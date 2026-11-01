@@ -1,102 +1,93 @@
-# linorobot2 上游子树说明
+# 上游依赖：linorobot2
 
-本仓库的 `linorobot2/` 目录以 **git subtree（--squash）** 方式引入第三方项目
-[linorobot/linorobot2](https://github.com/linorobot/linorobot2)，并在其上叠加 LightDog 的产品改造。
+本仓库**不包含**上游 [linorobot/linorobot2](https://github.com/linorobot/linorobot2) 的源码。
+上游只作为底座使用，我们通过 ROS 2 的覆盖层（overlay）机制叠加自己的东西。
 
 | 项 | 值 |
 |---|---|
-| 上游仓库 | `https://github.com/linorobot/linorobot2` |
-| 上游分支 | `jazzy` |
-| 基线提交 | `f6b0bd0350c4a9d6b815ef4bb5c701a1e5129711`（Merge PR #242） |
-| 本地前缀 | `linorobot2/` |
-| 引入方式 | `git subtree add --prefix=linorobot2 <repo> <ref> --squash` |
+| 上游仓库 | `linorobot/linorobot2` |
+| 分支 | `jazzy` |
+| 锁定提交 | `f6b0bd0`（见 `upstream.lock`） |
+| 运行时依赖 | 已构建的 Docker 镜像 `linorobot2:gazebo` |
+| 我们对上游的改动 | 1 处，且由启动脚本幂等修补 |
 
-## 为什么用 subtree 而不是 submodule
+## 仓库结构
 
-`linorobot2/` 里有相当一批**必须随产品走**的改动（LED/电池 URDF、Gazebo 桥接、容器挂载、
-launch 修复）。用 submodule 指向上游会让这些改动无处安放（除非再维护一个 fork），
-克隆方还需要额外 `--recursive` 和镜像配置。subtree 则是「单次 clone 即完整、改动留在主仓库历史里」，
-适合 vendored + patched 的用法。
+```
+lightdog/                 我们的 ROS 2 包（入库）
+  urdf/lightdog_{2wd,4wd}.urdf.xacro   覆盖层：上游机座 + LED + 电池
+  urdf/{led,battery}.urdf.xacro        我们新增的宏
+  launch/lightdog_sim.launch.py        include 上游 gazebo.launch.py 并覆盖 urdf
+  lightdog_led.py                      LED 亮度节点
+  config/led_visuals.yaml              节点参数
+sim/                      容器编排（入库）
+  docker-compose.yaml                 基于 linorobot2:gazebo 镜像
+  entrypoint.sh                       修补上游 → 构建我们的包 → 起仿真 + SLAM
+  patch_upstream.py                   唯一的那个上游补丁
+scripts/fetch_upstream.sh 按需拉上游源码（入库）
+upstream.lock             版本锁（入库）
+linorobot2/               拉下来的上游源码（gitignore，不入库）
+```
 
-## 网络前提
+## 三层叠加关系
 
-本机 `github.com` 直连不通（全 IP 超时），只有 `api.github.com` / `raw.githubusercontent.com` /
-`gh-proxy.com` 可用。因此所有拉取命令都要：
+1. **镜像层** `linorobot2:gazebo`：ROS 2 Jazzy + Gazebo Harmonic + 上游所有包，已 colcon build。
+2. **补丁层** `sim/patch_upstream.py`：容器启动时修补镜像内 `install/.../description.launch.py`。
+3. **覆盖层** `lightdog/`：容器启动时挂载进工作区并 `colcon build --symlink-install`。
 
-1. 清空代理变量（WorkBuddy 进程自带的 `HTTP_PROXY` 指向沙箱代理，会把外网请求吃掉）
-2. 走 gh-proxy 镜像
+叠加后 `ros2 launch lightdog lightdog_sim.launch.py` 就是完整的 LightDog 仿真。
+上游 `src/` 里一份源码都没被改过，升级时不会产生冲突。
+
+## 为什么不用 subtree / submodule
+
+试过 subtree：仓库从 149 个文件、`.git` 42MB 起步，其中 33MB 是上游文档的
+gif/png（`linorobot2.gif` 一个就 16MB），对产品毫无用处；而真实改动只有 13 个文件，
+每次升级都要在这 13 个文件里解冲突。
+
+submodule 也不合适：它指向上游，我们的 13 处修改无处安放（除非再维护一个 fork），
+克隆方还要 `--recursive` 并单独配镜像。
+
+现在这套：仓库 20 个文件、`.git` 126KB，上游升级只需改 `upstream.lock` 一个 sha。
+
+## 唯一的上游补丁
+
+`description.launch.py` 在 Jazzy 上必崩：
+
+```
+[ERROR] [launch]: Caught exception in launch: Unable to parse the value of parameter
+robot_description as yaml. If the parameter is meant to be a string, try wrapping it in
+launch_ros.parameter_descriptions.ParameterValue(value, value_type=str)
+```
+
+上游把 `Command(['xacro ', ...])` 直接塞进 parameters，xacro 输出以 `<?xml` 开头，
+launch_ros 按 YAML 解析必然失败。修法就是报错信息里给的标准写法。
+
+`sim/patch_upstream.py` 是幂等的：已打过就 SKIP；如果上游改了这段实现导致锚点找不到，
+它会**报错退出**让容器起不来，而不是静默跑一个坏配置。
+
+## 拉上游源码 / 升级上游
 
 ```bash
-export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
-git remote add linorobot2-upstream \
-  https://gh-proxy.com/https://github.com/linorobot/linorobot2.git
+# 拉取（走镜像，本机 github.com 直连不通）
+scripts/fetch_upstream.sh
+scripts/fetch_upstream.sh --force   # 强制重拉
+
+# 升级：改 upstream.lock 里的 UPSTREAM_COMMIT，然后
+scripts/fetch_upstream.sh
+cd sim && docker compose --env-file .env up -d --force-recreate
+docker logs -f sim      # 确认 patch 步骤是 OK 而不是 FAIL
 ```
 
-## 升级上游
+升级后必查三件事：
 
-```bash
-export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
+1. `[patch] OK` —— 不是 FAIL、不是 SKIP（SKIP 说明镜像里已有补丁，OK 说明这次打上了）
+2. `/led/brightness` 改值后 `material_color` 的 emissive 有变化
+3. `/battery_state` 有数据（gz 传输建链比较慢，可能要等几分钟）
 
-# 1) 取上游（建议先浅拉，避免一次拉全历史）
-git fetch --depth=200 linorobot2-upstream jazzy
+## 环境前提
 
-# 2) 合并到子树前缀，--squash 让上游历史压缩成一个提交
-git subtree pull --prefix=linorobot2 linorobot2-upstream jazzy --squash
-
-# 3) 冲突几乎必然出在下表「本地改造」列出的文件上，按产品需求保留本地语义后提交
-```
-
-若 `git fetch` 卡住或 502，换镜像重试（`https://ghproxy.net/https://github.com/...`、
-`https://ghfast.top/https://github.com/...`），或先 `--depth=1` 再逐步加深。
-**不要**为了走通连接去改 hosts——GitHub 的 IP 会抖动，改 hosts 往往让情况更糟。
-
-## 本地改造清单（冲突高发区）
-
-新增：
-
-```
-linorobot2/linorobot2_description/urdf/lightdog/led.urdf.xacro
-linorobot2/linorobot2_description/urdf/lightdog/battery.urdf.xacro
-linorobot2/docker/sim_start.sh
-linorobot2/docker/slam_start.sh
-linorobot2/docker/Dockerfile.xvfb
-linorobot2/docker/SIM_使用说明.md
-```
-
-修改：
-
-```
-linorobot2/linorobot2_description/urdf/robots/2wd.urdf.xacro     include + 调用 LED/电池宏
-linorobot2/linorobot2_description/urdf/robots/4wd.urdf.xacro     同上
-linorobot2/linorobot2_description/launch/description.launch.py   修 robot_description 未声明 str
-linorobot2/linorobot2_gazebo/launch/gazebo.launch.py             加 material_color / battery 桥接
-linorobot2/docker/Dockerfile                                     追装 xvfb / x11-utils / x11vnc
-linorobot2/docker/docker-compose.yaml                            挂载 urdf/launch/lightdog，改代码免重建
-linorobot2/docker/.env                                           SIM/WORLD/DISPLAY 等本机仿真配置
-```
-
-合计 13 个文件、约 +414 行。上游升级后用这条命令复核本地改造是否还在：
-
-```bash
-BASE=$(git log --format=%H --grep="vendor: 引入 linorobot2" -1)
-git diff --stat "$BASE" HEAD -- linorobot2
-```
-
-## 行尾策略
-
-仓库根 `.gitattributes` 强制 `* text=auto eol=lf`，并对 `*.sh / *.py / *.xacro / *.dae` 显式声明 LF。
-原因：宿主机 `core.autocrlf=true`，若不声明，检出会把 `docker/*.sh` 写成 CRLF，
-容器里 bash 直接报 `bad interpreter: /bin/bash^M`。
-`.dae` 是 XML 文本（不是二进制），误标为 `binary` 会把它冻结成 CRLF，产生整文件的假差异。
-
-新增文本文件后若怀疑行尾被污染：
-
-```bash
-git ls-files --eol <path>     # i/=索引  w/=工作区
-git add --renormalize .
-```
-
-## 不要入库的内容
-
-`linorobot2_navigation/maps/my_map.*` 是 SLAM 跑出来的地图，`**/__pycache__/` 是字节码，
-`docker/agent_outputs/` 是临时输出——都已在根 `.gitignore` 里排除。
+- `github.com` 本机直连不通，可用通道是 `gh-proxy.com` 镜像 + 清空代理变量
+  （WorkBuddy 进程自带的 `HTTP_PROXY` 指向沙箱代理，会把 git 请求吃掉）。
+- 宿主 `core.autocrlf=true`，仓库根 `.gitattributes` 已强制 `* text=auto eol=lf`。
+  不声明的话，检出会把 `sim/entrypoint.sh` 写成 CRLF，容器里 bash 直接
+  `bad interpreter: /bin/bash^M`。
