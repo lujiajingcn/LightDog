@@ -71,9 +71,10 @@ kill_p2() {
 # （跟随 prio 20 > Nav2 prio 10），输出 /cmd_vel_muxed 再进 collision_monitor，
 # 最终仍由 collision_monitor 独占 /cmd_vel。所以这里**不再需要杀 Nav2**。
 show_mux() {
+  # 发现 DDS 有延迟，刚起完节点时 5s 内很可能读不到，给足 12s。
   ros "source /opt/ros/jazzy/setup.bash >/dev/null 2>&1
        echo -n '  仲裁当前生效源: '
-       timeout 5 ros2 topic echo /cmd_vel_mux_state std_msgs/msg/String --once 2>/dev/null | grep data || echo '(读不到，mux 可能没起)'
+       timeout 12 ros2 topic echo /cmd_vel_mux_state std_msgs/msg/String --once 2>/dev/null | grep data || echo '(读不到：跟随节点未起时是 idle，多等几秒再 status)'
        echo '  /cmd_vel 发布者:'
        timeout 10 ros2 topic info -v /cmd_vel 2>/dev/null | grep -A2 'Node name' | grep -E 'Node name' | sed 's/^/    /'"
 }
@@ -86,7 +87,8 @@ case "$cmd" in
     need_container
     kill_p2
     ros "nohup ros2 launch lightdog lightdog_p2.launch.py > /tmp/p2.log 2>&1 & echo started"
-    sleep 6
+    # 10s 而不是 6s：DDS 发现慢，太早读 node list 会是空的，看着像启动失败
+    sleep 10
     echo "P2 节点已拉起，日志 /tmp/p2.log（容器内）。当前节点："
     ros "ros2 node list 2>/dev/null | grep -E 'lightdog_(person|follower|light|twist)' || echo '  (还没出现在 node list，稍等几秒)'"
     echo
