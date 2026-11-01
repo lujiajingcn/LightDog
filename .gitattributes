@@ -1,0 +1,33 @@
+# 本仓库面向 Linux/ROS 2 运行，一律使用 LF。
+# 显式声明，防止 Windows 上 core.autocrlf=true 把 .sh/.xacro 检出成 CRLF
+# （CRLF 的 shell 脚本在容器里会被 bash 判为 "bad interpreter"）。
+
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.py        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.xacro     text eol=lf
+*.urdf      text eol=lf
+*.xml       text eol=lf
+*.rviz      text eol=lf
+*.md        text eol=lf
+Dockerfile  text eol=lf
+.env        text eol=lf
+
+# 二进制：禁止任何行尾/编码转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pgm   binary
+*.stl   binary
+*.dae   binary
+*.obj   binary
+*.zip   binary
+*.tar   binary
+*.gz    binary
+*.pdf   binary
+*.so    binary

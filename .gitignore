@@ -1,0 +1,21 @@
+## Python
+__pycache__/
+*.pyc
+*.pyo
+
+## ROS 2 构建/运行产物
+build/
+install/
+log/
+
+## SLAM / Nav2 运行时生成的地图（可复现，不入库）
+linorobot2/linorobot2_navigation/maps/my_map.*
+
+## Agent / 临时抓包输出
+docker/agent_outputs/
+*.log
+
+## 编辑器
+.vscode/
+.idea/
+*.swp
