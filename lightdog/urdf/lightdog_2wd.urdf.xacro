@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<!--
+  LightDog 覆盖层：以「上游未修改的 2wd 机器人」为基座，追加四周 LED 与电池模型。
+
+  为什么可以这样拼：xacro 的 <xacro:include> 允许被包含文件自己也带 <robot> 根节点，
+  内容会被并入外层 <robot>，最终只输出一个 robot 节点（已实测）。
+  好处是上游 linorobot2_description 一行都不用改，升级只影响 include 的路径。
+
+  robot name 刻意保持 linorobot2_2wd，不要改成 lightdog_2wd：
+   Gazebo 的电池 topic 是 /model/<SDF 里的 model 名>/battery/<name>/state，
+   而 model 名取自这里的 robot name。保持原名可让 launch 里的桥接配置与
+   已验证过的 topic 完全一致。
+-->
+<robot name="linorobot2_2wd" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- 基座：上游完整定义（properties / mech / sensors / diff_drive 都在里面） -->
+  <xacro:include filename="$(find linorobot2_description)/urdf/robots/2wd.urdf.xacro" />
+
+  <!-- LightDog 扩展 -->
+  <xacro:include filename="$(find lightdog)/urdf/led.urdf.xacro" />
+  <xacro:include filename="$(find lightdog)/urdf/battery.urdf.xacro" />
+
+  <!-- 四周主灯 + 底部定位指示灯 -->
+  <xacro:led_lights
+    base_length="${base_length}"
+    base_width="${base_width}"
+    base_height="${base_height}" />
+
+  <!-- 3S / 5Ah / 15W 电池，发布 /battery_state -->
+  <xacro:lightdog_battery
+    battery_name="lightdog_battery"
+    capacity="5.0"
+    initial_charge="5.0"
+    power_load="15.0" />
+
+</robot>

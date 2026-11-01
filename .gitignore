@@ -8,14 +8,11 @@ build/
 install/
 log/
 
+## 上游第三方源码：按需拉取，不入库（见 upstream.lock 与 scripts/fetch_upstream.sh）
+linorobot2/
+
 ## SLAM / Nav2 运行时生成的地图（可复现，不入库）
-linorobot2/linorobot2_navigation/maps/my_map.*
+**/linorobot2_navigation/maps/my_map.*
 
-## Agent / 临时抓包输出
-docker/agent_outputs/
+## 临时输出
 *.log
-
-## 编辑器
-.vscode/
-.idea/
-*.swp

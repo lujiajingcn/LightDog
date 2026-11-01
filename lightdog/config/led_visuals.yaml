@@ -1,0 +1,40 @@
+# LightDog LED 节点参数
+#
+# 用法（在容器内）:
+#   ros2 run 不支持直接跑单文件, 用:
+#   python3 /home/ros/lightdog/lightdog_led.py --ros-args \
+#       --params-file /home/ros/lightdog/config/led_visuals.yaml
+#
+# visual 名的来历: Gazebo 把 URDF 的所有 fixed link lump 到 base_footprint,
+# 命名规则为 base_footprint_fixed_joint_lump__<link>_visual_<N>,
+# 其中 <link> 已含 _visual 后缀, 故出现 _visual_visual_ 双写。
+# N 按 link 名字母序编号, 车型不同则 N 不同 —— 下方两套值均为实测结果。
+
+lightdog_led:
+  ros__parameters:
+    world_name: turtlebot3_world
+
+    # ---- ROBOT_BASE=2wd (当前 docker/.env 配置) ----
+    led_visuals:
+      - base_footprint_fixed_joint_lump__led_front_visual_visual_4
+      - base_footprint_fixed_joint_lump__led_left_visual_visual_6
+      - base_footprint_fixed_joint_lump__led_rear_visual_visual_7
+      - base_footprint_fixed_joint_lump__led_right_visual_visual_8
+    indicator_visual: base_footprint_fixed_joint_lump__led_indicator_visual_visual_5
+
+    # ---- ROBOT_BASE=4wd 时改用下面这组（取消注释并替换上面两条） ----
+    # led_visuals:
+    #   - base_footprint_fixed_joint_lump__led_front_visual_visual_3
+    #   - base_footprint_fixed_joint_lump__led_left_visual_visual_5
+    #   - base_footprint_fixed_joint_lump__led_rear_visual_visual_6
+    #   - base_footprint_fixed_joint_lump__led_right_visual_visual_7
+    # indicator_visual: base_footprint_fixed_joint_lump__led_indicator_visual_visual_4
+
+    # 暖白主光
+    main_color: [1.0, 0.92, 0.80]
+    # 琥珀红定位光: 低亮度红光对褪黑素干扰最小, 适合彻夜常亮
+    indicator_color: [1.0, 0.25, 0.10]
+
+    # 待机时主灯全灭, 指示灯保持微光
+    default_brightness: 0.0
+    default_indicator: 0.06

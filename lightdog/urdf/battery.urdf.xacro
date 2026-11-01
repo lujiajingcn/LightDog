@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!--
+    LightDog 电池模型 (Gazebo Harmonic / gz-sim 8)
+
+    实测确认: gz-sim-linearbatteryplugin-system 存在, 加载后发布
+      /model/<model_name>/battery/<battery_name>/state  (gz.msgs.BatteryState)
+    经 ros_gz_bridge 转为 sensor_msgs/BatteryState, 供 P3 的自动回充触发使用。
+
+    参数按 3S 锂电 (11.1V 标称 / 12.6V 满电) + 5Ah 容量取值。
+  -->
+
+  <xacro:macro name="lightdog_battery" params="battery_name capacity initial_charge power_load">
+    <gazebo>
+      <plugin
+        filename="gz-sim-linearbatteryplugin-system"
+        name="gz::sim::systems::LinearBatteryPlugin">
+        <battery_name>${battery_name}</battery_name>
+        <!-- 满电电压 -->
+        <voltage>12.6</voltage>
+        <!-- 开路电压随放电线性下降: 12.6V -> 10.1V -->
+        <open_circuit_voltage_constant_coef>12.6</open_circuit_voltage_constant_coef>
+        <open_circuit_voltage_linear_coef>-2.5</open_circuit_voltage_linear_coef>
+        <initial_charge>${initial_charge}</initial_charge>
+        <capacity>${capacity}</capacity>
+        <!-- 电池内阻 (欧姆) -->
+        <resistance>0.1</resistance>
+        <smooth_current_tau>1.0</smooth_current_tau>
+        <!-- 整机平均功耗 (瓦), 决定放电速度 -->
+        <power_load>${power_load}</power_load>
+        <start_draining>true</start_draining>
+      </plugin>
+    </gazebo>
+  </xacro:macro>
+
+</robot>

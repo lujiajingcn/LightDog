@@ -1,0 +1,37 @@
+# LightDog 仿真编排
+#
+# 与上游 docker-compose 的区别：这里不构建镜像、也不挂载上游源码。
+# 基础镜像是已构建好的 linorobot2:gazebo（ROS 2 Jazzy + Gazebo Harmonic），
+# 只把我们的 lightdog 包装进工作区现场 colcon build。
+#
+# 用法：
+#   cd sim && docker compose --env-file .env up -d
+#   docker compose logs -f sim
+#   浏览器打开 http://localhost:6080/vnc.html
+
+services:
+  sim:
+    image: linorobot2:gazebo
+    container_name: sim
+    privileged: true
+    network_mode: bridge
+    ports:
+      - "5900:5900"   # x11vnc
+      - "6080:6080"   # noVNC
+    environment:
+      - IGN_IP=127.0.0.1
+      - GZ_IP=127.0.0.1
+      - LIBGL_ALWAYS_SOFTWARE=1
+      - MESA_GL_VERSION_OVERRIDE=4.0
+      - DISPLAY=:200
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - LINOROBOT2_BASE=${ROBOT_BASE}
+      - WORLD=${WORLD:-turtlebot3_world}
+      - SPAWN_X=${SPAWN_X:-0.5}
+    working_dir: /home/ros
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    volumes:
+      # 我们的包：挂到工作区 src 下，容器启动时现场构建
+      - ../lightdog:/home/ros/linorobot2_ws/src/lightdog:rw
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./patch_upstream.py:/patch_upstream.py:ro

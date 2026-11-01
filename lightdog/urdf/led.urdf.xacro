@@ -1,0 +1,108 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!--
+    LightDog LED 灯组
+
+    设计依据见 LightDog/Readme.md
+      - 主 LED 放在小车四周，避免遮挡顶部摄像头视野
+      - 车底一个常亮的小功率指示灯，用于夜间定位
+
+    仿真限制（已实测 Gazebo Harmonic / gz-sim 8.15）
+      - URDF 的 <light> 标签在 link 级和 model 级都会被静默丢弃,
+        不会生成可渲染光源, 因此这里只用 visual 自发光(emissive)表达亮度。
+      - 亮度由 lightdog_led 节点通过 /world/<world>/material_color 修改 emissive。
+      - 所有 fixed link 会被 lump 到 base_footprint, visual 名会被改写为
+        base_footprint_fixed_joint_lump__<link>_visual_<N>, 具体值由
+        `gz sdf -p` 实测确定, 见 lightdog/config/led_visuals.yaml
+  -->
+
+  <xacro:macro name="led_lights" params="base_length base_width base_height">
+
+    <!-- 灯条尺寸: 厚度 0.012 / 宽度 0.06 / 高度 0.020 -->
+    <xacro:property name="led_t" value="0.012"/>
+    <xacro:property name="led_w" value="0.060"/>
+    <xacro:property name="led_h" value="0.020"/>
+    <xacro:property name="led_z" value="${base_height/2 - 0.02}"/>
+    <xacro:property name="led_mass" value="0.010"/>
+
+    <!-- 四周主灯: 紧贴车体侧壁, 略向外凸出 -->
+    <xacro:property name="led_x" value="${base_length/2 + led_t/2 - 0.002}"/>
+    <xacro:property name="led_y" value="${base_width/2 + led_t/2 - 0.002}"/>
+
+    <!-- 前灯条 -->
+    <xacro:led_light name="led_front"
+      size="${led_t} ${led_w} ${led_h}"
+      origin_xyz="${led_x} 0 ${led_z}"
+      mass="${led_mass}"/>
+
+    <!-- 后灯条 -->
+    <xacro:led_light name="led_rear"
+      size="${led_t} ${led_w} ${led_h}"
+      origin_xyz="${-led_x} 0 ${led_z}"
+      mass="${led_mass}"/>
+
+    <!-- 左灯条 -->
+    <xacro:led_light name="led_left"
+      size="${led_w} ${led_t} ${led_h}"
+      origin_xyz="0 ${led_y} ${led_z}"
+      mass="${led_mass}"/>
+
+    <!-- 右灯条 -->
+    <xacro:led_light name="led_right"
+      size="${led_w} ${led_t} ${led_h}"
+      origin_xyz="0 ${-led_y} ${led_z}"
+      mass="${led_mass}"/>
+
+    <!-- 底部常亮指示灯: 贴在底盘底面中心, 朝下 -->
+    <xacro:led_light name="led_indicator"
+      size="0.030 0.030 0.008"
+      origin_xyz="-0.10 0 ${-base_height/2 - 0.004}"
+      mass="0.005"/>
+
+  </xacro:macro>
+
+  <!-- 单个 LED: 独立 link + fixed joint, 与 camera_link 的做法保持一致 -->
+  <xacro:macro name="led_light" params="name size origin_xyz mass">
+    <link name="${name}_link">
+      <visual name="${name}_visual">
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="${size}"/>
+        </geometry>
+        <!-- 熄灭状态: 近黑, emissive 全 0 -->
+        <material name="${name}_off">
+          <color rgba="0.05 0.05 0.05 1.0"/>
+        </material>
+      </visual>
+
+      <!-- 灯不参与碰撞, 避免干扰底盘运动学 -->
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="${mass}"/>
+        <inertia ixx="1e-6" ixy="0.0" ixz="0.0"
+                 iyy="1e-6" iyz="0.0"
+                 izz="1e-6"/>
+      </inertial>
+    </link>
+
+    <joint name="${name}_joint" type="fixed">
+      <parent link="base_link"/>
+      <child link="${name}_link"/>
+      <origin xyz="${origin_xyz}" rpy="0 0 0"/>
+    </joint>
+
+    <!-- 用 gazebo 材质覆盖保证 emissive 字段存在, 供 material_color 动态修改 -->
+    <gazebo reference="${name}_link">
+      <visual>
+        <material>
+          <ambient>0.01 0.01 0.01 1.0</ambient>
+          <diffuse>0.05 0.05 0.05 1.0</diffuse>
+          <specular>0.10 0.10 0.10 1.0</specular>
+          <emissive>0.00 0.00 0.00 1.0</emissive>
+        </material>
+      </visual>
+    </gazebo>
+  </xacro:macro>
+
+</robot>

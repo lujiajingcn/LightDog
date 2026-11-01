@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!--
+  LightDog 覆盖层（4wd 版本）。结构说明见 lightdog_2wd.urdf.xacro。
+  robot name 同样保持 linorobot2_4wd，理由见同目录 2wd 文件的注释。
+-->
+<robot name="linorobot2_4wd" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- 基座：上游完整定义 -->
+  <xacro:include filename="$(find linorobot2_description)/urdf/robots/4wd.urdf.xacro" />
+
+  <!-- LightDog 扩展 -->
+  <xacro:include filename="$(find lightdog)/urdf/led.urdf.xacro" />
+  <xacro:include filename="$(find lightdog)/urdf/battery.urdf.xacro" />
+
+  <xacro:led_lights
+    base_length="${base_length}"
+    base_width="${base_width}"
+    base_height="${base_height}" />
+
+  <xacro:lightdog_battery
+    battery_name="lightdog_battery"
+    capacity="5.0"
+    initial_charge="5.0"
+    power_load="15.0" />
+
+</robot>

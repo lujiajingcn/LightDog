@@ -1,0 +1,12 @@
+# 上游依赖版本锁 —— 由 scripts/fetch_upstream.sh 读取
+# 改动这里等于升级上游；升级后请跑一遍 sim 验证 LED/电池链路。
+
+UPSTREAM_PROJECT="linorobot/linorobot2"
+UPSTREAM_BRANCH="jazzy"
+UPSTREAM_COMMIT="f6b0bd0350c4a9d6b815ef4bb5c701a1e5129711"
+UPSTREAM_COMMIT_DATE="2026-10-06"
+
+# 直连（本机通常不通，仅作兜底）
+UPSTREAM_URL="https://github.com/linorobot/linorobot2.git"
+# 镜像（本机可用通道）
+UPSTREAM_MIRROR="https://gh-proxy.com/https://github.com/linorobot/linorobot2.git"
