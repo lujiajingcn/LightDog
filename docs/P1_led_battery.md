@@ -54,7 +54,59 @@ docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash && \
 
 节点日志走容器 stdout（`docker logs sim | grep lightdog_led`），`ros2 launch` 不单独落文件。
 
-## 三、实测验证（ROBOT_BASE=4wd）
+## 三、怎么看效果
+
+**一句话：浏览器开 `http://127.0.0.1:6080/vnc.html`，画面里就是 4wd 车身，改亮度能直接看到灯条明暗变化。**
+
+前提是容器已经起来：
+
+```bash
+cd sim && docker compose --env-file .env up -d
+```
+
+### 画面里有什么
+
+容器内 `gz` 跑的是 `-s`（纯服务端）模式，默认不带 3D 窗口 —— 只开 noVNC 看到的是 RViz 的
+SLAM 图，看不见车身。所以 entrypoint 会额外拉起一个 GUI 客户端（`SHOW_GUI=1`，默认开），
+并做两件事让它开箱可用：
+
+1. 用 `sim/gui.config` 替换默认布局 —— 默认配置把「组件检查器 + 实体树」dock 在右侧，
+   吃掉约 40% 宽度；我们的配置只留 3D 视图 + 播放控制 + 统计，窗口铺满 1920x1080。
+   注意这个文件**不能**有 `<gui>` 根节点，gz-gui 8 期望 `dialog`/`window`/`plugin` 直接在顶层，
+   套一层会被静默忽略并回退默认布局。
+2. 启动后调 `/gui/follow` 把相机锁到机器人，跟着它走，不会一进来找不到车。
+
+GUI 必须在 RViz **之后**启动 —— Xvfb 没有窗口管理器，窗口靠创建顺序叠放，后建的在上层。
+这条顺序在 `entrypoint.sh` 里有注释，改动时别调换。
+
+### 调亮度 / 读电池
+
+`sim/p1.sh` 是在宿主机 Git Bash 里跑的封装（内部 `docker exec` 到容器）：
+
+```bash
+bash sim/p1.sh status          # 容器/节点/话题/GUI/车型 概览
+bash sim/p1.sh led 0.8         # 主灯亮度 0~1
+bash sim/p1.sh led off         # 主灯全灭
+bash sim/p1.sh indicator 0.5   # 底部指示灯
+bash sim/p1.sh sweep           # 0→1 分段扫一遍，肉眼看灯条渐变
+bash sim/p1.sh battery         # 读 /battery_state
+```
+
+不想用脚本也可以直接打：
+
+```bash
+docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash && \
+  ros2 topic pub --once /led/brightness std_msgs/msg/Float32 "{data: 1.0}"'
+```
+
+**看画面时的注意点：**
+
+- 灯条是贴在车身上的自发光面片，**只从侧面看得到**。相机默认在左前上方，能同时看到前灯条和左灯条。
+- 底部指示灯在底盘下方（z≈0.05），从上方俯视看不见，属正常。要确认它就把相机拖到地面以下，或直接看 gz 话题数值。
+- `SHOW_GUI=0` 可关掉 GUI 省 CPU（软件渲染下 GUI 占一档渲染开销）；只做数据链路验证时建议关。
+- 改 `SHOW_GUI` 或 `gui.config` 后要 `docker compose --env-file .env up -d --force-recreate` 才生效。
+
+## 四、实测验证（ROBOT_BASE=4wd）
 
 | 项 | 证据 |
 |---|---|
@@ -64,7 +116,7 @@ docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash && \
 | 电池 | `voltage 12.477V`、`current 1.2022A`、`charge 4.994/5.0Ah`、`power_supply_status 2`(DISCHARGING) |
 | 电池 gz topic | `/model/linorobot2_4wd/battery/lightdog_battery/state` |
 
-## 四、已知限制（重要）
+## 五、已知限制（重要）
 
 **1. 渲染层未做逐像素验证。** 数据链路（ROS → bridge → gz topic → 正确的 emissive 数值）已完整验证，
 但没有确认 gz 渲染器把 emissive 真实画出来。原因是仿真以无头 + 软件渲染运行，
@@ -89,7 +141,7 @@ P3 做低电回充判定时**必须用 `charge / capacity` 或 `voltage` 阈值*
 若改了 LED link 的数量或命名，必须重新从 SDF 取出真实名字。
 另注意 4wd 的机体尺寸与 2wd 差别大（`base_height` 0.129 vs 0.003），LED 安装高度由宏参数跟随，但**贴片位置观感需人眼确认**。
 
-## 五、这个上游 bug 的来龙去脉
+## 六、这个上游 bug 的来龙去脉
 
 `description.launch.py` 原本把 `robot_description` 直接交给 `Command(['xacro ', ...])`，
 launch 会尝试把整个 URDF 文本当 YAML 解析。URDF 里任何一行出现 `:`（比如 XML 注释里）就会报

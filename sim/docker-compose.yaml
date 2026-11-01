@@ -28,6 +28,7 @@ services:
       - LINOROBOT2_BASE=${ROBOT_BASE}
       - WORLD=${WORLD:-turtlebot3_world}
       - SPAWN_X=${SPAWN_X:-0.5}
+      - SHOW_GUI=${SHOW_GUI:-1}
     working_dir: /home/ros
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     volumes:
@@ -35,3 +36,4 @@ services:
       - ../lightdog:/home/ros/linorobot2_ws/src/lightdog:rw
       - ./entrypoint.sh:/entrypoint.sh:ro
       - ./patch_upstream.py:/patch_upstream.py:ro
+      - ./gui.config:/gui.config:ro
