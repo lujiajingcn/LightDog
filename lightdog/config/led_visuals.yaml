@@ -14,21 +14,21 @@ lightdog_led:
   ros__parameters:
     world_name: turtlebot3_world
 
-    # ---- ROBOT_BASE=2wd (当前 docker/.env 配置) ----
+    # ---- ROBOT_BASE=4wd (当前 sim/.env 配置) ----
     led_visuals:
-      - base_footprint_fixed_joint_lump__led_front_visual_visual_4
-      - base_footprint_fixed_joint_lump__led_left_visual_visual_6
-      - base_footprint_fixed_joint_lump__led_rear_visual_visual_7
-      - base_footprint_fixed_joint_lump__led_right_visual_visual_8
-    indicator_visual: base_footprint_fixed_joint_lump__led_indicator_visual_visual_5
+      - base_footprint_fixed_joint_lump__led_front_visual_visual_3
+      - base_footprint_fixed_joint_lump__led_left_visual_visual_5
+      - base_footprint_fixed_joint_lump__led_rear_visual_visual_6
+      - base_footprint_fixed_joint_lump__led_right_visual_visual_7
+    indicator_visual: base_footprint_fixed_joint_lump__led_indicator_visual_visual_4
 
-    # ---- ROBOT_BASE=4wd 时改用下面这组（取消注释并替换上面两条） ----
+    # ---- ROBOT_BASE=2wd 时改用下面这组（取消注释并替换上面两条） ----
     # led_visuals:
-    #   - base_footprint_fixed_joint_lump__led_front_visual_visual_3
-    #   - base_footprint_fixed_joint_lump__led_left_visual_visual_5
-    #   - base_footprint_fixed_joint_lump__led_rear_visual_visual_6
-    #   - base_footprint_fixed_joint_lump__led_right_visual_visual_7
-    # indicator_visual: base_footprint_fixed_joint_lump__led_indicator_visual_visual_4
+    #   - base_footprint_fixed_joint_lump__led_front_visual_visual_4
+    #   - base_footprint_fixed_joint_lump__led_left_visual_visual_6
+    #   - base_footprint_fixed_joint_lump__led_rear_visual_visual_7
+    #   - base_footprint_fixed_joint_lump__led_right_visual_visual_8
+    # indicator_visual: base_footprint_fixed_joint_lump__led_indicator_visual_visual_5
 
     # 暖白主光
     main_color: [1.0, 0.92, 0.80]

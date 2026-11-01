@@ -20,8 +20,8 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    # 与上游保持一致：车型由环境变量决定（2wd / 4wd / mecanum）
-    robot_base = os.getenv('LINOROBOT2_BASE', '2wd')
+    # 车型由环境变量决定（2wd / 4wd / mecanum）；产品是四轮，故兜底用 4wd
+    robot_base = os.getenv('LINOROBOT2_BASE', '4wd')
 
     pkg_lightdog = FindPackageShare('lightdog')
 

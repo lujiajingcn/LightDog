@@ -32,17 +32,17 @@ class LedController(Node):
         self.declare_parameter('world_name', 'turtlebot3_world')
         # 实测值 (gz sdf -p 输出)。fixed link 全部 lump 到 base_footprint，
         # 且链接名自带 _visual 后缀导致双写；序号按 link 名字母序固定。
-        # 下列为 ROBOT_BASE=2wd (当前 .env 配置) 的实测名；
-        # 4wd 车型对应 ..._visual_visual_3/5/6/7，指示为 _4，可用
+        # 下列为 ROBOT_BASE=4wd（本产品车型）的实测名；
+        # 2wd 对应 ..._visual_visual_4/6/7/8，指示为 _5，可用
         # config/led_visuals.yaml 覆盖。改动 LED link 数量或命名后需重新实测。
         self.declare_parameter('led_visuals', [
-            'base_footprint_fixed_joint_lump__led_front_visual_visual_4',
-            'base_footprint_fixed_joint_lump__led_left_visual_visual_6',
-            'base_footprint_fixed_joint_lump__led_rear_visual_visual_7',
-            'base_footprint_fixed_joint_lump__led_right_visual_visual_8',
+            'base_footprint_fixed_joint_lump__led_front_visual_visual_3',
+            'base_footprint_fixed_joint_lump__led_left_visual_visual_5',
+            'base_footprint_fixed_joint_lump__led_rear_visual_visual_6',
+            'base_footprint_fixed_joint_lump__led_right_visual_visual_7',
         ])
         self.declare_parameter('indicator_visual',
-            'base_footprint_fixed_joint_lump__led_indicator_visual_visual_5')
+            'base_footprint_fixed_joint_lump__led_indicator_visual_visual_4')
 
         # 暖白主光 / 琥珀红指示光（低亮度红光对褪黑素影响小）
         self.declare_parameter('main_color', [1.00, 0.92, 0.80])
