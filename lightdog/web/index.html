@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>LightDog · 远程看护</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header id="bar">
+  <div class="row">
+    <span class="dot" id="conn" aria-label="连接状态"></span>
+    <span class="name">LightDog</span>
+    <span class="spacer"></span>
+    <span class="batt"><span id="batt-val">--</span><span class="batt-bar"><i id="batt-fill"></i></span></span>
+  </div>
+  <div class="row sub">
+    <span id="state-text">连接中…</span>
+    <span class="spacer"></span>
+    <span id="fps-text"></span>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============ 实时 ============ -->
+  <section id="view-live" class="view active">
+    <div class="screen-wrap">
+      <canvas id="screen" width="640" height="480"></canvas>
+      <div class="screen-overlay" id="screen-overlay">正在连接画面…</div>
+      <div class="rec-flag" id="rec-flag"><i></i>REC</div>
+      <div class="screen-meta" id="screen-meta"></div>
+    </div>
+
+    <div class="actions">
+      <button id="btn-snap" class="btn">拍一张</button>
+      <button id="btn-event" class="btn warn">标记事件</button>
+    </div>
+
+    <div class="chips" id="chips"></div>
+  </section>
+
+  <!-- ============ 事件 ============ -->
+  <section id="view-events" class="view">
+    <div class="sec-head">
+      <h2>事件</h2>
+      <button id="btn-reload-events" class="btn ghost small">刷新</button>
+    </div>
+    <div id="events" class="list"></div>
+    <p id="events-empty" class="empty">还没有事件。事发前后各 10 秒会自动保存。</p>
+
+    <div class="sec-head">
+      <h2>最近录像</h2>
+      <span class="hint" id="clips-hint"></span>
+    </div>
+    <div id="clips" class="list tight"></div>
+  </section>
+
+  <!-- ============ 设置 ============ -->
+  <section id="view-settings" class="view">
+    <div class="sec-head"><h2>紧急联系人</h2></div>
+    <p class="hint">检测到跌倒并确认无人应答时，按顺序拨打。</p>
+    <div id="contacts" class="list"></div>
+    <div class="contact-add">
+      <input id="c-name" type="text" placeholder="称呼（如：女儿）" autocomplete="off">
+      <input id="c-phone" type="tel" placeholder="电话号码" autocomplete="off">
+      <button id="btn-add-contact" class="btn small">添加</button>
+    </div>
+
+    <div class="sec-head"><h2>设备</h2></div>
+    <dl class="kv" id="device-info"></dl>
+
+    <div class="sec-head"><h2>访问令牌</h2></div>
+    <p class="hint">真机部署时应设置令牌，否则同一网络内任何人都能看画面。</p>
+    <div class="contact-add">
+      <input id="token-input" type="text" placeholder="留空表示不鉴权" autocomplete="off">
+      <button id="btn-save-token" class="btn small">保存并重连</button>
+    </div>
+  </section>
+
+</main>
+
+<nav id="tabs">
+  <button data-view="live" class="active">实时</button>
+  <button data-view="events">事件</button>
+  <button data-view="settings">设置</button>
+</nav>
+
+<!-- 播放器 -->
+<div id="player" class="player" hidden>
+  <div class="player-bar">
+    <span id="player-title">事件回放</span>
+    <button id="player-close" class="btn ghost small">关闭</button>
+  </div>
+  <video id="player-video" controls playsinline webkit-playsinline preload="metadata"></video>
+  <div class="player-meta" id="player-meta"></div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

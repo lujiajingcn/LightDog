@@ -17,5 +17,8 @@ linorobot2/
 ## 临时输出
 *.log
 
+## P4 录像数据（存储卡的宿主副本：clips/ events/ snapshots/ contacts.json）
+data/
+
 ## WorkBuddy 本地工作区数据（memory、临时脚本、上游副本），不入库
 .workbuddy/

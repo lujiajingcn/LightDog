@@ -72,6 +72,28 @@ SLAM_PID=$!
 
 sleep 8
 
+# 6.5) P4：录像 + 手机互联后端
+#
+#      放在 SLAM 之后、Gazebo GUI 之前，是因为这两个节点不依赖任何东西 ——
+#      相机没出图时 recorder 只是空转，server 的 /status 照样回 200。早点起，
+#      GUI 那 30 秒的等待时间里录像已经开始了。
+P4_PID=""
+if [ "${ENABLE_P4:-1}" = "1" ]; then
+  DATA_DIR="${LIGHTDOG_DATA_DIR:-/data}"
+  mkdir -p "$DATA_DIR"
+  # 注意：空的 `auth_token:=` 会被 ros2 launch 判成 malformed argument 直接退出，
+  # 所以这里的 P4_ARGS 必须按需拼接，不能写成固定字符串。
+  P4_ARGS="data_dir:=$DATA_DIR"
+  if [ -n "${LIGHTDOG_TOKEN:-}" ]; then
+    P4_ARGS="$P4_ARGS auth_token:=$LIGHTDOG_TOKEN"
+  fi
+  echo "=== Starting P4 recorder + server (data=$DATA_DIR) ==="
+  nohup ros2 launch lightdog lightdog_p4.launch.py $P4_ARGS \
+      > /tmp/p4.log 2>&1 &
+  P4_PID=$!
+  echo "  P4 PID $P4_PID (log /tmp/p4.log)"
+fi
+
 # 7) Gazebo GUI（默认开）。两件事决定了这段必须放在 SLAM 之后：
 #    - 容器里 gz 只跑服务端，不拉 GUI 的话浏览器里只有 RViz，看不到车身和 LED
 #    - Xvfb 下没有窗口管理器，窗口靠创建顺序叠放 → 后建的在上层，
@@ -99,15 +121,17 @@ fi
 echo "=== All services started ==="
 echo "  VNC:    localhost:5900"
 echo "  noVNC:  http://localhost:6080/vnc.html"
+echo "  Phone:  http://<本机局域网IP>:8000/    (P4 手机互联)"
 echo "  Sim:    PID $SIM_PID"
 echo "  GUI:    PID ${GUI_PID:-未启动}"
 echo "  SLAM:   PID $SLAM_PID"
 echo "  Mux:    PID $MUX_PID (log /tmp/twist_mux.log)"
+echo "  P4:     PID ${P4_PID:-未启动} (log /tmp/p4.log)"
 
 echo "  LED log: /tmp/lightdog_led.log (via ros2 launch)"
 echo ""
 
 wait -n $SIM_PID $SLAM_PID
 echo "A process exited, shutting down..."
-kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} 2>/dev/null || true
+kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} ${P4_PID:-} 2>/dev/null || true
 exit 0

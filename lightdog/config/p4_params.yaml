@@ -1,0 +1,56 @@
+# LightDog P4 参数（视频存储 + 手机互联）
+#
+# 两条铁律：
+#
+# 1. 录像节点用 `use_sim_time: true` —— 分段边界要跟相机时间戳同源，否则
+#    「事发前 10 秒」在 0.25x 实时因子的仿真里会算错 4 倍。
+# 2. 后端节点**不用** sim time —— 它对外提供的是 HTTP 服务，时间轴必须是墙钟，
+#    否则手机上看到的事件时间和真实时间对不上。
+
+/lightdog_recorder:
+  ros__parameters:
+    use_sim_time: true
+
+    image_topic: /camera/color/image_raw
+    data_dir: /data
+
+    # 段长 / 环形保留 / 配额。
+    #
+    # 单位刻意不一样，别混：
+    #   segment_sec  = ROS 秒，表示「这一段装多少秒的画面」（仿真相机约 15Hz，10 秒 ≈ 150 帧）
+    #   retain_sec   = **墙钟**秒，表示「卡里的东西留多久」。用墙钟是因为 ROS 时间
+    #                  重启后会归零（仿真每次重启 /clock 从 0 开始，真机 NTP 校时同理），
+    #                  拿它算"多久以前录的"会得到负数，旧录像永远清不掉。
+    # 真机上两者等价（ROS 时间 = 系统时间），可以直接按画面时长理解。
+    segment_sec: 10.0
+    retain_sec: 1800.0
+    min_segments: 6          # 至少留 6 段，防止 retain_sec 配小以后立刻被清空
+    max_disk_mb: 512.0       # 容量上限（只算 clips/，事件视频另算）
+
+    # 事件窗口默认值。P5 的跌倒检测可以在消息里覆盖。
+    pre_sec: 10.0
+    post_sec: 10.0
+    max_event_frames: 900
+
+    # avc1 = H.264。手机（尤其 iOS）只认这个；打不开会自动降级 mp4v 并报错日志。
+    codec: avc1
+    jpeg_quality: 80
+    recording: true
+    state_topic: /recorder/state
+
+/lightdog_server:
+  ros__parameters:
+    http_host: 0.0.0.0
+    http_port: 8000
+
+    # 空 = 不鉴权。仿真默认空，方便浏览器直接开；
+    # **真机必须设置**，否则同一个 WiFi 下任何人都能看到摄像头。
+    auth_token: ''
+
+    data_dir: /data
+    image_topic: /camera/color/image_raw
+    jpeg_quality: 75
+    # 推流频率上限。相机只有 1.5Hz 时，这个值再大也只是重复同一张图，
+    # 所以取 10 是为了真机 30Hz 场景留余量。
+    stream_fps: 10.0
+    device_name: LightDog

@@ -17,6 +17,8 @@ install(PROGRAMS
   lightdog_twist_mux.py
   lightdog_aruco_dock.py
   lightdog_dock_manager.py
+  lightdog_recorder.py
+  lightdog_server.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -25,6 +27,7 @@ install(DIRECTORY
   launch
   config
   models
+  web
   DESTINATION share/${PROJECT_NAME}
 )
 
