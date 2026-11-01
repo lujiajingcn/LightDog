@@ -35,7 +35,18 @@ websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /tmp/websockify.log 2>&
 NOVNC_PID=$!
 echo "=== Xvfb :200 (PID $XVFB_PID) / x11vnc :5900 / noVNC :6080 ==="
 
-# 4) LightDog 仿真栈（上游 gazebo.launch.py + 我们的 URDF 覆盖层 + 桥接 + LED 节点）
+# 4) /cmd_vel 多源仲裁（常驻）。
+#    collision_monitor 的输入已由 patch_upstream.py 指到本节点的输出，
+#    所以它必须在仿真栈之前就位，否则 Nav2 一条速度都发不出去（统一被
+#    source_timeout 兜成零）。P2 的跟随节点只是往它里面多接一个源。
+echo "=== Starting twist mux ==="
+nohup ros2 run lightdog lightdog_twist_mux.py --ros-args \
+    --params-file /home/ros/linorobot2_ws/install/lightdog/share/lightdog/config/p2_params.yaml \
+    > /tmp/twist_mux.log 2>&1 &
+MUX_PID=$!
+echo "  twist_mux PID $MUX_PID (log /tmp/twist_mux.log)"
+
+# 5) LightDog 仿真栈（上游 gazebo.launch.py + 我们的 URDF 覆盖层 + 桥接 + LED 节点）
 echo "=== Starting simulation ==="
 ros2 launch lightdog lightdog_sim.launch.py \
     gui:=false \
@@ -47,14 +58,14 @@ SIM_PID=$!
 
 sleep 10
 
-# 5) SLAM + RViz
+# 6) SLAM + RViz
 echo "=== Starting SLAM + RViz ==="
 ros2 launch linorobot2_navigation slam.launch.py sim:=true rviz:=true &
 SLAM_PID=$!
 
 sleep 8
 
-# 6) Gazebo GUI（默认开）。两件事决定了这段必须放在 SLAM 之后：
+# 7) Gazebo GUI（默认开）。两件事决定了这段必须放在 SLAM 之后：
 #    - 容器里 gz 只跑服务端，不拉 GUI 的话浏览器里只有 RViz，看不到车身和 LED
 #    - Xvfb 下没有窗口管理器，窗口靠创建顺序叠放 → 后建的在上层，
 #      所以 GUI 必须在 RViz 之后再起，打开 noVNC 才是 3D 视图在最前面
@@ -84,10 +95,11 @@ echo "  noVNC:  http://localhost:6080/vnc.html"
 echo "  Sim:    PID $SIM_PID"
 echo "  GUI:    PID ${GUI_PID:-未启动}"
 echo "  SLAM:   PID $SLAM_PID"
+echo "  Mux:    PID $MUX_PID (log /tmp/twist_mux.log)"
 echo "  LED log: /tmp/lightdog_led.log (via ros2 launch)"
 echo ""
 
 wait -n $SIM_PID $SLAM_PID
 echo "A process exited, shutting down..."
-kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID ${GUI_PID:-} 2>/dev/null || true
+kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} 2>/dev/null || true
 exit 0

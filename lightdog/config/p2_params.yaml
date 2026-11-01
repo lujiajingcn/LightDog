@@ -62,7 +62,31 @@
     angle_tol: 0.06
     side_turn_only: 0.9
     person_timeout: 1.5
+    # 不直接发 /cmd_vel：交给 twist_mux 仲裁，再由 collision_monitor 兜碰撞
+    cmd_vel_topic: /cmd_vel_follow
     enabled: true
+
+# /cmd_vel 多源仲裁。优先级：回充 30 > 跟随 20 > Nav2 10。
+# 超时窗口要比发布周期宽一截：跟跟随节点 10Hz 发（0.1s/条），给 0.6s
+# 是容忍软件渲染下丢帧；Nav2 空闲时 velocity_smoother 也会以 20Hz 发零速，
+# 所以 nav 源几乎总是「活跃」，靠优先级压制而不是靠超时。
+/lightdog_twist_mux:
+  ros__parameters:
+    # 故意不用 sim time：超时窗口回答的是「上游还在不在发包」，
+    # 与仿真跑多快无关。本机实时因子 0.22x，用 sim time 会把 0.6s 拖成 2.7s。
+    use_sim_time: false
+    nav_topic: /cmd_vel_smoothed
+    nav_priority: 10
+    nav_timeout: 0.6
+    follow_topic: /cmd_vel_follow
+    follow_priority: 20
+    follow_timeout: 0.6
+    dock_topic: /cmd_vel_dock
+    dock_priority: 30
+    dock_timeout: 1.0
+    out_topic: /cmd_vel_muxed
+    publish_rate: 20.0
+    zero_on_idle: true
 
 /lightdog_person_sim:
   ros__parameters:

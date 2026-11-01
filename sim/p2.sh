@@ -56,17 +56,26 @@ need_container() {
 # 注意：这个容器里 `pkill -f` 不生效（试过，进程纹丝不动），必须按 PID 杀。
 # 用 ps 拿 PID 再 kill -9。
 kill_p2() {
+  # 注意不含 twist_mux：它是常驻基础设施（entrypoint 起的），停 P2 不能把它带走，
+  # 否则 Nav2 的输入也断了。
   ros "for p in \$(ps -eo pid,args --no-headers | grep -E 'lightdog_(person_detector|follower|light_auto|person_sim)|lightdog_p2.launch.py' | grep -v grep | awk '{print \$1}'); do kill -9 \$p 2>/dev/null; done; sleep 1; true"
 }
 
-# P2 必须独占 /cmd_vel，否则 Nav2 的 command_timeout / collision_monitor /
-# docking_server 会在导航空闲时持续往 /cmd_vel 灌零速，把 follower 的指令淹掉
-# （实测：follower 一直发 -0.15，机器人 6 秒只挪 0.05m）。
-# 跟随和导航本来就是互斥的运动模式；真机上这种多源速度要靠 twist_mux 仲裁，
-# 仿真期先把它们停掉最省事。
-# 注意这里的进程名是 nav2_* 的库名，不是节点名。
-kill_nav_motion() {
-  ros "for p in \$(ps -eo pid,args --no-headers | grep -E '/nav2_controller|nav2_velocity_smoother|nav2_collision_monitor|nav2_behaviors|opennav_docking|nav2_lifecycle_manager|/command_timeout' | grep -v grep | awk '{print \$1}'); do kill -9 \$p 2>/dev/null; done; sleep 1; true"
+# 关于 /cmd_vel 的仲裁（历史教训，别回退）
+#
+# P2 最初是「kill 掉 Nav2 运动节点让 follower 独占 /cmd_vel」，因为导航空闲时
+# command_timeout / collision_monitor / docking_server 会持续往 /cmd_vel 灌零速，
+# 把 follower 的 -0.15 淹掉（实测机器人 6 秒只挪 5cm）。代价是丢了碰撞保护。
+#
+# 现在改成标准做法：follower 只发 /cmd_vel_follow，由 lightdog_twist_mux 仲裁
+# （跟随 prio 20 > Nav2 prio 10），输出 /cmd_vel_muxed 再进 collision_monitor，
+# 最终仍由 collision_monitor 独占 /cmd_vel。所以这里**不再需要杀 Nav2**。
+show_mux() {
+  ros "source /opt/ros/jazzy/setup.bash >/dev/null 2>&1
+       echo -n '  仲裁当前生效源: '
+       timeout 5 ros2 topic echo /cmd_vel_mux_state std_msgs/msg/String --once 2>/dev/null | grep data || echo '(读不到，mux 可能没起)'
+       echo '  /cmd_vel 发布者:'
+       timeout 10 ros2 topic info -v /cmd_vel 2>/dev/null | grep -A2 'Node name' | grep -E 'Node name' | sed 's/^/    /'"
 }
 
 cmd="${1:-status}"
@@ -75,12 +84,13 @@ case "$cmd" in
 
   start)
     need_container
-    kill_nav_motion      # 先让 /cmd_vel 只剩 follower（见函数注释）
     kill_p2
     ros "nohup ros2 launch lightdog lightdog_p2.launch.py > /tmp/p2.log 2>&1 & echo started"
     sleep 6
     echo "P2 节点已拉起，日志 /tmp/p2.log（容器内）。当前节点："
-    ros "ros2 node list 2>/dev/null | grep -E 'lightdog_(person|follower|light)' || echo '  (还没出现在 node list，稍等几秒)'"
+    ros "ros2 node list 2>/dev/null | grep -E 'lightdog_(person|follower|light|twist)' || echo '  (还没出现在 node list，稍等几秒)'"
+    echo
+    show_mux
     ;;
 
   reset)
@@ -128,6 +138,8 @@ case "$cmd" in
 
   stop)
     need_container
+    # 先往仲裁的跟随入口发一条零速，让车在节点被 kill 前就停下
+    ros "ros2 topic pub --once /cmd_vel_follow geometry_msgs/msg/Twist '{}' >/dev/null 2>&1; sleep 0.3; true"
     kill_p2
     ros "ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist '{}' >/dev/null 2>&1; true"
     echo "P2 节点已停，机器人已停。亮度保持最后状态（bash sim/p1.sh led off 可复位）"
@@ -191,7 +203,10 @@ PY"
     "$DOCKER" ps --format '{{.Names}} | {{.Status}}' | grep "^$CONTAINER"
     echo
     echo "=== P2 节点 ==="
-    ros "ros2 node list 2>/dev/null | grep -E 'lightdog_(person_detector|person_sim|follower|light_auto)' || echo '  (未启动)'"
+    ros "ros2 node list 2>/dev/null | grep -E 'lightdog_(person_detector|person_sim|follower|light_auto|twist_mux)' || echo '  (未启动)'"
+    echo
+    echo "=== /cmd_vel 仲裁 ==="
+    show_mux
     echo
     echo "=== P2 话题 ==="
     ros "ros2 topic list 2>/dev/null | grep -E 'person|led/brightness|cmd_vel'"

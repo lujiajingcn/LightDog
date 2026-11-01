@@ -16,7 +16,12 @@ Nav2 留给 P3 的自动回充（那里有确定的静态目标点）。
 
     订阅 /person/position  geometry_msgs/PointStamped  frame=base_link
     订阅 /person/present   std_msgs/Bool
-    发布 /cmd_vel          geometry_msgs/Twist
+    发布 /cmd_vel_follow   geometry_msgs/Twist
+
+输出不直接发 `/cmd_vel`：那个话题上有 Nav2 的 collision_monitor / docking_server /
+command_timeout 一群发布者，跟随指令会被它们的空闲零速淹没（P2 实测：follower
+一直发 -0.15，机器人 6 秒只挪 5cm）。现在统一交给 `lightdog_twist_mux` 仲裁，
+再由 collision_monitor 兜碰撞保护。话题名可用 `cmd_vel_topic` 参数改。
 
 ## 控制律
 
@@ -57,6 +62,7 @@ class PersonFollower(Node):
         self.declare_parameter('angle_tol', 0.06)         # 角度死区
         self.declare_parameter('side_turn_only', 0.9)     # 超过此角度只转不走
         self.declare_parameter('person_timeout', 1.5)
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel_follow')
         self.declare_parameter('enabled', True)
 
         p = self.get_parameter
@@ -78,7 +84,8 @@ class PersonFollower(Node):
 
         self.create_subscription(PointStamped, '/person/position', self._on_pos, 10)
         self.create_subscription(Bool, '/person/present', self._on_present, 10)
-        self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_topic = str(p('cmd_vel_topic').value)
+        self.pub = self.create_publisher(Twist, self.cmd_topic, 10)
 
         self.create_timer(0.1, self._tick)   # 10 Hz
 

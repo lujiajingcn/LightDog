@@ -14,6 +14,7 @@ install(PROGRAMS
   lightdog_follower.py
   lightdog_light_auto.py
   lightdog_person_sim.py
+  lightdog_twist_mux.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

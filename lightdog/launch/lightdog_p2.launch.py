@@ -4,10 +4,23 @@
 
 - 感知层  lightdog_person_detector  相机 -> /person/present + /person/position
 - 决策层  lightdog_light_auto       有没有人 -> /led/brightness（渐变）
-- 执行层  lightdog_follower         人去哪 -> /cmd_vel
+- 执行层  lightdog_follower         人去哪 -> /cmd_vel_follow
 - 仿真专用 lightdog_person_sim      让仿真里的「人」自己走起来
 
 四个节点互相只通过上面这几个话题耦合，换检测器（YOLO）或换控制律不会牵连别人。
+
+## 仲裁层不在这里
+
+`lightdog_twist_mux` 由 `sim/entrypoint.sh` 常驻拉起，不跟 P2 一起起 ——
+`collision_monitor` 的输入已经指向它的输出，它一停 Nav2 也发不出速度。
+P2 只是往它里面多接一个 `/cmd_vel_follow` 源（优先级高于 Nav2）。
+
+## 为什么执行层不直接发 /cmd_vel
+
+`/cmd_vel` 上本来就挤着 Nav2 的 collision_monitor / docking_server /
+command_timeout 和 ros_gz_bridge。跟随指令直发进去会被它们的空闲零速淹没，
+而如果把它们 kill 掉又会丢掉碰撞保护。所以中间插一层仲裁，输出交给
+collision_monitor，最后由它独占 `/cmd_vel`。
 
 ## 人的生成不放在这里
 

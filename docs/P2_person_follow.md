@@ -14,18 +14,33 @@
                                        ▼                                            ▼
                               lightdog_light_auto                        lightdog_follower
                                        │                                            │
-                              /led/brightness                              /cmd_vel
+                              /led/brightness                            /cmd_vel_follow
                                        │                                            │
-                              （P1 材质下发）                              （仿真底盘）
+                              （P1 材质下发）                                       │
+                                                                            ┌───────┴────────┐
+   Nav2: controller → velocity_smoother → /cmd_vel_smoothed ────────────────┤                │
+                                                            lightdog_twist_mux（常驻仲裁）
+                                                                            └───────┬────────┘
+                                                                                    │ /cmd_vel_muxed
+                                                                          collision_monitor
+                                                                                    │ /cmd_vel
+                                                                          ros_gz_bridge → gz 底盘
 ```
 
-四个节点只通过上面这几个话题耦合。换检测器、换控制律、换照明策略都不牵连其他人。
+四个 P2 节点只通过上面这几个话题耦合。换检测器、换控制律、换照明策略都不牵连其他人。
+
+**执行层不直接发 `/cmd_vel`。** 那个话题上本来就挤着 Nav2 的 `collision_monitor`、
+`docking_server`、`command_timeout` 和 `ros_gz_bridge`，跟随指令直发进去会被它们的
+空闲零速淹没；而把它们 kill 掉又会丢掉碰撞保护。所以中间插一层常驻仲裁
+（`lightdog_twist_mux`，由 `sim/entrypoint.sh` 拉起，优先级 跟随 20 > Nav2 10 > 空闲），
+仲裁结果再交给 `collision_monitor`，仍由它独占 `/cmd_vel`。
 
 | 节点 | 职责 | 输入 | 输出 |
 |---|---|---|---|
 | `lightdog_person_detector` | 在画面里找到人，算出前向距离与左右偏移 | 相机 RGB-D + camera_info | `/person/present`、`/person/position`、`/person/debug_image` |
 | `lightdog_light_auto` | 有人亮、人走后延迟渐灭 | `/person/present` | `/led/brightness` |
-| `lightdog_follower` | 朝人走、保持 1.2m | `/person/position`、`/person/present` | `/cmd_vel` |
+| `lightdog_follower` | 朝人走、保持 1.2m | `/person/position`、`/person/present` | `/cmd_vel_follow` |
+| `lightdog_twist_mux` | `/cmd_vel` 多源仲裁（**常驻，不属于 P2**） | `/cmd_vel_smoothed`、`/cmd_vel_follow`、`/cmd_vel_dock` | `/cmd_vel_muxed`、`/cmd_vel_mux_state` |
 | `lightdog_person_sim` | 让仿真里的「人」按路径走（**仅仿真**） | — | gz `set_pose` |
 
 ## 二、两个关键取舍
@@ -94,7 +109,7 @@ cd /e/study_lujiajing/WorkSpace_LightDog/LightDog/LightDog/sim
 docker compose --env-file .env up -d          # 仿真栈（若没跑）
 
 cd ..
-bash sim/p2.sh start                          # 拉 P2 四个节点（会先停掉 Nav2 的运动节点）
+bash sim/p2.sh start                          # 拉 P2 四个节点（仲裁器已由 entrypoint 常驻）
 bash sim/p2.sh spawn                          # 在场景里生成「人」
 ```
 
@@ -105,9 +120,16 @@ bash sim/p2.sh spawn                          # 在场景里生成「人」
 
 ```bash
 bash sim/p2.sh watch        # present / position / cmd_vel 实时流
-bash sim/p2.sh status       # 节点、话题、相机帧率、亮度、人的位姿
+bash sim/p2.sh status       # 节点、仲裁状态、话题、相机帧率、亮度、人的位姿
 bash sim/p2.sh det          # 读一次检测结果
 bash sim/p2.sh log          # P2 节点日志
+```
+
+「车不动」时第一件事是看 **谁赢了仲裁**：
+
+```bash
+docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 topic echo /cmd_vel_mux_state --once'
+# follow → 跟随在控制；nav → Nav2 在控制；idle → 没有任何源在发
 ```
 
 跑完一轮想把机器人放回出生点：
@@ -184,7 +206,22 @@ bash sim/p1.sh led 0.5
 | 相机内参 | fx=343.16, cx=320.0, cy=240.0, hfov=1.5 rad |
 | 检测掩码 | 1.4m 处 9962 px，1.0m 处 8526 px |
 | 跟随到位精度 | 1.20 m（目标值），死区 ±0.15 |
-| 仿真实时因子 | 约 0.22x（wall 9s ≈ sim 2s） |
+| 仿真实时因子 | 约 0.22x～1.0x（随渲染负载波动） |
+| 仲裁结果 | P2 全程 2763/2763 采样为 `follow`，Nav2 未抢到一次 |
+| 碰撞拦停 | 0.2m/s 撞向 0.75m 外障碍，停在距障碍 4cm 处，零接触 |
+
+### 5. 仲裁层验收（`/cmd_vel` 多源）
+
+三条路径分别独立验证过，缺一条都不算数：
+
+| 场景 | 操作 | 期望 | 实测 |
+|---|---|---|---|
+| 跟随优先 | P2 运行、人在视野内 | 仲裁为 `follow` | ✓ 2763/2763 采样 |
+| Nav2 能接管 | 停掉 P2，向 `/cmd_vel_smoothed` 发 0.15 | 仲裁为 `nav`、车前进 | ✓ 6s 位移 0.32m |
+| 碰撞能拦 | 恒定 0.2m/s 直行撞向障碍 | 停在障碍前、不接触 | ✓ 停在 4cm 外 |
+
+第三条尤其重要：它证明仲裁没有把碰撞保护短路掉 —— 这正是 P2 早期
+「杀掉 Nav2 让 follower 独占」那个权宜之计留下的最大隐患。
 
 ## 六、踩过的坑（都是实测踩出来的）
 
@@ -200,12 +237,17 @@ bash sim/p1.sh led 0.5
    现在出生点改到 **(−1.8, 0.5)**：y ∈ [0.3, 0.7] 这一带是场景里唯一一条
    从 x=−2.4 到 2.4 全程无柱的长走廊。
 
-3. **Nav2 抢 `/cmd_vel`，follower 的指令被零速淹没**
-   `/cmd_vel` 上有 5 个发布者：follower、`command_timeout`、`collision_monitor`、
-   `docking_server`、`ros_gz_bridge`。Nav2 导航空闲时 `command_timeout` 持续发零速，
-   实测 follower 一直发 −0.15，机器人 6 秒只挪了 0.05m。
-   跟随和导航本来就是互斥的运动模式，`p2.sh start` 现在会先把 Nav2 的运动节点杀掉，
-   让 `/cmd_vel` 只剩 follower + bridge。
+3. **Nav2 抢 `/cmd_vel`，follower 的指令被零速淹没**（这一条后来演化成了仲裁层）
+   `/cmd_vel` 上有 4 个发布者：`collision_monitor`、`docking_server`、`command_timeout`、
+   `ros_gz_bridge`。Nav2 导航空闲时它们持续发零速，实测 follower 一直发 −0.15，
+   机器人 6 秒只挪了 0.05m。
+   跟随和导航本来就是互斥的运动模式，最初的权宜之计是 `p2.sh start` 里把 Nav2 的
+   运动节点整个 `kill -9` —— 能用，但**把碰撞保护一起杀了**。
+   现在换成标准架构：新增 `lightdog_twist_mux` 常驻仲裁（跟随 20 > 回充 30 >
+   Nav2 10，带超时释放），`collision_monitor` 的输入由 `patch_upstream.py`
+   改到 `/cmd_vel_muxed`，出口仍是 `/cmd_vel`。于是两个目标同时成立：
+   P2 跟随期间实测 **2763/2763 个采样都是 follow 生效**，Nav2 一次没抢到；
+   而碰撞保护一直在链路上（见第七节真机化的第 1 条实测）。
 
 4. **仿真人的头被检测器当成「人」，导致人走了灯不灭**
    头部原本用肤色 `RGB(0.82, 0.68, 0.58)`，软件渲染的暗光下饱和度被抬到 0.45 以上、
@@ -236,13 +278,24 @@ bash sim/p1.sh led 0.5
 
 9. **`pkill -f` 在这个容器里不生效**
    试过 `pkill -f controller_server` 等，进程纹丝不动，必须
-   `ps | grep | awk '{print $1}'` 拿到 PID 再 `kill -9`。`p2.sh` 的 `kill_p2`
-   和 `kill_nav_motion` 都按这个来。
+   `ps | grep | awk '{print $1}'` 拿到 PID 再 `kill -9`。`p2.sh` 的 `kill_p2` 按这个来。
 
 10. **双向桥接的方向符容易看错**
     `gazebo.launch.py` 里是 `/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist`，
     两个 `@` 是**双向**（`]` 才是 ROS→GZ 单向）。双向桥接会让 gz 侧的零速回灌到 ROS，
     排查运动问题时先确认谁在发。
+
+11. **仲裁器自己踩的两个坑（写的时候就该想到）**
+    - **状态话题只在「切换」时发布** → `ros2 topic echo --once` 永远等不到
+      （除非刚好撞上切换那一刻），排查「为什么车不动」时全是超时，反而更迷惑。
+      改成每次 tick 都发一条（`String` 很短，20Hz 的开销可以忽略）。
+    - **超时用 sim time** → 实时因子 0.22x 时，设计的 0.6s 窗口实际是 2.7s 墙钟，
+      上游进程已经死了还在转发它的最后一条指令。改成 `time.monotonic()`。
+
+12. **修改 `navigation.yaml` 必须走补丁脚本，不能手改**
+    该文件在 `install/` 空间，容器重建后会被上游覆盖；手改一次看似生效，
+    下次 `docker compose restart` 就悄悄回退了，而症状是「车突然不响应导航」。
+    `sim/patch_upstream.py` 每次启动都跑，幂等且锚点找不到会直接报错退出。
 
 ## 七、已知限制
 
@@ -255,22 +308,32 @@ bash sim/p1.sh led 0.5
    占位实现，不是产品方案。
 3. **只处理画面里最大的一块橙色**：同时有两个人会跟最近/最大的那个，没有多目标跟踪
    和身份保持（ID 会跳）。多人与身份保持属于 P4/P5 的范围。
-4. **不避障**：`/cmd_vel` 直发底盘，绕过 Nav2 的碰撞监测。仿真里人和机器人之间没有
-   其它障碍，真机上必须接 `collision_monitor` 或至少用 `/scan` 做前向急停。
-   **这是上真机前必须补的一项。** 注意 P2 为了独占 `/cmd_vel` 把 collision_monitor
-   停掉了，所以现在连仿真里都没有碰撞保护。产品化时这些多源速度应该走 `twist_mux`。
+4. **避障已接入，但只覆盖「前方碰撞」**
+   `/cmd_vel` 现在由 `collision_monitor` 独占，跟随指令也要先过它。
+   实测：恒定 0.2 m/s 直行撞向 0.75m 外的静态障碍，车在距障碍 **4cm** 处完全停住
+   （连续 3 秒零位移），没有发生接触。用的还是上游的 `FootprintApproach`
+   polygon（`time_before_collision: 1.2s`），配置没有改动。
+   局限在于它只管正前方的预测碰撞：侧向擦碰、低矮障碍（激光扫不到的高度）
+   都不在覆盖范围内，也不做绕行 —— 只会停，不会躲。
 5. **人迎面走来时机器人只会后退**：人的路径是往返，人往回走时会一路把机器人逼退，
    退到墙角就顶着不动。真实产品应该做侧向让位，P2 的 P 控制没有这一层。
+   （注意：后退方向如果撞到障碍，`collision_monitor` 同样会介入拦停。）
 6. **仿真「人」是 static 模型**：靠 `set_pose` 搬运（5Hz，每次起一个 `gz service`
    子进程），没有行走动画，也不会被机器人推动。视觉上是个会滑动的圆柱人，
    够验证检测/跟随，但不代表真人的运动特征。
 7. **软件渲染下仿真跑不满实时**：实时因子约 0.22x，相机 3.9Hz。所有节点都用
    `use_sim_time: true`，所以逻辑时长是对的，但操作手感比真机慢。
+   仲裁器的超时窗口是**唯一**按墙钟算的（它判断的是「上游还在不在发包」，
+   与仿真快慢无关），其余时间逻辑一律用 sim time。
+8. **跟随期间 Nav2 拿不到控制权**：跟随节点即使人丢了也在持续发零速，
+   所以 `follow` 源一直「活跃」，优先级压着 Nav2。要在跟随与导航之间切换，
+   必须停掉跟随节点（`enable_follow:=false`）或改优先级，不能指望它自己让位。
 
 ## 八、与路线图上其它阶段的关系
 
 - **P1**（已完成）：`/led/brightness`、`/battery_state` —— P2 直接复用
-- **P3 自动回充**：用 Nav2 `docking_server` + 底座 ArUco，与 P2 的跟随互不干扰
-  （回充时关掉 follower；那时 Nav2 要回来，`/cmd_vel` 的仲裁必须做 `twist_mux`）
+- **P3 自动回充**：用 Nav2 `docking_server` + 底座 ArUco。仲裁层的 `/cmd_vel_dock`
+  入口（prio 30）已经预留好，回充控制器接到那个话题上就会自动压过跟随；
+  跟随期间要回充则需先 `enable_follow:=false`
 - **P5 跌倒检测**：需要姿态关键点，届时把检测器换成 YOLOv8-pose / MediaPipe，
   本文件的接口不变
