@@ -176,6 +176,9 @@ async function pollStatus() {
   try {
     const st = await api('/status');
     renderStatus(st);
+    // 告警状态跟着 /status 一起回来 —— 不再单独轮询 /alarms，
+    // 少一条定时请求，而且弹层和顶栏永远同一时刻的数据，不会互相打脸。
+    renderAlarm(st.alert);
   } catch (e) {
     setConn('off');
     $('state-text').textContent = e.message.slice(0, 40);
@@ -324,6 +327,220 @@ async function startStream() {
       : '正在连接画面…';
     if (S.streamFails >= 3) setConn('wait');
     scheduleReconnect(wait);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 跌倒告警                                                            */
+/* ------------------------------------------------------------------ */
+
+const ALARM = {
+  active: false, acked: false, beepTimer: null, actx: null, last: null, unlocked: false,
+};
+
+function audioCtx() {
+  if (!ALARM.actx) {
+    const C = window.AudioContext || window.webkitAudioContext;
+    if (!C) return null;
+    try { ALARM.actx = new C(); } catch (_) { return null; }
+  }
+  return ALARM.actx;
+}
+
+function beepOnce(freq, dur) {
+  const c = audioCtx();
+  if (!c) return;
+  if (c.state === 'suspended') c.resume().catch(() => {});
+  const o = c.createOscillator();
+  const g = c.createGain();
+  o.type = 'square';
+  o.frequency.value = freq;
+  o.connect(g);
+  g.connect(c.destination);
+  const t = c.currentTime;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.22, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.start(t);
+  o.stop(t + dur + 0.05);
+}
+
+function startBeep() {
+  if (ALARM.beepTimer) return;
+  const tick = () => {
+    beepOnce(880, 0.35);
+    setTimeout(() => beepOnce(660, 0.35), 450);
+  };
+  tick();
+  ALARM.beepTimer = setInterval(tick, 2400);
+
+  // 手机浏览器要求音频必须由用户手势解锁，否则 resume() 会被拒绝。
+  // 这里挂一次性监听：用户碰一下屏幕就解锁（视觉告警本身已经足够醒目）。
+  if (!ALARM.unlocked) {
+    ALARM.unlocked = true;
+    const unlock = () => {
+      const c = audioCtx();
+      if (c && c.state === 'suspended') c.resume().catch(() => {});
+    };
+    document.addEventListener('touchstart', unlock, { once: true });
+    document.addEventListener('click', unlock, { once: true });
+  }
+}
+
+function stopBeep() {
+  clearInterval(ALARM.beepTimer);
+  ALARM.beepTimer = null;
+}
+
+function renderAlarm(a) {
+  const el = $('alarm');
+  const state = (a && a.state) || 'NORMAL';
+  const active = (state === 'ALARM' || state === 'ACKED');
+
+  if (!active) {
+    if (ALARM.active) {
+      el.hidden = true;
+      stopBeep();
+      document.title = 'LightDog · 远程看护';
+    }
+    ALARM.active = false;
+    ALARM.acked = false;
+    ALARM.last = null;
+    return;
+  }
+
+  ALARM.active = true;
+  ALARM.acked = (state === 'ACKED');
+  ALARM.last = a;
+
+  const contacts = a.contact_count || 0;
+  const rounds = a.rounds || 0;
+  const maxRounds = a.max_rounds || 0;
+  const isTest = !!a.is_test;
+
+  $('alarm-title').textContent = isTest ? '模拟告警'
+    : (ALARM.acked ? '告警已确认' : '检测到跌倒');
+  $('alarm-sub').textContent = isTest
+    ? '这是一次测试，不会打扰任何联系人'
+    : (ALARM.acked
+      ? '已收到确认，正在等人员起身'
+      : (contacts ? `正在按顺序联系 ${contacts} 位紧急联系人` : '未设置紧急联系人，请立即查看'));
+
+  // "已持续"必须按**墙钟**从告警发生那一刻算，不能用 age。
+  // age 是状态机里"进入当前状态后过了多久"（sim 时间、且进 ACKED 会归零），
+  // 直接显示会变成"告警已确认，已持续 14 秒"—— 读起来像告警只持续了 14 秒。
+  //
+  // 兜一层异常值：手机和机器人的时钟可能差几分钟（没对时），差太多就别用墙钟了，
+  // 否则会显示成"已持续 -3 分钟"或者"已持续 8 天"。
+  let dur = a.alarm_wall ? (Date.now() / 1000 - a.alarm_wall) : (a.age || 0);
+  if (!isFinite(dur) || dur < 0 || dur > 86400) dur = a.age || 0;
+  const rows = [
+    ['发生时间', fmtTime(a.alarm_wall)],
+    ['已持续', fmtSecs(dur)],
+    ['联系人', contacts ? contacts + ' 位' : '未设置'],
+    ['呼叫进度', maxRounds ? `${rounds}/${maxRounds} 轮` : '--'],
+  ];
+  if (a.z_p95 !== null && a.z_p95 !== undefined) {
+    rows.push(['人体高度', Number(a.z_p95).toFixed(2) + ' m']);
+  }
+  $('alarm-info').innerHTML = rows
+    .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+
+  const vb = $('alarm-video');
+  if (a.event_id) {
+    vb.disabled = false;
+    vb.textContent = '看现场视频';
+    vb.dataset.event = a.event_id;
+  } else {
+    vb.disabled = true;
+    vb.textContent = '视频生成中…';   // recorder 要等 post 窗口才合成完
+    vb.dataset.event = '';
+  }
+
+  const ab = $('alarm-ack');
+  ab.textContent = ALARM.acked ? '已确认' : '我已知晓';
+  ab.disabled = ALARM.acked;
+  $('alarm-icon').className = 'alarm-icon' + (ALARM.acked ? ' acked' : '');
+  el.classList.toggle('acked', ALARM.acked);
+
+  $('alarm-foot').textContent = isTest
+    ? '测试告警：不拨号、不自动解除，点「我已知晓」或在设置里复位结束'
+    : (a.call_enabled
+      ? '已按联系人顺序自动呼叫'
+      : '本机未配置外呼命令，仅记录并通知 App');
+
+  el.hidden = false;
+  document.title = isTest ? '模拟告警 · LightDog'
+    : (ALARM.acked ? '告警已确认 · LightDog' : '⚠ 跌倒告警 · LightDog');
+  if (ALARM.acked) stopBeep(); else startBeep();
+}
+
+/* 从告警弹层直接看现场视频。
+ *
+ * 有个时间差必须处理：告警在事件刚触发时就弹出来了，而 recorder 还要等
+ * post 窗口（默认 10 秒）才合成完 mp4。所以刚弹层时 event_id 是空的，
+ * 按钮显示"视频生成中…"并禁用；用户点的时候如果还是空的，就给他一个明确提示，
+ * 而不是打开一个 404 的播放器。 */
+function alarmVideo() {
+  const a = ALARM.last;
+  const id = $('alarm-video').dataset.event || (a && a.event_id) || '';
+  if (!id) {
+    toast('视频还在合成，大约再等 10 秒');
+    return;
+  }
+  openPlayer('跌倒现场',
+    withToken(API + '/events/' + encodeURIComponent(id) + '/video'),
+    fmtTime(a && a.alarm_wall));
+}
+
+async function ackAlarm() {
+  $('alarm-ack').disabled = true;
+  try {
+    await api('/alarms/ack', { method: 'POST' });
+    toast('已确认，告警停止重复呼叫');
+  } catch (e) {
+    $('alarm-ack').disabled = false;
+    toast('确认失败：' + e.message);
+  }
+}
+
+async function loadAlarms() {
+  const box = $('alarms');
+  try {
+    const data = await api('/alarms');
+    const list = data.alarms || [];
+    $('alarms-empty').style.display = list.length ? 'none' : 'block';
+
+    box.innerHTML = list.map((a) => {
+      const st = a.state || '';
+      // NORMAL 是"人工复位"之后的状态，对用户来说同样是"已解除"
+      const cls = st === 'ACKED' ? 'acked' : ((st === 'RESOLVED' || st === 'NORMAL') ? 'resolved' : '');
+      const tag = st === 'ACKED' ? '已确认'
+        : ((st === 'RESOLVED' || st === 'NORMAL') ? '已解除' : '告警中');
+      // 测试告警的 id 带 _test 后缀（老记录里没有 is_test 字段，靠后缀兜底）
+      const isTest = a.is_test || /_test$/.test(a.alarm_id || '');
+      const n = (a.call_attempts || []).length;
+      const eid = a.event_id || '';
+      return `<div class="item alarm-item ${cls}" data-alarm="${encodeURIComponent(eid)}">
+        <div class="item-body">
+          <div class="item-title">${isTest ? '模拟告警' : '跌倒告警'}</div>
+          <div class="item-sub">${fmtTime(a.alarm_wall)}${n ? ' · 已呼叫 ' + n + ' 次' : ''}</div>
+        </div>
+        <span class="item-tag">${tag}</span>
+      </div>`;
+    }).join('');
+
+    box.querySelectorAll('[data-alarm]').forEach((el) => {
+      el.addEventListener('click', () => {
+        const id = decodeURIComponent(el.dataset.alarm || '');
+        if (!id) { toast('这条告警还没有可用视频'); return; }
+        openPlayer('告警视频',
+          withToken(API + '/events/' + encodeURIComponent(id) + '/video'), '');
+      });
+    });
+  } catch (e) {
+    $('alarms-empty').style.display = 'block';
+    $('alarms-empty').textContent = '读取告警失败：' + e.message;
   }
 }
 
@@ -519,6 +736,16 @@ async function triggerEvent() {
   }
 }
 
+async function alarmCmd(cmd, okMsg) {
+  try {
+    const r = await api('/alarms/' + cmd, { method: 'POST' });
+    toast(okMsg + (r && r.state ? '（' + r.state + '）' : ''));
+    pollStatus();
+  } catch (e) {
+    toast('操作失败：' + e.message);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 视图切换 / 启动                                                     */
 /* ------------------------------------------------------------------ */
@@ -532,7 +759,7 @@ function switchView(name) {
   });
   // hash 深链：手机上把某一页加书签 / 分享给家人时能直达
   try { history.replaceState(null, '', '#' + name); } catch (_) {}
-  if (name === 'events') { loadEvents(); loadClips(); }
+  if (name === 'events') { loadEvents(); loadAlarms(); loadClips(); }
   if (name === 'settings') { loadContacts(); pollStatus(); }
 }
 
@@ -555,7 +782,20 @@ function boot() {
   $('btn-snap').addEventListener('click', takeSnapshot);
   $('btn-event').addEventListener('click', triggerEvent);
   $('btn-reload-events').addEventListener('click', () => { loadEvents(); loadClips(); });
+  $('btn-reload-alarms').addEventListener('click', loadAlarms);
   $('player-close').addEventListener('click', closePlayer);
+
+  // 告警弹层
+  $('alarm-ack').addEventListener('click', ackAlarm);
+  $('alarm-video').addEventListener('click', alarmVideo);
+  $('alarm-icon').addEventListener('click', () => {
+    // 戳一下大图标＝静音/恢复蜂鸣。有些场合（开会、半夜）只想看不想响。
+    if (ALARM.beepTimer) { stopBeep(); toast('已静音'); }
+    else if (ALARM.active && !ALARM.acked) { startBeep(); toast('已开启提示音'); }
+  });
+
+  $('btn-alarm-test').addEventListener('click', () => alarmCmd('test', '已触发模拟告警'));
+  $('btn-alarm-reset').addEventListener('click', () => alarmCmd('reset', '已复位'));
 
   $('btn-add-contact').addEventListener('click', () => {
     const name = $('c-name').value.trim();

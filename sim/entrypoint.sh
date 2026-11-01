@@ -78,9 +78,12 @@ sleep 8
 #      相机没出图时 recorder 只是空转，server 的 /status 照样回 200。早点起，
 #      GUI 那 30 秒的等待时间里录像已经开始了。
 P4_PID=""
+# 存储卡根目录。P4 的录像和 P5 的 contacts.json 都落在这里，所以在两个
+# ENABLE_* 判断之前就定下来（否则 ENABLE_P4=0 时它会是个空串，
+# contacts_path 就变成 `:=/contacts.json`，参数看着合法但指向根目录）。
+DATA_DIR="${LIGHTDOG_DATA_DIR:-/data}"
+mkdir -p "$DATA_DIR"
 if [ "${ENABLE_P4:-1}" = "1" ]; then
-  DATA_DIR="${LIGHTDOG_DATA_DIR:-/data}"
-  mkdir -p "$DATA_DIR"
   # 注意：空的 `auth_token:=` 会被 ros2 launch 判成 malformed argument 直接退出，
   # 所以这里的 P4_ARGS 必须按需拼接，不能写成固定字符串。
   P4_ARGS="data_dir:=$DATA_DIR"
@@ -93,6 +96,25 @@ if [ "${ENABLE_P4:-1}" = "1" ]; then
   P4_PID=$!
   echo "  P4 PID $P4_PID (log /tmp/p4.log)"
 fi
+
+# 6.6) P5：跌倒检测 + 告警状态机
+#
+#      必须在 P4 之后起：告警时要往 /recorder/event 发切片请求，recorder 不在
+#      的话告警照样能发（只是没有视频）。反过来 P4 完全不依赖 P5，两个阶段
+#      谁先谁后都不会崩，这也是当初把它们拆成两个 launch 的原因。
+#
+#      默认开：没有 "人" 的时候检测器只是持续报 absent，代价可以忽略，
+#      但手机端 /status 里的 alert 字段一直是 NORMAL —— 看起来才像个成品。
+P5_PID=""
+if [ "${ENABLE_P5:-1}" = "1" ]; then
+  echo "=== Starting P5 fall detector + alert manager ==="
+  nohup ros2 launch lightdog lightdog_p5.launch.py \
+      contacts_path:="$DATA_DIR/contacts.json" \
+      > /tmp/p5.log 2>&1 &
+  P5_PID=$!
+  echo "  P5 PID $P5_PID (log /tmp/p5.log)"
+fi
+
 
 # 7) Gazebo GUI（默认开）。两件事决定了这段必须放在 SLAM 之后：
 #    - 容器里 gz 只跑服务端，不拉 GUI 的话浏览器里只有 RViz，看不到车身和 LED
@@ -127,11 +149,12 @@ echo "  GUI:    PID ${GUI_PID:-未启动}"
 echo "  SLAM:   PID $SLAM_PID"
 echo "  Mux:    PID $MUX_PID (log /tmp/twist_mux.log)"
 echo "  P4:     PID ${P4_PID:-未启动} (log /tmp/p4.log)"
+echo "  P5:     PID ${P5_PID:-未启动} (log /tmp/p5.log)"
 
 echo "  LED log: /tmp/lightdog_led.log (via ros2 launch)"
 echo ""
 
 wait -n $SIM_PID $SLAM_PID
 echo "A process exited, shutting down..."
-kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} ${P4_PID:-} 2>/dev/null || true
+kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} ${P4_PID:-} ${P5_PID:-} 2>/dev/null || true
 exit 0

@@ -49,6 +49,7 @@ services:
       # 容器重建后录像还在，宿主机上也能直接翻文件。
       - LIGHTDOG_DATA_DIR=/data
       - ENABLE_P4=${ENABLE_P4:-1}
+      - ENABLE_P5=${ENABLE_P5:-1}
       - LIGHTDOG_TOKEN=${LIGHTDOG_TOKEN:-}
     working_dir: /home/ros
     entrypoint: ["/bin/bash", "/entrypoint.sh"]

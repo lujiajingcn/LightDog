@@ -19,6 +19,8 @@ install(PROGRAMS
   lightdog_dock_manager.py
   lightdog_recorder.py
   lightdog_server.py
+  lightdog_fall_detector.py
+  lightdog_alert_manager.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

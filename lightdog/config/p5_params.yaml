@@ -1,0 +1,73 @@
+# LightDog P5 参数（跌倒检测 + 告警链路）
+#
+# 时间参数全部依赖仿真时钟，use_sim_time: true。
+# 注意：软件渲染下实时因子约 0.2x，也就是说 `suspect_hold: 5.0` 在墙钟上要等
+# 约 25 秒。真机上两者一致，不用把参数改小。
+
+/lightdog_fall_detector:
+  ros__parameters:
+    use_sim_time: true
+
+    rgb_topic: /camera/color/image_raw
+    depth_topic: /camera/depth/image_rect_raw
+    info_topic: /camera/color/camera_info
+
+    # 相机装车几何（与 p2/p3 保持同一套值）。光心离地 = 0.255 + 0.1195 = 0.3745m，
+    # 这个数错了，判出来的"离地高度"会整体平移，阈值就全失准。
+    camera_offset: [-0.065, 0.0, 0.255]
+    base_link_height: 0.1195
+
+    # 橙色上衣的 HSV（与 P2 检测器同一套实测值）
+    h_min: 0.012
+    h_max: 0.090
+    s_min: 0.45
+    v_min: 0.15
+    min_points: 200
+    range_min: 0.30
+    range_max: 8.00
+
+    # 判据：人体点云离地高度的 95 分位（米）。
+    # 橙色躯干下沿 0.72m，所以站着时 z_p95 必然 >= 0.72；躺倒时整根压在 0~0.34m。
+    # 0.50 / 0.68 落在 (0.34, 0.72) 这个空档里，两边都有余量。
+    lying_top_max: 0.50
+    stand_top_min: 0.68
+
+    rate: 10.0
+    absent_timeout: 1.5
+    publish_debug: true
+
+/lightdog_alert_manager:
+  ros__parameters:
+    use_sim_time: true
+
+    # ---- 一级确认：姿态持续性 ----
+    suspect_hold: 5.0         # 连续躺倒多少秒才算"可疑"（过滤弯腰/蹲下）
+    lying_gap: 1.0            # 判据抖动容忍：1 秒内还看到过 lying 就仍然算躺着
+
+    # ---- 二级确认：交互无响应 ----
+    confirm_window: 15.0      # 语音问询后再等多久；这期间站起来就取消
+    recover_hold: 3.0         # 站起来持续多久算真的恢复了
+
+    # ---- 告警 ----
+    resolved_hold: 5.0
+    contacts_path: /data/contacts.json
+    # 空 = 只记录不真拨（仿真默认）。真机配成外呼命令模板，
+    # 例如：asterisk -rx "channel originate SIP/{phone} extension s@alarm"
+    # 支持占位符 {phone} {name} {attempt}；参数用 shlex 切分，不经过 shell。
+    call_command: ''
+    call_interval: 20.0       # 两次呼叫间隔（仿真秒）
+    max_rounds: 3             # 联系人轮询几轮后放弃
+    # 事件视频的取帧窗口（秒，仿真/机器人时间）。
+    #
+    # pre 必须 >= suspect_hold + confirm_window + 余量（5 + 15 + 5 = 25）：
+    # 告警是在「躺倒 5 秒 + 问询 15 秒无响应」之后才触发的，如果 pre 只给 15 秒，
+    # 视频起点正好卡在问询开始那一刻 —— 人已经躺在地上了，最关键的「怎么倒的」
+    # 反而没拍到（第一版就是 15，实测抽首帧发现人已经躺平）。
+    event_pre: 25.0
+    event_post: 10.0
+    auto_reset: true          # 人站起来后自动解除（false 则需人工 reset）
+
+    fall_state_topic: /fall/state
+    fall_z_topic: /fall/z_p95
+    event_topic: /recorder/event
+    tick_hz: 5.0

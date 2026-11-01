@@ -245,7 +245,7 @@ main { padding: 12px 14px 24px; }
 /* ---------------- 播放器 ---------------- */
 
 .player {
-  position: fixed; inset: 0; z-index: 50;
+  position: fixed; inset: 0; z-index: 80;
   background: rgba(0, 0, 0, .96);
   display: flex; flex-direction: column;
   padding: calc(12px + env(safe-area-inset-top, 0px)) 12px calc(16px + var(--safe-b));
@@ -259,6 +259,81 @@ main { padding: 12px 14px 24px; }
   object-fit: contain;
 }
 .player-meta { font-size: 12px; color: var(--fg-dim); margin-top: 10px; text-align: center; }
+
+/* ---------------- 跌倒告警 ---------------- */
+
+/* 整屏盖住：告警是这套设备唯一"必须被看见"的东西，不能做成一个小横幅 */
+.alarm {
+  position: fixed; inset: 0; z-index: 70;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  background: rgba(92, 8, 12, .97);
+  animation: alarm-pulse 1.6s ease-in-out infinite;
+}
+.alarm[hidden] { display: none; }
+@keyframes alarm-pulse {
+  0%, 100% { background: rgba(92, 8, 12, .97); }
+  50%      { background: rgba(140, 12, 18, .97); }
+}
+
+.alarm-box {
+  width: 100%; max-width: 420px;
+  background: #1a0507;
+  border: 1.5px solid #ff5a5f;
+  border-radius: 18px;
+  padding: 22px 20px 18px;
+  text-align: center;
+}
+.alarm-icon {
+  width: 56px; height: 56px; margin: 0 auto 12px;
+  border-radius: 50%;
+  background: #e5484d; color: #fff;
+  font-size: 32px; font-weight: 700; line-height: 56px;
+  animation: alarm-blink 1s steps(2, end) infinite;
+  cursor: pointer;              /* 点一下＝静音/恢复提示音 */
+  user-select: none;
+}
+@keyframes alarm-blink { 50% { opacity: .35; } }
+
+/* 已确认：不再闪、不再脉冲，视觉上立刻"降级"。
+ * 这一下很重要 —— 家人确认后如果屏幕还在疯狂闪红，他会以为没生效又去点。 */
+.alarm.acked { animation: none; background: rgba(20, 34, 26, .97); }
+.alarm.acked .alarm-box { background: #0d1a12; border-color: #3f7a56; }
+.alarm-icon.acked { background: #3f7a56; animation: none; }
+.alarm.acked .alarm-box h1 { color: #cfe9da; }
+.alarm.acked .alarm-sub { color: #8fbfa3; }
+.alarm.acked .alarm-kv dt { color: #8fbfa3; }
+.alarm.acked .alarm-foot { color: #6f9581; }
+.alarm.acked .btn { border-color: #2c5440; background: #12241a; color: #cfe9da; }
+.alarm.acked .btn.solid { background: #2f6a49; border-color: #2f6a49; color: #eaf7ee; }
+.alarm-box h1 { margin: 0 0 6px; font-size: 22px; color: #fff; letter-spacing: .5px; }
+.alarm-sub { margin: 0 0 16px; font-size: 13px; color: #ffb3b5; }
+
+.alarm-kv {
+  margin: 0 0 18px; padding: 12px;
+  display: grid; grid-template-columns: auto 1fr; gap: 6px 12px;
+  background: rgba(255, 255, 255, .05); border-radius: 10px;
+  font-size: 13px; text-align: left;
+}
+.alarm-kv dt { color: #ff9b9e; }
+.alarm-kv dd { margin: 0; text-align: right; color: #fff; font-variant-numeric: tabular-nums; }
+
+.alarm-actions { display: flex; flex-direction: column; gap: 10px; }
+.alarm .btn {
+  border-color: #6b2a2d; background: #2a0e11; color: #ffd9da;
+  padding: 15px 12px; font-size: 16px;
+}
+.alarm .btn.solid {
+  background: #e5484d; border-color: #e5484d; color: #fff;
+  order: -1;                    /* 让"我已知晓"排在前面，拇指更容易够到 */
+}
+.alarm .btn:active { transform: scale(.98); }
+.alarm-foot { margin: 14px 0 0; font-size: 12px; color: #b9777a; }
+
+/* 告警记录条目 */
+.alarm-item .item-tag { background: #3a1214; color: #ff9b9e; }
+.alarm-item.acked .item-tag { background: #1f3326; color: #7bd39a; }
+.alarm-item.resolved .item-tag { background: #232e3d; color: #8b9bb0; }
 
 /* ---------------- toast ---------------- */
 

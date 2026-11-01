@@ -183,6 +183,7 @@ class LightDogServer(Node):
         self.declare_parameter('web_dir', '')
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('battery_topic', '/battery_state')
+        self.declare_parameter('alert_topic', '/alert/state')
         self.declare_parameter('jpeg_quality', 75)
         self.declare_parameter('stream_fps', 10.0)      # 推流上限（不是相机帧率）
         self.declare_parameter('device_name', 'LightDog')
@@ -222,6 +223,8 @@ class LightDogServer(Node):
         self.battery_raw = None      # /battery_state 兜底，P3 没起时也能显示电量
         self.person_present = False
         self.mux_source = ''
+        self.alert = {}              # /alert/state（P5 告警状态机）
+        self._alert_logged = ''      # 已经落盘过的最新 (alarm_id, state)
 
         sensor_qos = QoSProfile(depth=1,
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -234,8 +237,10 @@ class LightDogServer(Node):
         self.create_subscription(Float32, '/dock/battery_ratio', self._on_battery, 5)
         self.create_subscription(Bool, '/person/present', self._on_person, 5)
         self.create_subscription(String, '/cmd_vel_mux_state', self._on_mux, 5)
+        self.create_subscription(String, str(p('alert_topic').value), self._on_alert, 10)
 
         self.pub_event = self.create_publisher(String, '/recorder/event', 10)
+        self.pub_alert_cmd = self.create_publisher(String, '/alert/command', 10)
 
         self.get_logger().info(
             f'LightDog server: http://{self._lan_ip()}:{self.port}/ '
@@ -279,6 +284,40 @@ class LightDogServer(Node):
     def _on_mux(self, msg: String):
         self.mux_source = msg.data.strip('"')
 
+    def _on_alert(self, msg: String):
+        try:
+            a = json.loads(msg.data)
+        except Exception:
+            return
+        if not isinstance(a, dict):
+            return
+        self.alert = a
+
+        # 告警事件日志：只在 (alarm_id, state) 变化时落一行，
+        # 否则 1Hz 的状态上报会把 alarms.jsonl 写爆。
+        key = '%s|%s' % (a.get('alarm_id', ''), a.get('state', ''))
+        if key == self._alert_logged:
+            return
+        st = a.get('state', '')
+        # NORMAL 也要落一行：人工 reset 是从 ALARM 直接跳 NORMAL 的（不经过
+        # RESOLVED），不记的话这条告警在历史里会永远停在"告警中"。
+        if st in ('ALARM', 'ACKED', 'RESOLVED', 'NORMAL') and a.get('alarm_id'):
+            self._alert_logged = key
+            self._append_alarm(a)
+
+    def _append_alarm(self, a):
+        rec = dict(a)
+        rec['logged_wall'] = round(time.time(), 3)
+        path = os.path.join(self.data_dir, 'alarms.jsonl')
+        try:
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            self.get_logger().warn(
+                f'告警落盘：{a.get("alarm_id")} -> {a.get("state")} '
+                f'（联系人 {a.get("contact_count", 0)} 个）')
+        except Exception as e:
+            self.get_logger().error(f'写 {path} 失败：{e}')
+
     # ---------- 汇总 ----------
 
     def _lan_ip(self):
@@ -305,8 +344,56 @@ class LightDogServer(Node):
         except Exception:
             return {}
 
+    def event_of_alarm(self, alarm_id):
+        """按 `note` 字段精确找回某条告警对应的那段视频。
+
+        为什么不能只按时间猜：`newest_event_since` 找的是「wall 之后最新的一个」，
+        对"正在响的告警"够用，但翻历史记录时会串到后面那次告警的视频上去。
+        `lightdog_alert_manager` 触发切片时会带上 `note=alert_manager:<alarm_id>`，
+        recorder 原样存进 meta.json —— 拿它做唯一关联就没这个问题。
+        """
+        if not alarm_id:
+            return ''
+        want = 'alert_manager:%s' % alarm_id
+        try:
+            for name in os.listdir(self.events_dir):
+                d = os.path.join(self.events_dir, name)
+                # 必须有 video.mp4：告警刚触发时目录已建、视频还在合成
+                if not os.path.isfile(os.path.join(d, 'video.mp4')):
+                    continue
+                try:
+                    with open(os.path.join(d, 'meta.json'), 'r', encoding='utf-8') as f:
+                        m = json.load(f)
+                except Exception:
+                    continue
+                if m.get('note') == want:
+                    return str(m.get('id') or name)
+        except FileNotFoundError:
+            pass
+        return ''
+
+    def current_alert(self):
+        """当前告警状态，并补上 `event_id`。
+
+        告警视频是异步的（recorder 要等 post 窗口才合成完），所以 event_id
+        不能在告警那一刻定死，只能在有人来查的时候现查一次 —— 视频好了自然就出现。
+
+        `/status` 和 `/api/v1/alarms` 都走这里：两个接口各算一份的话，
+        手机端轮询 /status 拿到了 event_id、切到事件页却发现 `current` 里没有，
+        这种"同一个东西两副面孔"的 bug 最难查。
+        """
+        a = dict(self.alert) if self.alert else {}
+        # 告警中才去查视频：既省 IO，也避免 NORMAL 时无谓地扫事件目录
+        if a.get('state') in ('ALARM', 'ACKED') and not a.get('event_id'):
+            ev = (self.event_of_alarm(a.get('alarm_id'))
+                  or self.newest_event_since(float(a.get('alarm_wall') or 0) - 1.0))
+            if ev:
+                a['event_id'] = ev
+        return a
+
     def status(self):
         cs, _ = self.load_contacts()
+        alert = self.current_alert()
         st = {
             'device': {
                 'name': self.device_name,
@@ -325,6 +412,7 @@ class LightDogServer(Node):
             'recorder': self.recorder,
             'storage': dict(self._disk(), clips=len(self._clips())),
             'contacts': len(cs),
+            'alert': alert,
         }
         return st
 
@@ -373,6 +461,73 @@ class LightDogServer(Node):
             return None
         d = os.path.join(self.events_dir, eid)
         return d if os.path.isdir(d) else None
+
+    def newest_event_since(self, wall):
+        """找 wall 之后生成的最新事件（必须有 video.mp4）。
+
+        P5 的告警视频是异步的：告警在 t 时刻触发，recorder 要等到 t+post
+        才合成完。所以不能在告警时就把 event_id 定下来 —— 手机轮询 status 时
+        现查，等视频好了自然就出现了。
+        """
+        best = None
+        try:
+            for name in os.listdir(self.events_dir):
+                d = os.path.join(self.events_dir, name)
+                if not os.path.isfile(os.path.join(d, 'video.mp4')):
+                    continue
+                try:
+                    with open(os.path.join(d, 'meta.json'), 'r', encoding='utf-8') as f:
+                        m = json.load(f)
+                except Exception:
+                    continue
+                w = float(m.get('wall') or 0.0)
+                if w >= wall and (best is None or w > best[0]):
+                    best = (w, str(m.get('id') or name))
+        except FileNotFoundError:
+            pass
+        return best[1] if best else ''
+
+    def alarms(self):
+        """把 alarms.jsonl 这个事件日志按 alarm_id 折叠成"每条告警的最终状态"。"""
+        path = os.path.join(self.data_dir, 'alarms.jsonl')
+        by_id = {}
+        order = []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    aid = r.get('alarm_id') or ''
+                    if not aid:
+                        continue
+                    if aid not in by_id:
+                        order.append(aid)
+                        by_id[aid] = dict(r)
+                    else:
+                        prev = by_id[aid]
+                        prev['state'] = r.get('state', prev['state'])
+                        prev['call_attempts'] = r.get('call_attempts', prev.get('call_attempts', []))
+                        prev['rounds'] = r.get('rounds', prev.get('rounds', 0))
+        except FileNotFoundError:
+            return []
+        out = [by_id[a] for a in order]
+        out.reverse()                       # 最新的在前
+        for a in out:
+            if a.get('event_id'):
+                continue
+            # 先按 note 精确关联（历史记录也能拿到视频），
+            # 老记录没有 note 时才退回"按时间找最近一条"。
+            ev = self.event_of_alarm(a.get('alarm_id'))
+            if not ev and a.get('state') in ('ALARM', 'ACKED'):
+                ev = self.newest_event_since(float(a.get('alarm_wall') or 0) - 1.0)
+            if ev:
+                a['event_id'] = ev
+        return out
 
     # ---------- 联系人 ----------
 
@@ -576,6 +731,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/v1/events':
             return self._json({'events': self.node._events()})
 
+        if path == '/api/v1/alarms':
+            return self._json({'alarms': self.node.alarms(),
+                               'current': self.node.current_alert()})
+
         if path == '/api/v1/clips':
             return self._json({'clips': self.node._clips()})
 
@@ -666,6 +825,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/v1/events' and method == 'POST':
                 return self._post_event(raw)
 
+            if path.startswith('/api/v1/alarms/') and method == 'POST':
+                return self._post_alarm_cmd(path[len('/api/v1/alarms/'):].strip('/'))
+
             if path == '/api/v1/contacts' and method in ('PUT', 'POST'):
                 return self._put_contacts(raw)
 
@@ -694,6 +856,22 @@ class Handler(BaseHTTPRequestHandler):
         self.node.pub_event.publish(msg)
         self.node.get_logger().info(f'HTTP 触发事件：{msg.data}')
         return self._json({'ok': True, 'queued': req}, 202)
+
+    def _post_alarm_cmd(self, action):
+        """手机端对告警的三个动作：确认已知晓 / 测试 / 复位。
+
+        走 ROS 话题转给 `lightdog_alert_manager`，而不是让后端直接改状态 ——
+        状态机的唯一所有者必须是那个节点，否则两边各记一份迟早对不上。
+        """
+        mapping = {'ack': 'ack', 'test': 'test', 'reset': 'reset'}
+        cmd = mapping.get(action)
+        if cmd is None:
+            return self._err(400, 'unknown alarm action (ack|test|reset)')
+        m = String()
+        m.data = cmd
+        self.node.pub_alert_cmd.publish(m)
+        self.node.get_logger().info(f'HTTP 下发告警命令：{cmd}')
+        return self._json({'ok': True, 'command': cmd}, 202)
 
     def _put_contacts(self, raw):
         try:

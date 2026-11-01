@@ -54,6 +54,13 @@
     <p id="events-empty" class="empty">还没有事件。事发前后各 10 秒会自动保存。</p>
 
     <div class="sec-head">
+      <h2>告警记录</h2>
+      <button id="btn-reload-alarms" class="btn ghost small">刷新</button>
+    </div>
+    <div id="alarms" class="list"></div>
+    <p id="alarms-empty" class="empty">还没有告警。</p>
+
+    <div class="sec-head">
       <h2>最近录像</h2>
       <span class="hint" id="clips-hint"></span>
     </div>
@@ -73,6 +80,13 @@
 
     <div class="sec-head"><h2>设备</h2></div>
     <dl class="kv" id="device-info"></dl>
+
+    <div class="sec-head"><h2>告警</h2></div>
+    <p class="hint">真实跌倒需要「持续躺倒 + 问询无响应」两级确认后才报警，避免弯腰、蹲下误报。</p>
+    <div class="actions">
+      <button id="btn-alarm-test" class="btn warn">模拟一次告警</button>
+      <button id="btn-alarm-reset" class="btn">复位</button>
+    </div>
 
     <div class="sec-head"><h2>访问令牌</h2></div>
     <p class="hint">真机部署时应设置令牌，否则同一网络内任何人都能看画面。</p>
@@ -98,6 +112,21 @@
   </div>
   <video id="player-video" controls playsinline webkit-playsinline preload="metadata"></video>
   <div class="player-meta" id="player-meta"></div>
+</div>
+
+<!-- 跌倒告警：盖住整个屏幕，不给人忽略的机会 -->
+<div id="alarm" class="alarm" hidden>
+  <div class="alarm-box">
+    <div class="alarm-icon" id="alarm-icon">!</div>
+    <h1 id="alarm-title">检测到跌倒</h1>
+    <p class="alarm-sub" id="alarm-sub"></p>
+    <dl class="alarm-kv" id="alarm-info"></dl>
+    <div class="alarm-actions">
+      <button id="alarm-video" class="btn">看现场视频</button>
+      <button id="alarm-ack" class="btn solid">我已知晓</button>
+    </div>
+    <p class="alarm-foot" id="alarm-foot"></p>
+  </div>
 </div>
 
 <div id="toast" class="toast"></div>
