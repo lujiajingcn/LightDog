@@ -9,6 +9,7 @@ source /home/ros/linorobot2_ws/install/setup.bash
 
 WORLD="${WORLD:-turtlebot3_world}"
 SPAWN_X="${SPAWN_X:-0.5}"
+SPAWN_Y="${SPAWN_Y:-0.0}"
 
 # 1) 上游唯一必需的补丁（幂等；失败则直接退出，不带着坏配置继续）
 echo "=== Patching upstream ==="
@@ -40,7 +41,7 @@ ros2 launch lightdog lightdog_sim.launch.py \
     gui:=false \
     world_name:="${WORLD}" \
     spawn_x:="${SPAWN_X}" \
-    spawn_y:=0.0 \
+    spawn_y:="${SPAWN_Y}" \
     spawn_yaw:=0.0 &
 SIM_PID=$!
 

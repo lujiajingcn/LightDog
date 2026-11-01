@@ -1,0 +1,78 @@
+# LightDog P2 参数（人体检测 / 跟随 / 光照联动）
+#
+# 时间相关参数依赖仿真时钟，所以四个节点统一 use_sim_time: true。
+# 换真机时把 use_sim_time 设成 false 即可，其余参数可沿用。
+
+/lightdog_person_detector:
+  ros__parameters:
+    use_sim_time: true
+
+    rgb_topic: /camera/color/image_raw
+    depth_topic: /camera/depth/image_rect_raw
+    info_topic: /camera/color/camera_info
+
+    # 4wd 车型 depth_sensor_pose = xyz "-0.065 0 0.255" rpy "0 0 0"
+    # 见 linorobot2_description/urdf/4wd_properties.urdf.xacro
+    camera_offset: [-0.065, 0.0, 0.255]
+
+    # 橙色上衣实测 H≈0.052（18.7°）。范围放宽到 4°~32° 容忍光照造成的偏移，
+    # 靠 s_min 把低饱和的墙面/暖白灯条挡在外面（灯条 s≈0.2）。
+    h_min: 0.012
+    h_max: 0.090
+    s_min: 0.45
+    v_min: 0.15
+
+    min_blob_px: 150       # 3m 处躯干约 2800px，5m 处约 1000px
+    col_gap: 6             # 列方向允许的空隙，容忍身上阴影断开
+    range_min: 0.30
+    range_max: 8.00
+
+    # 形状约束：只用来滤掉极端横向的色块，不能卡太紧。
+    # 实测：1.4m 处站立躯干 bbox 高/宽 ≈ 1.45，但相机只有 0.275m 高，
+    # 人贴近到 0.8m 时躯干在画面里只剩一条横带（140x56px，比值 0.4），
+    # 卡 1.20 会把中近距离的人一起滤掉。头部误检靠"深色头发"从颜色上解决，
+    # 这里的形状约束只兜底（0.55 仍能挡掉纯地砖/墙面那种扁色块）。
+    aspect_min: 0.55
+    min_height_px: 30
+
+    publish_debug: true
+    rate: 10.0             # 软件渲染下别给太高，10Hz 够跟随用
+    lost_timeout: 1.0
+
+/lightdog_light_auto:
+  ros__parameters:
+    use_sim_time: true
+    on_brightness: 0.85
+    idle_brightness: 0.0
+    fade_delay: 5.0        # 人走后先等 5s，容忍短暂丢检
+    fade_time: 2.0
+    step_hz: 20.0
+    enabled: true
+
+/lightdog_follower:
+  ros__parameters:
+    use_sim_time: true
+    target_distance: 1.20
+    distance_tol: 0.15
+    stop_distance: 0.55
+    k_linear: 0.9
+    max_linear: 0.25
+    k_angular: 1.4
+    max_angular: 0.70
+    angle_tol: 0.06
+    side_turn_only: 0.9
+    person_timeout: 1.5
+    enabled: true
+
+/lightdog_person_sim:
+  ros__parameters:
+    use_sim_time: true
+    world_name: turtlebot3_world
+    entity_name: person
+    # 直线往返：像是从床边走到卫生间再走回来（单位 m，成对 x,y）
+    # y=0.5 是 turtlebot3_world 里唯一一条没有装饰圆柱的长走廊，见 sim/.env 的说明。
+    # 单程 2.4m，往返 4.8m，0.3m/s 约 16s 一圈。
+    waypoints: [-0.4, 0.5, 2.0, 0.5]
+    speed: 0.30
+    update_hz: 5.0
+    enabled: true

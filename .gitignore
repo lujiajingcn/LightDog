@@ -16,3 +16,6 @@ linorobot2/
 
 ## 临时输出
 *.log
+
+## WorkBuddy 本地工作区数据（memory、临时脚本、上游副本），不入库
+.workbuddy/

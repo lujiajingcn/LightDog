@@ -28,6 +28,7 @@ services:
       - LINOROBOT2_BASE=${ROBOT_BASE}
       - WORLD=${WORLD:-turtlebot3_world}
       - SPAWN_X=${SPAWN_X:-0.5}
+      - SPAWN_Y=${SPAWN_Y:-0.0}
       - SHOW_GUI=${SHOW_GUI:-1}
     working_dir: /home/ros
     entrypoint: ["/bin/bash", "/entrypoint.sh"]

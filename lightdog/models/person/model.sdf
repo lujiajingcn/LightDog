@@ -1,0 +1,109 @@
+<?xml version="1.0" ?>
+<!--
+  P2 仿真用「人」模型
+
+  用途：给场景 1（夜间跟随照明）提供可被相机看到、可被检测的移动目标。
+  真机阶段这一步换成真人，仿真里用几何体代替。
+
+  设计取舍：
+  - static=true：不参与重力与动力学，靠 /world/<world>/set_pose 服务直接搬运，
+    避免仿真里人形翻倒、被机器人推走等与产品逻辑无关的物理噪音。
+  - 仍然保留 collision：激光雷达 / 代价地图要能看见人，跟随时的避障才有意义。
+  - 上衣用高饱和橙 RGB(1.0 0.35 0.05)：turtlebot3_world 是灰白墙 + 绿地，
+    机器人本体是黄车身 + 暖白灯条，橙色在 HSV 空间上能干净地把人和这些都分开
+    （检测器见 lightdog_person_detector.py）。
+
+  高度：腿 0~0.72 / 躯干 0.72~1.47 / 头 1.47~1.69，总高约 1.69m。
+
+  躯干下沿压到 0.72 而不是按人体比例的 0.85，是被相机安装高度逼的：
+  4wd 相机只有 0.275m 高，1.2m 处视野上沿只到 1.11m，距离越近能看到的躯干越少。
+  躯干从 0.85 起时，人走到 0.8m 就只剩腿在画面里；压到 0.72 后 0.7m 还能看到一条
+  橙色，跟随不会在中近距离上断掉。
+
+  头部用深色（头发）而不是肤色：肤色 RGB(0.82 0.68 0.58) 在软件渲染下的暗光里
+  饱和度会被抬到 0.45 以上、H 也落在橙色区间，实测会被检测器当成「人」（574px，
+  超过 min_blob_px），导致人已经走开、亮度却不灭。改深色后 S 极低，颜色上就分开了。
+-->
+<sdf version="1.9">
+  <model name="person">
+    <static>true</static>
+    <pose>0 0 0 0 0 0</pose>
+
+    <link name="legs">
+      <pose>0 0 0.36 0 0 0</pose>
+      <visual name="legs_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.72</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.08 0.10 0.28 1</ambient>
+          <diffuse>0.10 0.13 0.36 1</diffuse>
+          <specular>0.05 0.05 0.08 1</specular>
+          <emissive>0 0 0 1</emissive>
+        </material>
+      </visual>
+      <collision name="legs_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.72</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="torso">
+      <pose>0 0 1.095 0 0 0</pose>
+      <visual name="torso_visual">
+        <geometry>
+          <cylinder>
+            <radius>0.17</radius>
+            <length>0.75</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.42 0.15 0.02 1</ambient>
+          <diffuse>0.95 0.33 0.05 1</diffuse>
+          <specular>0.25 0.10 0.02 1</specular>
+          <emissive>0 0 0 1</emissive>
+        </material>
+      </visual>
+      <collision name="torso_collision">
+        <geometry>
+          <cylinder>
+            <radius>0.17</radius>
+            <length>0.75</length>
+          </cylinder>
+        </geometry>
+      </collision>
+    </link>
+
+    <link name="head">
+      <pose>0 0 1.58 0 0 0</pose>
+      <visual name="head_visual">
+        <geometry>
+          <sphere>
+            <radius>0.11</radius>
+          </sphere>
+        </geometry>
+        <material>
+          <!-- 深色头发：低饱和 -> 不会被橙色判据命中 -->
+          <ambient>0.04 0.04 0.05 1</ambient>
+          <diffuse>0.08 0.07 0.08 1</diffuse>
+          <specular>0.05 0.05 0.05 1</specular>
+          <emissive>0 0 0 1</emissive>
+        </material>
+      </visual>
+      <collision name="head_collision">
+        <geometry>
+          <sphere>
+            <radius>0.11</radius>
+          </sphere>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>
