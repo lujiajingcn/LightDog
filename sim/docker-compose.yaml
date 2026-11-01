@@ -14,6 +14,11 @@ services:
     image: linorobot2:gazebo
     container_name: sim
     privileged: true
+    # 以 root 跑：P3 的补丁要改 /opt/ros/jazzy/share/nav2_bringup/launch/navigation_launch.py
+    # （docking_server 的 cmd_vel 出口），那个文件属 root:root 555，ros 用户改不动，
+    # 而镜像里没有 sudo。整条链路（Xvfb / x11vnc / gz / ros 节点）都不依赖 root 之外的
+    # 权限隔离，所以直接以 root 运行最省事。
+    user: root
     network_mode: bridge
     ports:
       - "5900:5900"   # x11vnc
@@ -29,6 +34,13 @@ services:
       - WORLD=${WORLD:-turtlebot3_world}
       - SPAWN_X=${SPAWN_X:-0.5}
       - SPAWN_Y=${SPAWN_Y:-0.0}
+      - SPAWN_YAW=${SPAWN_YAW:-0.0}
+      # 充电底座在世界里的位置（P3）。patch_upstream.py 用它生成 dock_database.yaml，
+      # 坐标会换算到 odom（原点 = 出生点），所以换出生点不用手改数据库。
+      - DOCK_X=${DOCK_X:--2.3}
+      - DOCK_Y=${DOCK_Y:-0.5}
+      - DOCK_YAW=${DOCK_YAW:-0.0}
+      - DOCK_APPROACH=${DOCK_APPROACH:-0.30}
       - SHOW_GUI=${SHOW_GUI:-1}
     working_dir: /home/ros
     entrypoint: ["/bin/bash", "/entrypoint.sh"]

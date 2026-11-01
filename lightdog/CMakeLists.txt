@@ -15,6 +15,8 @@ install(PROGRAMS
   lightdog_light_auto.py
   lightdog_person_sim.py
   lightdog_twist_mux.py
+  lightdog_aruco_dock.py
+  lightdog_dock_manager.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

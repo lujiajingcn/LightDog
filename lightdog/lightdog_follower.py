@@ -81,9 +81,15 @@ class PersonFollower(Node):
         self.person = None            # 最新一次人位置
         self.present = False
         self.last_present = None      # rclpy Time
+        # 回充期间让位。dock_manager 在 DOCKING/UNDOCKING 时把 /dock/inhibit 置 true。
+        # 只靠优先级其实也能压住（dock 30 > follow 20），但跟随节点会一直发
+        # 非零速度去"抢"，docking 一结束人还在原地，机器人立刻掉头追人 ——
+        # 这不是低电回充该有的行为。所以显式认这个标志。
+        self.inhibited = False
 
         self.create_subscription(PointStamped, '/person/position', self._on_pos, 10)
         self.create_subscription(Bool, '/person/present', self._on_present, 10)
+        self.create_subscription(Bool, '/dock/inhibit', self._on_inhibit, 10)
         self.cmd_topic = str(p('cmd_vel_topic').value)
         self.pub = self.create_publisher(Twist, self.cmd_topic, 10)
 
@@ -105,6 +111,12 @@ class PersonFollower(Node):
         if self.present:
             self.last_present = self.get_clock().now()
 
+    def _on_inhibit(self, msg: Bool):
+        if bool(msg.data) != self.inhibited:
+            self.get_logger().info(
+                '回充占用中，跟随让位' if msg.data else '回充结束，跟随恢复')
+        self.inhibited = bool(msg.data)
+
     # ---------- 控制 ----------
 
     def _person_lost(self) -> bool:
@@ -116,7 +128,7 @@ class PersonFollower(Node):
     def _tick(self):
         cmd = Twist()
 
-        if not self.enabled or self._person_lost() or self.person is None:
+        if not self.enabled or self.inhibited or self._person_lost() or self.person is None:
             self.pub.publish(cmd)     # 持续发零速，防止底层保持上一条指令
             return
 

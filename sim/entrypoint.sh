@@ -21,6 +21,12 @@ cd /home/ros/linorobot2_ws
 colcon build --symlink-install --packages-select lightdog
 source install/setup.bash
 
+# 让 gz 能按 model:// 解析我们自己的模型（充电桩的 ArUco 贴图靠这个找）
+# 不加这行，model.sdf 里的 model://lightdog_dock/... 会在 spawn 时报
+# "Unable to find material"，marker 就是个纯白/纯黑方块，回充直接瞎。
+export GZ_SIM_RESOURCE_PATH="${GZ_SIM_RESOURCE_PATH}:/home/ros/linorobot2_ws/install/lightdog/share/lightdog/models"
+echo "=== GZ_SIM_RESOURCE_PATH=$GZ_SIM_RESOURCE_PATH ==="
+
 # 3) 虚拟显示 + VNC
 export DISPLAY=:200
 DISP_NUM=${DISPLAY#:}
@@ -35,10 +41,11 @@ websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /tmp/websockify.log 2>&
 NOVNC_PID=$!
 echo "=== Xvfb :200 (PID $XVFB_PID) / x11vnc :5900 / noVNC :6080 ==="
 
-# 4) /cmd_vel 多源仲裁（常驻）。
+# 4) /cmd_vel 多源仲裁（常驻，且必须在仿真栈之前就位）
+#
 #    collision_monitor 的输入已由 patch_upstream.py 指到本节点的输出，
 #    所以它必须在仿真栈之前就位，否则 Nav2 一条速度都发不出去（统一被
-#    source_timeout 兜成零）。P2 的跟随节点只是往它里面多接一个源。
+#    source_timeout 兜成零）。P2 的跟随 / P3 的回充只是往它里面多接一个源。
 echo "=== Starting twist mux ==="
 nohup ros2 run lightdog lightdog_twist_mux.py --ros-args \
     --params-file /home/ros/linorobot2_ws/install/lightdog/share/lightdog/config/p2_params.yaml \
@@ -53,7 +60,7 @@ ros2 launch lightdog lightdog_sim.launch.py \
     world_name:="${WORLD}" \
     spawn_x:="${SPAWN_X}" \
     spawn_y:="${SPAWN_Y}" \
-    spawn_yaw:=0.0 &
+    spawn_yaw:="${SPAWN_YAW:-0.0}" &
 SIM_PID=$!
 
 sleep 10
@@ -96,6 +103,7 @@ echo "  Sim:    PID $SIM_PID"
 echo "  GUI:    PID ${GUI_PID:-未启动}"
 echo "  SLAM:   PID $SLAM_PID"
 echo "  Mux:    PID $MUX_PID (log /tmp/twist_mux.log)"
+
 echo "  LED log: /tmp/lightdog_led.log (via ros2 launch)"
 echo ""
 
