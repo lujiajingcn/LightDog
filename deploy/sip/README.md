@@ -45,9 +45,17 @@ sudo asterisk -rx "dialplan reload"
 
 ```bash
 # 4) 把 secret 写进参数文件（0600，别写进 unit 的 -p，systemctl status 会漏出去）
-sudo sed -i "s/^    sip_ami_secret: ''/    sip_ami_secret: '<上一步那个 secret>'/" \
-    /opt/ros/jazzy/lightdog/share/lightdog/config/p5_params.yaml
-sudo chmod 600 /opt/ros/jazzy/lightdog/share/lightdog/config/p5_params.yaml
+# 路径用 ros2 pkg prefix 定位，不要硬编码：参数文件在 <ws>/install/lightdog/
+# share/lightdog/config/ 下（和 install.sh 的 PARAM_DIR 是同一个目录），
+# 而 lightdog 从来不会装进 /opt/ros/<distro> 那个系统前缀里。
+PARAMS="$(ros2 pkg prefix lightdog)/share/lightdog/config/p5_params.yaml"
+sudo sed -i "s/^    sip_ami_secret: ''/    sip_ami_secret: '<上一步那个 secret>'/" "$PARAMS"
+sudo chmod 600 "$PARAMS"
+
+# sed 匹配不到行时**返回 0 且什么都不做**，所以必须回读确认。
+# 没写进去的表现是：告警照常弹窗，一个电话都不打。
+grep -E "^    sip_ami_secret: '.+'" "$PARAMS" \
+  || echo "!! secret 没写进去：确认 p5_params.yaml 里这行是 4 个空格缩进、且值为空串"
 ```
 
 > `call_mode` 默认是 `auto`：`sip_ami_secret` 非空就自动走 SIP，空就退化成

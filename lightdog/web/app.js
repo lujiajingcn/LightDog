@@ -42,6 +42,22 @@ const S = {
 
 const $ = (id) => document.getElementById(id);
 
+/**
+ * HTML 转义。凡是把外部数据拼进 innerHTML 模板的地方都必须过一遍。
+ *
+ * 联系人姓名 / 电话是用户自己填的，录像文件名来自磁盘 —— 这些值里只要有一个
+ * `<`，轻则排版被拆开，重则变成能执行的脚本。本文件其他地方一律用
+ * textContent，只有列表模板绕不过字符串拼接，所以统一从这里走。
+ */
+function esc(v) {
+  return String(v === undefined || v === null ? '' : v)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function withToken(url) {
   if (!S.token) return url;
   return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(S.token);
@@ -167,7 +183,7 @@ function renderStatus(st) {
     // 结果待机时也被标成 busy，一眼看不出到底哪个才是"在动"。
     const moving = src === 'follow' || src === 'dock' || src === 'nav';
     const cls = src === 'estop' ? 'bad' : (moving ? 'busy' : '');
-    chips.push(`<span class="chip ${cls}">运动源 <b>${src}</b></span>`);
+    chips.push(`<span class="chip ${cls}">运动源 <b>${esc(src)}</b></span>`);
   }
   if (rec.events !== undefined) {
     chips.push(`<span class="chip">事件 <b>${rec.events}</b></span>`);
@@ -194,7 +210,7 @@ function renderStatus(st) {
     ['联系人', (st.contacts || 0) + ' 个'],
   ];
   $('device-info').innerHTML = kv
-    .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
 }
 
 async function pollStatus() {
@@ -476,7 +492,7 @@ function renderAlarm(a) {
     rows.push(['人体高度', Number(a.z_p95).toFixed(2) + ' m']);
   }
   $('alarm-info').innerHTML = rows
-    .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
 
   const vb = $('alarm-video');
   if (a.event_id) {
@@ -602,7 +618,7 @@ async function loadEvents() {
       return `<div class="item" data-event="${encodeURIComponent(ev.id)}">
         <div class="thumb">${thumb}</div>
         <div class="item-body">
-          <div class="item-title">${ev.label || ev.type}</div>
+          <div class="item-title">${esc(ev.label || ev.type)}</div>
           <div class="item-sub">${fmtTime(ev.wall)}${dur ? ' · ' + dur : ''}${hasVideo ? '' : ' · 无视频'}</div>
         </div>
         <span class="item-tag ${tagClass(ev.type)}">${ev.type}</span>
@@ -626,7 +642,7 @@ async function loadClips() {
     $('clips').innerHTML = list.map((c) => `
       <div class="item" data-clip="${encodeURIComponent(c.file)}">
         <div class="item-body">
-          <div class="item-title">${c.file}</div>
+          <div class="item-title">${esc(c.file)}</div>
           <div class="item-sub">${fmtTime(c.mtime)} · ${fmtBytes(c.bytes)}</div>
         </div>
         <span class="item-tag">播放</span>
@@ -686,8 +702,8 @@ function renderContacts() {
   box.innerHTML = S.contacts.map((c, i) => `
     <div class="item" data-idx="${i}">
       <div class="item-body">
-        <div class="item-title">${c.name}${c.primary ? ' <span class="item-tag">首选</span>' : ''}</div>
-        <div class="item-sub">${c.phone}</div>
+        <div class="item-title">${esc(c.name)}${c.primary ? ' <span class="item-tag">首选</span>' : ''}</div>
+        <div class="item-sub">${esc(c.phone)}</div>
       </div>
       <button class="btn ghost small" data-del="${i}">删除</button>
     </div>`).join('');
@@ -708,7 +724,7 @@ async function loadContacts() {
     S.contacts = data.contacts || [];
     renderContacts();
   } catch (e) {
-    $('contacts').innerHTML = '<p class="empty">读取失败：' + e.message + '</p>';
+    $('contacts').innerHTML = '<p class="empty">读取失败：' + esc(e.message) + '</p>';
   }
 }
 

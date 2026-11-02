@@ -293,5 +293,93 @@ class TestDockingThresholdDocs(unittest.TestCase):
         self.assertEqual(bad, [], '\n'.join(bad))
 
 
+class TestDeployDocPaths(unittest.TestCase):
+    """部署文档里指参数文件的路径，必须和 install.sh 用的是同一套。
+
+    sip/README.md 曾经让用户把 AMI secret 写进
+    `/opt/ros/jazzy/lightdog/share/lightdog/config/p5_params.yaml` ——
+    少了一层 `install/`，而且 lightdog 是工作区包，从来不会装进系统 ROS 前缀。
+
+    这个错误的后果比「文件不存在」更隐蔽：
+      * `sed -i` 找不到**文件**会报错，还能发现；
+      * `sed -i` 找不到**行**是静默的（返回 0，什么都不做）——
+        secret 没写进去，外呼退化成「只记录」，告警照常弹窗，一个电话都不打。
+    所以这条既禁止那种路径，也要求文档里配上回读确认。
+    """
+
+    BAD_PREFIX = re.compile(r'/opt/ros/[a-z]+/lightdog')
+
+    def _deploy_files(self, repo):
+        root = os.path.join(repo, 'deploy')
+        if not os.path.isdir(root):
+            self.skipTest('找不到 deploy/（容器只挂包目录）')
+        out = []
+        for path in glob.glob(os.path.join(root, '**', '*'), recursive=True):
+            if os.path.isfile(path) and path.endswith(
+                    ('.md', '.sh', '.py', '.example', '.in')):
+                out.append(path)
+        return out
+
+    def test_no_package_path_under_system_ros_prefix(self):
+        files = self._deploy_files(os.path.dirname(PKG))
+        bad = []
+        for path in files:
+            with open(path, encoding='utf-8') as f:
+                for i, ln in enumerate(f, 1):
+                    if self.BAD_PREFIX.search(ln):
+                        bad.append(f'{os.path.basename(path)}:{i} '
+                                   f'把 lightdog 指到了系统 ROS 前缀下')
+        self.assertGreater(len(files), 5, '一个部署文件都没扫到，检查逻辑失效了')
+        self.assertEqual(
+            bad, [],
+            '\n'.join(bad) + '\n正确写法：$(ros2 pkg prefix lightdog)'
+                             '/share/lightdog/config/…')
+
+
+class TestWebEscaping(unittest.TestCase):
+    """web/app.js 把列表拼进 innerHTML，外部数据必须过 esc()。
+
+    联系人姓名 / 电话是用户自己填的，录像文件名来自磁盘。这些值里只要有一个
+    `<`，轻则排版被拆开，重则变成能执行的脚本。同一个文件里其他地方一律用
+    textContent，只有列表模板绕不过字符串拼接，漏的也正是这几处。
+
+    故意按「必须转义的那几处」逐个钉死，不做通用 AST 分析：同一文件里
+    `${lastCall.name || ''}` 这种「先拼成字符串、随后由 esc(v) 统一渲染」
+    的写法本身是安全的，通用规则会误报。
+    """
+
+    REQUIRED = (
+        '${esc(c.name)}',
+        '${esc(c.phone)}',
+        '${esc(c.file)}',
+        '${esc(ev.label || ev.type)}',
+        '${esc(src)}',
+    )
+    FORBIDDEN = (
+        '${c.name}',        # 联系人姓名
+        '${c.phone}',       # 联系人电话
+        '${c.file}',        # 磁盘上的文件名
+        '${ev.label',       # 事件标签
+        '${src}',           # 仲裁源名
+    )
+
+    def test_user_data_is_escaped(self):
+        app = os.path.join(PKG, 'web', 'app.js')
+        if not os.path.isfile(app):
+            self.skipTest('找不到 web/app.js')
+        with open(app, encoding='utf-8') as f:
+            src = f.read()
+
+        self.assertIn('function esc(', src, 'app.js 里没有 esc() 转义函数')
+
+        missing = [t for t in self.REQUIRED if t not in src]
+        self.assertEqual(missing, [],
+                         '这些模板没有走转义：\n' + '\n'.join(missing))
+
+        leaked = [t for t in self.FORBIDDEN if t in src]
+        self.assertEqual(leaked, [],
+                         '这些字段被直接拼进了 innerHTML：\n' + '\n'.join(leaked))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
