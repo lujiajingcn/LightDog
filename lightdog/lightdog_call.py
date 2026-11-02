@@ -200,7 +200,7 @@ class AmiClient:
         return time.monotonic() + (self.timeout if timeout is None else float(timeout))
 
     def action(self, fields, timeout=None):
-        """发一个 Action，读回它的 Response（不处理后续 Event）。"""
+        """发一个 Action，读回它的 Response（途中的 Event 丢弃）。"""
         if self._sock is None:
             raise AmiError('AMI 未连接')
         body = ''.join(f'{k}: {v}\r\n' for k, v in fields.items()) + '\r\n'
@@ -208,7 +208,23 @@ class AmiClient:
             self._sock.sendall(body.encode('utf-8'))
         except OSError as e:
             raise AmiError(f'AMI 写失败：{e}') from e
-        return self._read_message(self._peek_deadline(timeout))
+        return self._read_response(self._peek_deadline(timeout))
+
+    def _read_response(self, deadline):
+        """读到一条**带 `response` 字段**的消息为止，途中的 Event 直接丢掉。
+
+        AMI 在同一条 TCP 上把「响应」和「事件」交错着发。刚登录、或者上一次
+        外呼的 Hangup 事件恰好排在前面时，第一条消息就是个 Event。原实现把它
+        当 Response 解析，`response` 字段为空 → 登录被判成
+        「认证失败：未知原因」——密码明明是对的，日志却让人去查密码。
+
+        这类误诊比直接报错难查得多：运维会去 manager.conf 里翻半天，
+        而真正的问题是「读消息时没分辨类型」。
+        """
+        while True:
+            msg = self._read_message(deadline)
+            if 'response' in msg:
+                return msg
 
     def wait_event(self, event, action_id, timeout):
         """等一个指定事件；不相关的事件直接丢弃（AMI 会混着发很多）。"""

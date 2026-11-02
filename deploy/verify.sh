@@ -40,6 +40,21 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; FAIL=$((FAIL + 1)); }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*"; WARN=$((WARN + 1)); }
 head1() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
+# 从 p5_params.yaml 里取一个标量值。
+#
+# 不引 yaml 解析器：verify.sh 要在装完、还没 source workspace 的干净 shell 里跑，
+# 依赖越少越不容易「检查脚本自己先崩」。但 `tr -d ' \r'` 这一招有个坑：
+# 行尾注释会粘进值里 —— `sip_ami_host: 127.0.0.1   # 同机` 会变成
+# `127.0.0.1#同机`，拿它去连 AMI 必然失败，而报出来的是「AMI 登录失败」。
+# 所以先按 yaml 的规则去掉注释：`#` 前面必须是空白，否则密码里的 # 会被截断。
+# 顺带注意：**不能**用 `tr -d ' '` 去空格 —— 那会把密码里的空格也吃掉
+# （`p#ss word` → `p#ssword`），登录失败且完全看不出原因。只去首尾。
+yaml_val() {
+  sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" "$2" | head -1 \
+    | sed 's/[[:space:]]#.*$//' | tr -d "\"'\r" \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 mapfile -t NAMES < <(grep -v '^[[:space:]]*#' "$NODES_CONF" \
                      | grep -v '^[[:space:]]*$' | cut -d'|' -f1)
 mapfile -t ENABLED < <(grep -v '^[[:space:]]*#' "$NODES_CONF" \
@@ -169,11 +184,17 @@ PARAMS="$WS_GUESS/install/lightdog/share/lightdog/config/p5_params.yaml"
 
 MODE="?"
 SECRET=""
+AMI_HOST=""
+AMI_PORT=""
+AMI_USER=""
 if [ -f "$PARAMS" ]; then
-  # 只取这两个键，不引 yaml 解析器：verify.sh 要在装完、还没 source workspace
-  # 的干净 shell 里跑，依赖越少越不容易「检查脚本自己先崩」。
-  MODE="$(sed -n 's/^[[:space:]]*call_mode:[[:space:]]*//p' "$PARAMS" | head -1 | tr -d "\"' \r")"
-  SECRET="$(sed -n 's/^[[:space:]]*sip_ami_secret:[[:space:]]*//p' "$PARAMS" | head -1 | tr -d "\"' \r")"
+  MODE="$(yaml_val call_mode "$PARAMS")"
+  SECRET="$(yaml_val sip_ami_secret "$PARAMS")"
+  # 这三个也要读：节点是按 yaml 里的 host/port/user 连的，自检若用 CLI 默认值，
+  # 用户改过其中任何一个就会得到「AMI 登录失败」，而节点其实是好的。
+  AMI_HOST="$(yaml_val sip_ami_host "$PARAMS")"
+  AMI_PORT="$(yaml_val sip_ami_port "$PARAMS")"
+  AMI_USER="$(yaml_val sip_ami_user "$PARAMS")"
 fi
 
 if [ -z "$SECRET" ]; then
@@ -188,9 +209,12 @@ else
   [ -f "$CALL_PY" ] || CALL_PY="$WS_GUESS/install/lightdog/lib/lightdog/lightdog_call.py"
   if [ -f "$CALL_PY" ]; then
     # --check 只登录、不拨号：自检脚本**不能**让家里人半夜接到测试电话。
-    OUT="$(python3 "$CALL_PY" --check --secret "$SECRET" 2>&1)" \
-      && ok "AMI 登录成功（$CALL_PY）" \
-      || bad "AMI 登录失败：$OUT"
+    OUT="$(python3 "$CALL_PY" --check --secret "$SECRET" \
+             --ami-host "${AMI_HOST:-127.0.0.1}" \
+             --ami-port "${AMI_PORT:-5038}" \
+             --user "${AMI_USER:-lightdog}" 2>&1)" \
+      && ok "AMI 登录成功（${AMI_USER:-lightdog}@${AMI_HOST:-127.0.0.1}:${AMI_PORT:-5038}）" \
+      || bad "AMI 登录失败（${AMI_USER:-lightdog}@${AMI_HOST:-127.0.0.1}:${AMI_PORT:-5038}）：$OUT"
   else
     warn "找不到 lightdog_call.py，跳过 AMI 登录检查"
   fi

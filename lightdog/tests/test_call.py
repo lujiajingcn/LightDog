@@ -58,13 +58,16 @@ class FakeAmi(threading.Thread):
     """
 
     def __init__(self, secret='s3cret', reason=0, respond=True,
-                 event_delay=0.0, reject=False):
+                 event_delay=0.0, reject=False, noise_before_login=0):
         super().__init__(daemon=True)
         self.secret = secret
         self.reason = reason
         self.respond = respond
         self.event_delay = event_delay
         self.reject = reject
+        #: 登录 Response 之前先推几条无关事件。真实 AMI 上「响应」和「事件」
+        #: 共用一条 TCP，事件插在响应前面是完全正常的。
+        self.noise_before_login = int(noise_before_login)
         self.actions = []
         self.channels = {}          # 频道名 -> 是否还活着
         self._pending = {}          # 频道名 -> ActionID（用来回 Reason=1）
@@ -147,6 +150,10 @@ class FakeAmi(threading.Thread):
             self.actions.append(f)
         if action == 'login':
             if f.get('secret') == self.secret:
+                for i in range(self.noise_before_login):
+                    self._send(conn, 'Event: Hangup\r\n'
+                                     'Channel: PJSIP/9%03d-000000%02d\r\n'
+                                     'Cause: 16\r\n\r\n' % (i, i))
                 self._send(conn, 'Response: Success\r\n'
                                  'Message: Authentication accepted\r\n\r\n')
             else:
@@ -258,6 +265,33 @@ class AmiTest(unittest.TestCase):
         try:
             self.assertIn('login', f.names())
             self.assertEqual(f.actions[0].get('events'), 'call,originate')
+        finally:
+            c.close()
+
+    def test_events_before_response_do_not_break_login(self):
+        """AMI 在 Response 之前推一条 Event，登录不能被判成「认证失败」。
+
+        这不是假想：`events=call,originate` 一订阅上，上一次通话的 Hangup
+        事件就可能排在下一条 Response 前面。原实现把第一条消息当 Response，
+        `response` 字段为空 → 抛 AmiAuthError「认证失败：未知原因」——
+        密码是对的，日志却让人去翻 manager.conf。
+        """
+        f = self.fake_up(noise_before_login=2)
+        c = LC.AmiClient('127.0.0.1', f.port, 'lightdog', f.secret).connect()
+        try:
+            self.assertIn('login', f.names())
+        finally:
+            c.close()
+
+    def test_action_skips_events_while_waiting(self):
+        """不止登录：任何 Action 在拿到 Response 之前遇到事件都得跳过。"""
+        f = self.fake_up(noise_before_login=3)
+        c = LC.AmiClient('127.0.0.1', f.port, 'lightdog', f.secret).connect()
+        try:
+            # 上一批噪声已经被 _read_response 消费掉了；这里再发一次 Action，
+            # 仍要能拿回一条真正的 Response
+            resp = c.action({'action': 'coreshowchannels'})
+            self.assertEqual(str(resp.get('response', '')).lower(), 'success')
         finally:
             c.close()
 

@@ -18,11 +18,13 @@
 
 import csv
 import importlib.util
+import json
 import os
 import re
 import sys
+import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -270,13 +272,17 @@ class TestReport(unittest.TestCase):
         self.assertIn('再没出现过', out)
 
     def test_restart_is_detected(self):
-        """同名两次启动 = 被重启过。不靠 starttime 根本看不出来。"""
+        """同名两次启动、任何一拍里只有一份 = 被重启过。不靠 starttime 看不出来。
+
+        同时要钉住**不是**「重复实例」：先死后起和两份同时在跑，处置完全不同。
+        """
         rc, out = report_of(self.tmp, 400, [
             node('lightdog_recorder', pid=100, start=111, until=200),
             node('lightdog_recorder', pid=200, start=222, since=200),
         ])
         self.assertEqual(rc, 1, out)
-        self.assertIn('启动', out)
+        self.assertIn('中途重启', out)
+        self.assertNotIn('同时有', out)
 
     def test_duplicate_instances_are_detected(self):
         """同一时刻两份同名节点 —— 会互相抢话题，是故障不是泄漏。"""
@@ -286,6 +292,22 @@ class TestReport(unittest.TestCase):
         ])
         self.assertEqual(rc, 1, out)
         self.assertIn('实例', out)
+
+    def test_duplicate_instances_with_different_starttimes(self):
+        """两份实例**同时活着**，但启动时刻不同 —— 必须报「重复实例」。
+
+        这是最容易被写错的一格：判据若只看「有几个 starttime」，那么
+        「重启没杀干净、两份同时在跑」会被说成「中途重启过」。
+        后者听起来像是系统自己恢复过一次（可以接受），而前者是两份节点
+        正在互相抢话题（必须立刻处理）。两种结论的处置完全不同。
+        """
+        rc, out = report_of(self.tmp, 400, [
+            node('lightdog_voice', pid=100, start=111),
+            node('lightdog_voice', pid=200, start=222),
+        ])
+        self.assertEqual(rc, 1, out)
+        self.assertIn('同时有 2 个实例', out)
+        self.assertNotIn('中途重启', out)
 
     def test_fallback_names_are_not_duplicate_alarms(self):
         """`--match python` 时十几个无关进程都叫 python3。
@@ -330,6 +352,31 @@ class TestReport(unittest.TestCase):
         self.assertIn('数据目录', buf.getvalue())
         self.assertIn('MB/小时', buf.getvalue())
 
+    def test_shrinking_data_dir_says_retention(self):
+        """目录变小是**保留策略在工作**，不是「增长率为负」。
+
+        原来这一行会打成 `+-38.1M（-39 个文件）` 和 `≈ -69 MB/小时`：
+        前者是格式错误，后者会被读成「磁盘写入速率异常」，
+        而事实恰恰相反 —— 那是 `event_retain_days` 在删旧录像。
+        """
+        path = os.path.join(self.tmp, 's.csv')
+        write_csv(path, 400, 5.0, [node('lightdog_recorder')])
+        with open(os.path.join(self.tmp, 's.dir.csv'), 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=['t', 'wall', 'bytes', 'files'])
+            w.writeheader()
+            for i in range(400):
+                w.writerow({'t': i * 5.0, 'wall': 'x',
+                            'bytes': 500 * 1024 * 1024 - i * 100000,
+                            'files': 200 - i // 10})
+        buf = StringIO()
+        with redirect_stdout(buf):
+            rc = soak.report(path, 1800.0)
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn('+-', out, '负增长被打成了「+-」')
+        self.assertNotIn('MB/小时', out, '目录在缩小时不该给增长率')
+        self.assertIn('保留策略', out)
+
 
 @unittest.skipUnless(HAS_SOAK, '找不到 deploy/soak.py（容器只挂包目录）')
 class TestProcNaming(unittest.TestCase):
@@ -361,6 +408,48 @@ class TestProcNaming(unittest.TestCase):
         self.assertEqual(soak.dwidth('进程'), 4)
         self.assertEqual(soak.dwidth('lightdog'), 8)
         self.assertEqual(soak.dwidth(soak.pad('进程', 10)), 10)
+
+
+@unittest.skipUnless(HAS_SOAK, '找不到 deploy/soak.py（容器只挂包目录）')
+class TestRunGuards(unittest.TestCase):
+    """参数与环境校验。这些错误必须在**建 CSV 之前**拦住。
+
+    原先 `--interval 0` 会进忙循环（实测 1 秒写 2404 拍），而文件已经建好了：
+    留下一个巨大的半截 CSV 和一句「观测不足」，比直接拒绝更让人困惑。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_zero_interval_is_rejected_before_creating_csv(self):
+        out = os.path.join(self.tmp, 'z.csv')
+        err = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(err):
+            rc = soak.main(['run', '--duration', '0.2', '--interval', '0',
+                            '--out', out])
+        self.assertEqual(rc, 2)
+        self.assertIn('interval', err.getvalue())
+        self.assertFalse(os.path.exists(out),
+                         '参数被拒绝时不该留下一个只有表头的 CSV')
+
+    def test_missing_proc_is_explained_not_a_traceback(self):
+        """Windows 宿主机上 `listdir('/proc')` 抛 WinError 3。
+
+        裸栈里只有一行「系统找不到指定的路径: '/proc'」，看不出这个工具
+        本来就只支持 Linux。这里把 isdir 换成假件模拟宿主机。
+        """
+        out = os.path.join(self.tmp, 'p.csv')
+        err = StringIO()
+        real = soak.os.path.isdir
+        soak.os.path.isdir = lambda p: False if p == '/proc' else real(p)
+        try:
+            with redirect_stdout(StringIO()), redirect_stderr(err):
+                rc = soak.main(['run', '--duration', '0.1', '--out', out])
+        finally:
+            soak.os.path.isdir = real
+        self.assertEqual(rc, 3)
+        self.assertIn('/proc', err.getvalue())
+        self.assertIn('Linux', err.getvalue())
 
 
 @unittest.skipUnless(HAS_SOAK, '找不到 deploy/soak.py（容器只挂包目录）')
@@ -421,6 +510,29 @@ class TestLiveSampling(unittest.TestCase):
             with open(path, newline='') as f:
                 rows = list(csv.DictReader(f))
             self.assertGreaterEqual(len(rows), min_rows, '%s 没有数据行' % path)
+
+    def test_auto_named_csv_is_reported_in_json(self):
+        """不传 --out 时，尾部那个机器可读字段必须报**真实**落盘路径。
+
+        原先报的是 `{"csv": ""}`，而文件其实叫 `soak-<时间>.csv` ——
+        下游按这个字段取文件会取不到，偏偏日志里看起来一切正常。
+        """
+        tmp = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            buf = StringIO()
+            with redirect_stdout(buf), redirect_stderr(StringIO()):
+                soak.main(['run', '--duration', '0.3', '--interval', '0.1',
+                           '--match', 'python'])
+        finally:
+            os.chdir(cwd)
+        tail = [ln for ln in buf.getvalue().splitlines() if ln.startswith('{')]
+        self.assertTrue(tail, '没有输出机器可读尾巴')
+        info = json.loads(tail[-1])
+        self.assertTrue(info['csv'], 'csv 字段是空的，而文件已经落了盘')
+        self.assertTrue(os.path.isfile(os.path.join(tmp, info['csv'])),
+                        '报出来的路径找不到文件：%r' % info['csv'])
 
     def test_run_with_unmatchable_pattern_refuses_to_pass(self):
         """什么都没采到必须 rc=3，不能打「未发现泄漏」。"""

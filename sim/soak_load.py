@@ -173,14 +173,23 @@ class Load(object):
         except OSError:
             pass
 
-    def stream(self, kind, path, secs, max_bytes, rst=True):
-        """建一个长连接，读一会儿，然后要么优雅关要么 RST。"""
+    def stream(self, kind, path, secs, max_bytes, rst=True, min_bytes=1):
+        """建一个长连接，读一会儿，然后要么优雅关要么 RST。
+
+        `min_bytes` 是**响应体**字节数的下限（不含 HTTP 头）。这一条是必须的：
+        推流线程死掉之后连接照样建得起来、200 照样回得来，只是后面一个字节都
+        没有。原先不看字节数，这种「连上但没数据」会被记成成功 —— 2 小时跑完
+        失败率 0%，报告写「载荷执行正常」，而手机屏幕上是一片黑。
+        """
         s = None
         try:
             s = self._conn(timeout=secs + 5.0)
             self._req(s, 'GET', path)
             s.settimeout(0.5)
             got = 0
+            body = 0
+            buf = b''
+            hdr_done = False
             deadline = time.monotonic() + secs
             while time.monotonic() < deadline and got < max_bytes:
                 try:
@@ -190,8 +199,25 @@ class Load(object):
                 if not b:
                     break
                 got += len(b)
+                if not hdr_done:
+                    # 头可能跨包到达，攒着找 \r\n\r\n，别假设「第一次 recv 就是完整头」
+                    buf += b
+                    idx = buf.find(b'\r\n\r\n')
+                    if idx >= 0:
+                        hdr_done = True
+                        body += len(buf) - idx - 4
+                        buf = b''
+                    elif len(buf) > 65536:
+                        hdr_done = True       # 头大得离谱，剩下的都当 body
+                        buf = b''
+                else:
+                    body += len(b)
+            if body < min_bytes:
+                self.fail(kind, '%ds 内响应体只有 %d 字节（要求 ≥%d）：'
+                                '连上了但没有数据' % (int(secs), body, min_bytes))
+                return body
             self.ok(kind)
-            return got
+            return body
         except Exception as e:
             self.fail(kind, e)
             return 0
@@ -241,7 +267,9 @@ class Load(object):
         self.stream('SSE', '/api/v1/events/stream', 8.0, 1 << 20, rst=True)
 
         self.mark('MJPEG 读 4s 后 RST')
-        self.stream('MJPEG', '/api/v1/stream.mjpg', 4.0, 400 * 1024, rst=True)
+        # 至少一帧的开头：4 秒里一个字节都没有，说明推流线程已经死了
+        self.stream('MJPEG', '/api/v1/stream.mjpg', 4.0, 400 * 1024,
+                    rst=True, min_bytes=1024)
 
         # 每三轮一次优雅关闭：两条清理路径都要走到
         if i % 3 == 0:

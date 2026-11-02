@@ -45,7 +45,7 @@ OpenCV 的线程池、glibc 的 malloc 阈值，都会让 RSS 单调上涨然后
     # 事后重新分析同一份 CSV（不用重跑）
     python3 deploy/soak.py report /tmp/soak.csv
 
-退出码：0 正常 / 1 发现泄漏 / 2 观测不足（不构成结论）/ 3 一个进程都没采到
+退出码：0 正常 / 1 发现泄漏 / 2 观测不足或参数不合法 / 3 一个进程都没采到
 """
 
 import argparse
@@ -248,7 +248,7 @@ def _dir_bytes(path):
 # ---------------------------------------------------------------- 采样
 
 def snapshot(pat, watch_dir):
-    """采一拍。返回 (rows, dirrow)。"""
+    """采一拍。返回 (rows, dirrow, sysrow)；后两个在没要求时为 None。"""
     rows = []
     for pid in _pids():
         cmd = _cmdline(pid)
@@ -292,8 +292,23 @@ COLUMNS = ['t', 'wall', 'pid', 'name', 'rss_kb', 'vsz_kb', 'threads', 'fds',
 
 
 def run(args):
+    # 参数与环境的硬校验必须放在 open(out) **之前**：否则 interval=0 会先把
+    # CSV 建出来、再忙循环写进去（实测 1 秒写 2404 拍），文件留着、结论没有。
+    if args.interval <= 0:
+        sys.stderr.write('--interval 必须 > 0：0 会变成忙循环（1 秒能写两千多拍，'
+                         'CSV 巨大且采样器自己成了负载源）\n')
+        return 2
+    if not os.path.isdir('/proc'):
+        # 宿主机是 Windows 时 listdir('/proc') 抛 FileNotFoundError，
+        # 而栈里只有一行 WinError，看不出「这个工具本来就只支持 Linux」。
+        sys.stderr.write('读不到 /proc：这个工具只能跑在 Linux 上'
+                         '（树莓派 / 仿真容器）。本机不是。\n')
+        return 3
     pat = re.compile(args.match)
     out = args.out or time.strftime('soak-%Y%m%d-%H%M%S.csv')
+    # 写回 args：main() 的机器可读输出要报**真实**落盘路径。不回写的话
+    # 不传 --out 时尾部会打 `{"csv": ""}`，而文件其实叫 soak-<时间>.csv。
+    args.out = out
     stop = {'flag': False}
 
     def _stop(_sig, _frm):
@@ -445,7 +460,7 @@ def judge(series, floor, rel=0.0, want_disjoint=False):
 
 
 def load_csv(path):
-    """读回 CSV -> (samples, dir_samples)。samples 是按拍的 [{pid: row}]。"""
+    """读回 CSV -> (samples, dir_samples, sys_samples)，后两个文件不存在时为空列表。"""
     with open(path, newline='') as f:
         rows = list(csv.DictReader(f))
     by_t = {}
@@ -499,7 +514,7 @@ def mb(kb):
     return '%.0fM' % (kb / 1024.0)
 
 
-def analyze(samples, ds, min_duration):
+def analyze(samples, ds):
     """把逐拍数据切成「每个进程一条时间线」，逐条判定。
 
     关键点：**按 (name, pid) 分别成线**，不按 name 合并。同名多 pid 意味着
@@ -584,7 +599,7 @@ def report(path, min_duration):
     if not samples:
         print('CSV 里没有任何样本：%s' % path)
         return 3
-    a = analyze(samples, ds, min_duration)
+    a = analyze(samples, ds)
     a['sys'] = sy
     dur = a['dur']
     leaks = []
@@ -643,24 +658,37 @@ def report(path, min_duration):
                          % (p['name'], p['last_t'] / 60.0, p['n'],
                             a['n_samples']))
 
+    # 同一个名字出现多个 pid，可能是两件完全不同的事：
+    #   A. 两份实例**同时活着**（重启没杀干净：`ros2 launch` 被 Ctrl-C 之后子节点
+    #      被 init 收养，再起来一份）—— 两份会互相抢话题，是故障级；
+    #   B. 先死一份、后来起来另一份 —— 那叫中途重启。
+    # 只看「有几个 starttime」永远分不出来：A 的 starttime 也是两个。判据必须是
+    # 「有没有哪一拍里同时数到 >1 个」，也就是 dup 的峰值。
     for name, cnt, starts in a['restarted']:
-        if starts > 1:
+        peak = a['dup'].get(name, 1)
+        if peak > 1:
+            leaks.append('%s 同时有 %d 个实例在跑 → 重复实例，两份会互相抢话题'
+                         % (name, peak))
+        elif starts > 1:
             leaks.append('%s 出现了 %d 次不同的启动（starttime 变化）→ 中途重启过'
                          % (name, starts))
-        elif cnt > 1:
-            leaks.append('%s 同时有 %d 个实例在跑 → 重复实例，两份会互相抢话题'
-                         % (name, cnt))
-    for name, cnt in sorted(a['dup'].items()):
-        if cnt > 1 and not any(name == r[0] for r in a['restarted']):
-            leaks.append('%s 在某一拍里有 %d 个实例' % (name, cnt))
 
     if a['dir']:
         d = a['dir']
         grow = (d[-1][1] - d[0][1]) / 1024.0 / 1024.0
+        dfiles = d[-1][2] - d[0][2]
         rate = grow / (dur / 3600.0) if dur > 0 else 0.0
-        print(pad('数据目录', 24) + pad('', 6)
-              + pad('+%.1fM（%d 个文件）' % (grow, d[-1][2] - d[0][2]), 34)
-              + '≈ %.0f MB/小时' % rate)
+        if grow < 0:
+            # 负增长是**好事**：`event_retain_days` / `max_event_mb` 在删旧文件。
+            # 不特判的话这一行会打出 `+-38.1M`（格式错）和 `≈ -69 MB/小时`
+            # （读起来像「速率异常」，而它其实是保留策略在工作）。
+            print(pad('数据目录', 24) + pad('', 6)
+                  + pad('-%.1fM（%d 个文件）' % (-grow, dfiles), 34)
+                  + '目录在缩小（保留策略生效）')
+        else:
+            print(pad('数据目录', 24) + pad('', 6)
+                  + pad('+%.1fM（%d 个文件）' % (grow, dfiles), 34)
+                  + '≈ %.0f MB/小时' % rate)
         print('-' * 96)
         # 512MB 的卡、涨到 90% 之前告警。这里只提示速率，不判泄漏。
         if rate > 200:
