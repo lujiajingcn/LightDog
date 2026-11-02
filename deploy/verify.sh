@@ -141,7 +141,8 @@ head1 "3. 运行时"
 
 if [ -e "$STATE_ESTOP" ]; then
   warn "急停处于闭锁状态（$STATE_ESTOP 存在）—— 车不会动是刻意的。
-      现场确认安全后执行：sudo lightdog-estop-clear  或  sudo rm $STATE_ESTOP"
+      现场确认安全后执行：sudo lightdog-estop clear --yes
+      （别只删文件：rm 只骗得过下次重启，正在跑的 twist_mux 仍锁着）"
 else
   ok "急停未闭锁"
 fi

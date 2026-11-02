@@ -47,9 +47,9 @@ collision_monitor 本来就看不见它，不存在误拦。所以把 docking �
 
 补丁 4：navigation.yaml 的 docking_server 参数
 ------------------------------------------------------------------
-1) `docking_threshold: 0.05` → `0.32`。我们的桩体前后纵深约 0.10m，机器人车头
+1) `docking_threshold: 0.05` → `0.12`。我们的桩体前后纵深约 0.10m，机器人车头
    贴住 marker 板时 base_link 到 dock 原点正好 0.30m，0.05 会让控制器一直往
-   桩里推（轮子打滑、超时失败）。0.32 让它在物理接触前就判定到位。
+   桩里推（轮子打滑、超时失败）。0.12 让它在物理接触（0.298m 处）之前就判定到位。
 2) `external_detection_translation_*` / `rotation_*` 全部归零：安装偏差已经由
    `lightdog_aruco_dock` 在发布前用矩阵补偿掉了，这里再加一层只会重复计算。
 3) `dock_database` 指向 `/tmp/dock_database.yaml`（由本脚本按环境变量生成，

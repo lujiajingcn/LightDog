@@ -33,6 +33,18 @@
     max_angular: 0.70
 
     # ---- 话题 ----
+    # ⚠ cmd_vel_topic 的取值有安全含义，不是随手可改的：
+    # 真机上它是**唯一**到固件的一跳，所以这里订阅哪个话题，就等于把哪个话题
+    # 直接接到车轮上。
+    #   /cmd_vel_muxed  仲裁之后、collision_monitor **之前**。
+    #                   仿真里速度出口是 /cmd_vel（它后面还有 ros_gz_bridge → gz），
+    #                   真机没有那一跳，于是 Nav2 的 collision_monitor 会退化成一个
+    #                   只往死话题发零速的节点 —— 前方有障碍也拦不住车。
+    #   /cmd_vel        collision_monitor **之后**，能拿回碰撞保护。
+    #                   代价是要求 Nav2（含 collision_monitor）常驻：Nav2 没起时
+    #                   /cmd_vel 没有发布者，cmd_hold 会一直发零速，车不会动。
+    # 目前按 /cmd_vel_muxed 取值（跟随不依赖 Nav2）。上车前必须明确这一项，
+    # 见 docs/hardware_readiness.md §一。
     cmd_vel_topic: /cmd_vel_muxed
     led_topic: /led/brightness
     estop_topic: /safety/estop

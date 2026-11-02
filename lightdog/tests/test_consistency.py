@@ -10,6 +10,7 @@
      否则真机上想调它只能改代码，而代码里那份默认值是照仿真调的
   3. package.xml 的版本要和 HTTP 的 server_version 一致（对外可观测的版本号）
   4. launch 文件引用的 params 文件必须真实存在
+  5. 部署脚本 / 文档里提到的 `lightdog-xxx` 命令必须真实存在
 """
 
 import glob
@@ -180,6 +181,116 @@ class TestSimEchoTruncation(unittest.TestCase):
                               f'{os.path.basename(path)}：JSON 话题被截断 -> '
                               f'{ln.strip()}')
         self.assertGreater(checked, 3, '一个 JSON 话题都没扫到，检查逻辑失效了')
+
+
+class TestDeployCommandNames(unittest.TestCase):
+    """部署脚本/文档里提到的 `lightdog-xxx` 必须真实存在。
+
+    踩过的坑：`verify.sh` 发现急停处于闭锁时，让用户执行
+    `sudo lightdog-estop-clear`。但 `install.sh` 只装 `/usr/local/bin/lightdog-estop`
+    （解除是位置参数 `clear --yes`），`lightdog-estop-clear` 根本不存在。
+    结果就是：现场唯一的解急停入口，打印出来的是一条 `command not found`，
+    而车还锁着、人正站在旁边。
+
+    这类错误没人会替你发现 —— 那句话只在「已经出故障」的分支里才打印，
+    平时跑得再多次也看不见。所以用静态扫描钉住：
+    允许的名字 = nodes.conf 里的单元名 + install.sh 实际安装的可执行文件。
+    """
+
+    PAT = re.compile(r'\blightdog-[a-z][a-z0-9-]*')
+
+    def _known(self, repo):
+        known = {
+            'lightdog.target',      # target 单元，不是节点
+            'lightdog-estop',       # install.sh 装到 /usr/local/bin 的那个
+        }
+        conf = os.path.join(repo, 'deploy', 'nodes.conf')
+        with open(conf, encoding='utf-8') as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln or ln.startswith('#'):
+                    continue
+                known.add('lightdog-' + ln.split('|')[0].strip())
+        return known
+
+    def test_referenced_commands_exist(self):
+        repo = os.path.dirname(PKG)
+        deploy = os.path.join(repo, 'deploy')
+        if not os.path.isdir(deploy):
+            # 仿真容器只挂包目录（src/lightdog），deploy/ 不在里面
+            self.skipTest('找不到 deploy/（容器只挂包目录）')
+
+        known = self._known(repo)
+        files = (glob.glob(os.path.join(deploy, '*.sh'))
+                 + glob.glob(os.path.join(deploy, '*.md'))
+                 + glob.glob(os.path.join(repo, 'docs', '*.md'))
+                 + [os.path.join(repo, 'Readme.md')])
+
+        bad = []
+        scanned = 0
+        for path in files:
+            if not os.path.isfile(path):
+                continue
+            scanned += 1
+            with open(path, encoding='utf-8') as f:
+                for i, ln in enumerate(f, 1):
+                    for tok in self.PAT.findall(ln):
+                        if tok not in known:
+                            bad.append(f'{os.path.basename(path)}:{i} '
+                                       f'提到了不存在的命令 {tok}')
+        self.assertGreater(scanned, 5, '一个部署文件都没扫到，检查逻辑失效了')
+        self.assertEqual(bad, [], '\n'.join(bad))
+
+
+def _docking_threshold_pair(src):
+    """从 patch_upstream.py 里取出 docking_threshold 的补丁对 (旧值, 新值)。"""
+    m = re.search(
+        r"'      docking_threshold: ([0-9.]+)',\s*\n\s*"
+        r"'      docking_threshold: ([0-9.]+)'", src)
+    return m.groups() if m else (None, None)
+
+
+class TestDockingThresholdDocs(unittest.TestCase):
+    """docking_threshold 是用户可见的停靠精度（±10cm），三处必须同数。
+
+    patch_upstream.py 的文件头摘要曾经写 `0.05 -> 0.32`，而同一个文件的代码
+    实际改的是 0.12、P3 文档也写 0.12 —— 只看文件头的人会以为停靠精度是
+    ±32cm。摘要和代码分居同文件的两头，改了一处很容易忘掉另一处。
+    """
+
+    def test_header_value_matches_patch(self):
+        repo = os.path.dirname(PKG)
+        patch = os.path.join(repo, 'sim', 'patch_upstream.py')
+        if not os.path.isfile(patch):
+            self.skipTest('找不到 sim/（容器只挂包目录）')
+        with open(patch, encoding='utf-8') as f:
+            src = f.read()
+        _old, new = _docking_threshold_pair(src)
+        self.assertIsNotNone(new, '找不到 docking_threshold 补丁对，正则要更新')
+        m = re.search(r'docking_threshold: 0\.05`\s*→\s*`([0-9.]+)`', src)
+        self.assertIsNotNone(m, '文件头摘要里找不到 docking_threshold 的箭头，正则要更新')
+        self.assertEqual(m.group(1), new,
+                         f'文件头写 {m.group(1)}，代码实际改成 {new}')
+
+    def test_docs_quote_same_value(self):
+        repo = os.path.dirname(PKG)
+        patch = os.path.join(repo, 'sim', 'patch_upstream.py')
+        docs = sorted(glob.glob(os.path.join(repo, 'docs', '*.md')))
+        if not os.path.isfile(patch) or not docs:
+            self.skipTest('找不到 sim/ 或 docs/（容器只挂包目录）')
+        with open(patch, encoding='utf-8') as f:
+            _old, new = _docking_threshold_pair(f.read())
+        self.assertIsNotNone(new, '找不到 docking_threshold 补丁对，正则要更新')
+        bad = []
+        for path in docs:
+            with open(path, encoding='utf-8') as f:
+                for i, ln in enumerate(f, 1):
+                    for got in re.findall(
+                            r'docking_threshold[`:\s]+([0-9]+\.[0-9]+)', ln):
+                        if got != new:
+                            bad.append(f'{os.path.basename(path)}:{i} 写 {got}，'
+                                       f'补丁实际是 {new}')
+        self.assertEqual(bad, [], '\n'.join(bad))
 
 
 if __name__ == '__main__':

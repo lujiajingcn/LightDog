@@ -32,6 +32,7 @@ GROUPS = [
     ('test_mcu_bridge', '下位机桥接：钳位 / 急停闸 / 速度保持窗口'),
     ('test_soak', '浸泡采样：泄漏判定 / 重启检测 / 退出码语义'),
     ('test_soak_load', '浸泡载荷：流式字节判据 / 汇总退出码'),
+    ('test_acceptance', '真机验收判据：零速前置必须来自真实观测'),
     ('test_consistency', '参数与版本一致性'),
 ]
 

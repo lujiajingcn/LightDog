@@ -97,6 +97,7 @@ class Probe(Node):
         self.mux_state_at = None
         self.cmd = None
         self.cmd_at = None
+        self.cmd_samples = 0      # zero_cmd 的观测计数，用来区分「没数据」和「在动」
         self.mission = None
         self.mission_at = None
         self.alert = None
@@ -218,16 +219,34 @@ class Probe(Node):
                 return cur
         return last
 
-    def zero_cmd(self, need=1.0):
-        """速度出口是否零速且稳定。"""
+    def zero_cmd(self, need=1.0, min_samples=3):
+        """速度出口是否**观测到**零速且稳定。
+
+        返回 True 需要两个条件同时成立：至少收到 min_samples 条速度消息，
+        并且每一条都是零速。
+
+        只满足「没看到非零速度」是不够的：一条消息都没收到时，旧写法直接
+        return True，于是 check_1 拿「没数据」当「车停着」，接着就去 kill
+        twist_mux —— 那正是本文件开头「测不到的事不报 PASS」要防的第一件事。
+
+        `cmd_samples` 留给调用方区分「车在动」和「根本没数据」：前者要人去
+        把车停下，后者要去查话题为什么不通，处置方式完全不同。
+        """
         t0 = time.monotonic()
+        self.cmd_samples = 0
+        last_at = None
         while time.monotonic() - t0 < need:
             rclpy.spin_once(self, timeout_sec=0.02)
             if self.cmd is None:
                 continue
+            # 按「最后一条消息的时间戳变没变」数条数。不能拿 `cmd is not None`
+            # 当计数：cmd 一旦收到过就再也不是 None，一条消息会被数成几百次。
+            if self.cmd_at != last_at:
+                self.cmd_samples += 1
+                last_at = self.cmd_at
             if abs(self.cmd.linear.x) > 1e-3 or abs(self.cmd.angular.z) > 1e-3:
                 return False
-        return True
+        return self.cmd_samples >= min_samples
 
 
 # --------------------------------------------------------------------- 报告
@@ -380,11 +399,19 @@ def check_1(p, rep, args):
     # 安全前置：车必须静止。这一刀会把 mux 杀掉，正在动的车会失去仲裁
     # —— mux 没了速度出口就没人刷新，但万一有别的节点直连 /cmd_vel 就危险。
     if not p.zero_cmd(need=1.5):
-        v = p.cmd.linear.x if p.cmd else float('nan')
-        rep.add(1, '看门狗真的断 PWM', FAIL,
-                f'车没停（cmd_vel.x={v:.3f}），拒绝执行',
-                '这一项会 kill 掉 twist_mux。先在安全场地让车停下、'
-                '切到 IDLE，再单独跑：--only 1')
+        if p.cmd_samples < 3:
+            rep.add(1, '看门狗真的断 PWM', FAIL,
+                    f'/cmd_vel_muxed 只收到 {p.cmd_samples} 条速度消息，'
+                    '无法确认车是静止的',
+                    '这一项要 kill 掉 twist_mux，必须先证明车停着。\n'
+                    '先查话题通不通：ros2 topic echo /cmd_vel_muxed --once\n'
+                    '（不通时什么都不会发生，但「看起来通过了」比报错更危险）')
+        else:
+            v = p.cmd.linear.x if p.cmd else float('nan')
+            rep.add(1, '看门狗真的断 PWM', FAIL,
+                    f'车没停（cmd_vel.x={v:.3f}），拒绝执行',
+                    '这一项会 kill 掉 twist_mux。先在安全场地让车停下、'
+                    '切到 IDLE，再单独跑：--only 1')
         return
     mode = (p.mission or {}).get('mode')
     if mode in ('FOLLOW', 'DOCKING', 'DOCK_APPROACH', 'ALIGNING', 'UNDOCKING'):

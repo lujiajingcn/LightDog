@@ -47,6 +47,7 @@
 | `system_params.yaml` | `patrol_waypoints` | `''` | `"x,y,yaw; x,y,yaw"` | 空 = 不巡游。格式必须用分号分隔、逗号分字段，坏数据会被**计数并跳过**而不是猜一个默认值 |
 | `mcu_params.yaml` | `port` / `baud` | `/dev/ttyAMA0` / `115200` | 按实际接线与固件改 | 打不开串口时车**完全不动**，日志里只有一行「串口打不开」。用 USB 转 TTL 时写 `/dev/serial/by-id/...`，别写 `/dev/ttyUSB0`（重启后编号会变） |
 | `mcu_params.yaml` | `cmd_hold` | `0.30` | 与 `twist_mux` 的 `follow_hold` 一致 | 太长：跟随节点让出控制权后车还带着最后一条速度走；太短：正常指令被切成一顿一顿 |
+| `mcu_params.yaml` | `cmd_vel_topic` | `/cmd_vel_muxed` | **二选一，见右栏** | 真机上它是唯一到固件的一跳，订阅谁就等于把谁接到车轮上。`/cmd_vel_muxed` 在 `collision_monitor` **之前**；仿真里速度出口是 `/cmd_vel`（后面还有 `ros_gz_bridge → gz`），真机没有那一跳，于是 Nav2 的碰撞保护退化成一个只往死话题发零速的节点 —— **前方有障碍也拦不住车**。改成 `/cmd_vel` 能拿回碰撞保护，但要求 Nav2 常驻，否则车不会动 |
 | `p1` 灯组 | 见 `docs/P1_led_battery.md` | — | — | LED 真机由固件驱动，`lightdog_led` 要停掉 |
 
 ## 二、真机上不要启动的节点
