@@ -6,8 +6,10 @@
 
 检查项：
   1. yaml 里的每个参数，对应节点必须 declare_parameter 过（否则是死参数）
-  2. package.xml 的版本要和 HTTP 的 server_version 一致（对外可观测的版本号）
-  3. launch 文件引用的 params 文件必须真实存在
+  2. 反过来，每个 declare_parameter 过的参数也必须出现在 yaml 里 ——
+     否则真机上想调它只能改代码，而代码里那份默认值是照仿真调的
+  3. package.xml 的版本要和 HTTP 的 server_version 一致（对外可观测的版本号）
+  4. launch 文件引用的 params 文件必须真实存在
 """
 
 import glob
@@ -74,6 +76,32 @@ class TestParamsWired(unittest.TestCase):
                             f'{os.path.basename(cfg)}: {node_key} 的 {pname} '
                             f'在 {os.path.basename(mod)} 里没声明（写了也不生效）')
         self.assertGreater(inspected, 0, '一个节点都没匹配上，映射规则坏了')
+        self.assertEqual(problems, [], '\n'.join(problems))
+
+    def test_every_declared_param_is_in_yaml(self):
+        """反方向：代码里声明了、yaml 里没有 = 现场调不了。
+
+        这条比上一条更容易漏。上一条（yaml->代码）写错了参数不生效，至少
+        还能看出「改了没反应」；这一条漏了新参数，现象是「默认值刚好能用，
+        上真机想调的时候发现根本没有这个旋钮」，往往要翻源码才发现。
+        """
+        index = {}                                   # 节点名 -> yaml 里的参数集
+        for cfg in sorted(glob.glob(os.path.join(CONFIG_DIR, '*.yaml'))):
+            with open(cfg, encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            for node_key, body in data.items():
+                if node_module(node_key) is None:
+                    continue
+                index.setdefault(node_key.strip('/'), set()).update(
+                    (body or {}).get('ros__parameters') or {})
+
+        problems = []
+        for name, have in sorted(index.items()):
+            mod = os.path.join(PKG, name + '.py')
+            for pname in sorted(declared_names(mod) - have - IMPLICIT_PARAMS):
+                problems.append(
+                    f'{os.path.basename(mod)} 的 {pname} 没写进 config/*.yaml'
+                    f'（真机上只能改代码才能调它）')
         self.assertEqual(problems, [], '\n'.join(problems))
 
     def test_twist_mux_hold_le_timeout(self):

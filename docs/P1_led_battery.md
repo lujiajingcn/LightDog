@@ -150,3 +150,5 @@ launch 会尝试把整个 URDF 文本当 YAML 解析。URDF 里任何一行出�
 
 修法是 `ParameterValue(..., value_type=str)`，由 `sim/patch_upstream.py` 在容器启动时幂等修补镜像内副本。
 **锚点找不到时脚本会报错退出让容器起不来**，而不是静默跑一个坏配置 —— 这样上游改版能立刻被发现。
+
+> 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。

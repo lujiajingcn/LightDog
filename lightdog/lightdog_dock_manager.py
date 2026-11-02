@@ -136,6 +136,16 @@ class DockManager(Node):
         self.declare_parameter('cancel_cooldown', 120.0)
         self.declare_parameter('auto_dock', True)
 
+        # 停靠成功 ≠ 充上电。docking_server 返回 success 只代表它认为停到位了，
+        # 触点间隙/氧化/被碰歪都会「假停靠」：界面显示 DOCKED，电量却不动，
+        # 一直到耗尽。这里用「电量比是否在涨」做一次事后确认，只报错不自动离桩
+        # （自动离桩会在真的已经充满但 BMS 上报滞后时来回折腾）。
+        self.declare_parameter('verify_charging', True)
+        self.declare_parameter('charge_check_timeout', 30.0)   # 墙钟秒
+        # 离桩超时。真机桩前净空不同，不能写死：给 30s 时车稍慢一点就返回
+        # 905 FAILED_TO_CONTROL；仿真 0.2x 实时因子下更要放宽。
+        self.declare_parameter('max_undocking_time', 30.0)
+
         # ---- 视觉对准（ALIGNING）----
         self.declare_parameter('align_before_dock', True)
         self.declare_parameter('align_tol', 0.10)        # 竖直角容差 (rad) ≈ 5.7°
@@ -170,6 +180,9 @@ class DockManager(Node):
         self.retry_cooldown = float(p('retry_cooldown').value)
         self.cancel_cooldown = float(p('cancel_cooldown').value)
         self.auto_dock = bool(p('auto_dock').value)
+        self.verify_charging = bool(p('verify_charging').value)
+        self.charge_check_timeout = float(p('charge_check_timeout').value)
+        self.max_undocking_time = float(p('max_undocking_time').value)
 
         self.align_before_dock = bool(p('align_before_dock').value)
         self.align_tol = float(p('align_tol').value)
@@ -182,12 +195,31 @@ class DockManager(Node):
         self.sim_charge_rate = float(p('sim_charge_rate').value)
         self.sim_battery_timeout = float(p('sim_battery_timeout').value)
 
+        # 真机上开着 sim_charging 是灾难：停靠后按时间伪造电量，很快"充满"并
+        # 自动离桩，而真实电池一点没充。不能只靠"记得改配置"这一层人肉保障，
+        # 用 use_sim_time 兜底：仿真节点必然是 true，真机一般 false。
+        if self.sim_charging:
+            try:
+                sim_time = bool(self.get_parameter('use_sim_time').value)
+            except Exception:
+                sim_time = False
+            if not sim_time:
+                self.sim_charging = False
+                self.get_logger().error(
+                    'sim_charging=true 但 use_sim_time=false：判定为真机环境，'
+                    '已强制关闭仿真充电（否则会伪造电量、到点自动离桩）。'
+                    '真机请把 p3_params.yaml 的 sim_charging 改成 false。')
+
         # ---- 运行时状态 ----
         self.state = IDLE
         self.battery = None           # 最近一条 BatteryState
         self.sim_ratio = None         # 调试注入的电量比
         self.sim_ratio_stamp = 0.0
         self.charge_ah = None         # 用于 sim_charging 的积分量
+        # 停靠后"是否真的在充电"的抽查点（墙钟）：进入 DOCKED 时的电量比 / 时刻
+        self._dock_ratio_at = None
+        self._dock_check_at = 0.0
+        self._charging_checked = False
         self.low_since = None         # 连续低电起始时刻
         self.cooldown_until = 0.0     # 充满后的冷却
         self.retry_until = 0.0        # 失败后的冷却
@@ -359,6 +391,8 @@ class DockManager(Node):
                 self.charge_ah = None
                 self.cooldown_until = now + self.full_cooldown
                 self.start_undocking()
+                return
+            self._check_charging(now, ratio)
             return
 
         if self.state != IDLE:
@@ -388,6 +422,42 @@ class DockManager(Node):
         if (now - self.low_since) >= self.low_confirm_time:
             self.low_since = None
             self.start_docking(manual=False)
+
+    # ---------- 停靠后的充电抽查 ----------
+
+    def _check_charging(self, now, ratio):
+        """停靠后抽查「电量比是不是在涨」，只报错、不自动离桩。
+
+        为什么需要：docking_server 返回 success 只说明它认为停到位了。触点
+        间隙、氧化、车被碰歪都会造成「假停靠」—— 界面显示 DOCKED、状态机以为
+        在充电，实际电量一动不动，直到耗尽。这个失效在仿真里看不到（仿真充电
+        是凭空积分），只有上真机才会暴露。
+
+        判据用「电量比是否上涨」而不是 `BatteryState.status`：不同 BMS 对
+        status 的填充很不一致（有的恒为 UNKNOWN），电量比则必然随充电上升。
+        """
+        if not getattr(self, 'verify_charging', False):
+            return
+        if getattr(self, '_dock_ratio_at', None) is None:
+            self._dock_ratio_at = ratio
+            self._dock_check_at = now
+            self._charging_checked = False
+            return
+        if getattr(self, '_charging_checked', False):
+            return
+        if ratio > self._dock_ratio_at + 0.002:
+            self._charging_checked = True
+            self.get_logger().info(
+                f'确认在充电：{self._dock_ratio_at:.1%} -> {ratio:.1%}')
+            return
+        timeout = getattr(self, 'charge_check_timeout', 30.0)
+        if (now - self._dock_check_at) < timeout:
+            return
+        self._charging_checked = True
+        self.get_logger().error(
+            f'停靠 {timeout:.0f}s 电量没有上涨（仍为 {ratio:.1%}）：可能没真正接触上。'
+            f'检查充电触点 / 桩供电 / 车是否被碰歪；不会自动离桩，'
+            f'可发 /dock/command=undock 手动重试。')
 
     # ---------- 视觉对准 ----------
 
@@ -440,6 +510,11 @@ class DockManager(Node):
         self.last_error = ''
         self.align_started = time.monotonic()
         self._last_align_log = 0.0
+        # 新一轮回充：清掉上一轮的充电抽查状态，否则这一轮一进 DOCKED 就
+        # 拿上一轮的电量比去比，可能立刻误报"没在充电"。
+        self._dock_ratio_at = None
+        self._dock_check_at = 0.0
+        self._charging_checked = False
 
         if self.align_before_dock:
             self.state = ALIGNING
@@ -524,6 +599,8 @@ class DockManager(Node):
         self._dock_goal_handle = None
         self.pub_vel.publish(Twist())
         self.busy = False
+        self._dock_ratio_at = None
+        self._charging_checked = False
         self.retries += 1
         self.get_logger().error(f'停靠失败（第 {self.retries} 次）：{reason}')
         if self.retries > self.max_retries:
@@ -542,7 +619,7 @@ class DockManager(Node):
             return
         goal = UndockRobot.Goal()
         goal.dock_type = 'simple_charging_dock'
-        goal.max_undocking_time = 30.0
+        goal.max_undocking_time = float(self.max_undocking_time)
 
         self.busy = True
         self.state = UNDOCKING
@@ -620,6 +697,8 @@ class DockManager(Node):
         self.busy = False
         self.state = IDLE
         self.align_done = False
+        self._dock_ratio_at = None
+        self._charging_checked = False
         # 手动取消要真的「停下来别动」。低电判定还在，不做冷却的话
         # tick 会立刻重新走一遍 low → 确认 → 对准 → 停靠（实测 3.3s 就回到 DOCKED）。
         self.low_since = None

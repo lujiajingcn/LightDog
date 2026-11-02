@@ -66,6 +66,29 @@ def extract_methods(path, cls_name, names, ns=None):
     return found
 
 
+def extract_funcs(path, names, ns=None):
+    """从模块顶层抽普通函数（safe_token / clamp_sec 这类纯函数）。
+
+    和 extract_methods 同一个理由：直接执行源文件里的那份代码，
+    不复制实现，改源文件测试自动跟着变。
+    """
+    with open(path, encoding='utf-8') as f:
+        src = f.read()
+    tree = ast.parse(src)
+    names = set(names)
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            code = _strip_decorators(ast.get_source_segment(src, node))
+            g = dict(ns or {})
+            exec(compile(code, node.name, 'exec'), g)
+            found[node.name] = g[node.name]
+    missing = names - set(found)
+    if missing:
+        raise KeyError(f'{os.path.basename(path)} 里找不到顶层函数 {sorted(missing)}')
+    return found
+
+
 def extract_class(path, cls_name, ns=None):
     """整类抽取（用于 CmdVelSource 这种纯数据类）。"""
     with open(path, encoding='utf-8') as f:
@@ -128,9 +151,18 @@ class Point:
         self.x, self.y, self.z = x, y, z
 
 
+class Header:
+    def __init__(self, frame_id='base_link'):
+        self.frame_id = frame_id
+        self.stamp = None
+
+
 class PointStamped:
-    def __init__(self, x=0.0, y=0.0):
+    """geometry_msgs/PointStamped 的最小替身（带 header，跟随器要查 frame_id）。"""
+
+    def __init__(self, x=0.0, y=0.0, frame_id='base_link'):
         self.point = Point(x, y)
+        self.header = Header(frame_id)
 
 
 class Pub:

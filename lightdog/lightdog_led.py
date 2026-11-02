@@ -60,6 +60,19 @@ class LedController(Node):
         self.brightness = float(self.get_parameter('default_brightness').value)
         self.indicator = float(self.get_parameter('default_indicator').value)
 
+        # 本节点的作用是**仿真渲染层**：把亮度翻译成 gz 的材质自发光。
+        # 真机上 LED 由固件直接订阅 /led/brightness 驱动，这个节点不该启动。
+        # 真机上若误拉起，它只会往一个没人转发的 ros_gz_interfaces 话题发消息，
+        # 表现为「灯不亮、也没报错」，排查时极易误判成固件问题。
+        try:
+            sim_time = bool(self.get_parameter('use_sim_time').value)
+        except Exception:
+            sim_time = True
+        if not sim_time:
+            self.get_logger().error(
+                'use_sim_time=false：本节点只服务 Gazebo 材质渲染，'
+                '真机上请让固件消费 /led/brightness，并在 launch 里去掉本节点')
+
         latched = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,

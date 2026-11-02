@@ -1,7 +1,9 @@
 # LightDog P2 参数（人体检测 / 跟随 / 光照联动）
 #
-# 时间相关参数依赖仿真时钟，所以四个节点统一 use_sim_time: true。
-# 换真机时把 use_sim_time 设成 false 即可，其余参数可沿用。
+# 仿真里这几个节点统一 use_sim_time: true（twist_mux 例外，理由见它自己那段）。
+# 换真机时把 use_sim_time 设成 false，其余参数可沿用。
+# 注意：本文件里**所有超时判据都按墙钟（time.monotonic）计**，与 use_sim_time
+# 无关 —— 它们回答的是「消息多久没到了」，仿真跑多快不该影响这个结论。
 
 /lightdog_person_detector:
   ros__parameters:
@@ -38,6 +40,8 @@
 
     publish_debug: true
     rate: 10.0             # 软件渲染下别给太高，10Hz 够跟随用
+    # 短暂丢检仍报「有人」的容忍时长（墙钟秒）。单帧丢检就报无人会让灯闪、
+    # 车一走一停；必须大于相机周期（仿真 0.67s，真机 0.033s）。
     lost_timeout: 1.0
     # 帧新鲜度（墙钟秒）。回答的是「相机管线还在不在出帧」，与仿真跑多快无关。
     # 必须大于相机周期的几倍：仿真相机 1.5Hz（0.67s/帧）、真机 30Hz。
@@ -54,6 +58,9 @@
     fade_delay: 5.0        # 人走后先等 5s，容忍短暂丢检
     fade_time: 2.0
     step_hz: 20.0
+    # 多久收不到 /person/present 就认为检测器已经死了（墙钟秒）。没有这个判据时
+    # 检测器一崩，最后那条 present=True 会永久粘住，灯整夜亮着且无任何日志。
+    present_timeout: 3.0
     enabled: true
 
 /lightdog_follower:
@@ -69,6 +76,10 @@
     angle_tol: 0.06
     side_turn_only: 0.9
     person_timeout: 1.5
+    # /person/position 的坐标系。x 前 / y 左 的语义只对 base_link 成立；
+    # 换检测器实现（例如改发 camera_link）时不同步改这里，跟随器会拒绝使用
+    # 该坐标并停车 —— 这是刻意的，宁可停住也不能按错的坐标系算速度。
+    expected_frame: base_link
     # dock_manager 以 10Hz 发 /dock/inhibit；它挂了以后最后那条 true 会一直
     # 留在跟随器里，表现为「跟随彻底不工作」。超过这个时间没新消息就解除。
     inhibit_timeout: 5.0
@@ -104,6 +115,11 @@
     out_topic: /cmd_vel_muxed
     publish_rate: 20.0
     zero_on_idle: true
+    # 平台物理上限，作用在输出上：任何上游算错了，最终发给底层的速度都不会超过它。
+    # 0 = 不限制。这里给的是「仿真里不会触发」的值，真机按电机实际能力改小
+    # （本项目底盘建议 0.30 / 1.0）。超速时会打一条 warn 并钳制。
+    max_linear: 0.50
+    max_angular: 1.50
 
 /lightdog_person_sim:
   ros__parameters:

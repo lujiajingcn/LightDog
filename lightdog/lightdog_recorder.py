@@ -97,6 +97,36 @@ def even(n: int) -> int:
     return n - (n % 2)
 
 
+def safe_token(text, default='event', max_len=24) -> str:
+    """把外部输入收敛成可以安全拼进文件名的片段。
+
+    `type` 来自 HTTP 请求体（`POST /api/v1/events`）或任意 ROS 话题发布者，
+    会被直接拼成 `evt_<时间>_<type>` 目录名。不净化的话 `type="../../x"`
+    能把 `os.makedirs` 的目标指到 events/ 之外，`type="a/b"` 会在中间多建一级
+    目录 —— 后者在真机上表现为「事件在列表里消失但磁盘在涨」。
+    只留 ASCII 字母数字与 `-_`，其余全部丢掉。
+    """
+    s = ''.join(ch for ch in str(text)
+                if ch.isascii() and (ch.isalnum() or ch in ('-', '_')))
+    s = s.strip('-_')[:max_len]
+    return s or default
+
+
+def clamp_sec(value, low=0.0, high=300.0, default=10.0) -> float:
+    """把事件窗口参数夹到合理范围；坏值退回默认值。
+
+    不夹的话 `pre=1e9` 会让窗口覆盖整个环形缓冲（以及已经被清掉的历史），
+    合成线程要扫一遍所有分段才失败。
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not (v == v):            # NaN
+        return default
+    return max(low, min(high, v))
+
+
 class Recorder(Node):
 
     def __init__(self):
@@ -119,6 +149,13 @@ class Recorder(Node):
         # P5 的窗口是 25+10=35s，真机 30Hz 相机要 1050 帧，取 1200 留余量。
         # 流式写盘只占一帧内存，所以放宽上限不会再回到当初 OOM 的老路。
         self.declare_parameter('max_event_frames', 1200)
+        # 事件目录的保留策略。环形缓冲有配额，events/ 之前一没有 —— 一次跌倒
+        # 35s 视频在真机 30fps 下约 2~3MB，一天几次，一个月就是几百 MB。
+        # 卡写满后录像/事件/告警全部失败（ENOSPC），而且往往是半夜才发生。
+        self.declare_parameter('event_retain_days', 30.0)
+        self.declare_parameter('max_event_mb', 512.0)
+        self.declare_parameter('min_events', 20)      # 至少留这么多条，供最近的取证
+        self.declare_parameter('max_snapshots', 200)  # 快照目录同样要封顶
         self.declare_parameter('codec', 'avc1')
         self.declare_parameter('jpeg_quality', 80)
         # 环形缓冲的中间编码质量。这里**不是**最终画质（写盘时会重编一次），
@@ -137,6 +174,10 @@ class Recorder(Node):
         self.pre_sec = float(p('pre_sec').value)
         self.post_sec = float(p('post_sec').value)
         self.max_event_frames = int(p('max_event_frames').value)
+        self.event_retain_days = float(p('event_retain_days').value)
+        self.max_event_mb = float(p('max_event_mb').value)
+        self.min_events = int(p('min_events').value)
+        self.max_snapshots = int(p('max_snapshots').value)
         self.codec = str(p('codec').value)
         self.jpeg_quality = int(p('jpeg_quality').value)
         self.buffer_quality = int(p('buffer_jpeg_quality').value)
@@ -185,6 +226,7 @@ class Recorder(Node):
         self.pending = []            # 待合成事件
         self.n_events = 0
         self.warned_codec = False
+        self._last_dir_gc = 0.0      # events/ snapshots/ 清理的节流时刻（墙钟）
 
         sensor_qos = QoSProfile(depth=1,
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -458,11 +500,13 @@ class Recorder(Node):
             self.get_logger().warn(f'/recorder/event 不是合法 JSON（{e}）：{msg.data!r}')
             return
 
-        etype = str(req.get('type', 'event'))
-        label = str(req.get('label', etype))
-        pre = float(req.get('pre', self.pre_sec))
-        post = float(req.get('post', self.post_sec))
-        note = str(req.get('note', ''))
+        # type 会拼进目录名，必须先净化（见 safe_token 的注释）；
+        # pre/post 夹到 0~300s，否则一个手滑的 pre=1e9 会扫遍整个环形缓冲。
+        etype = safe_token(req.get('type', 'event'))
+        label = str(req.get('label', etype))[:80]
+        pre = clamp_sec(req.get('pre', self.pre_sec), default=self.pre_sec)
+        post = clamp_sec(req.get('post', self.post_sec), default=self.post_sec)
+        note = str(req.get('note', ''))[:200]
 
         t_ev = self._now_ros()
         # 先把当前段落盘：这样 pre 窗口的尾部不会卡在内存里等段满
@@ -506,6 +550,11 @@ class Recorder(Node):
                                  daemon=True).start()
 
         self._gc()
+        wall = time.time()
+        if (wall - self._last_dir_gc) >= 60.0:
+            self._last_dir_gc = wall
+            self._gc_events(wall)
+            self._gc_snapshots()
         self._publish_state(now)
 
     # ---------- 事件合成 ----------
@@ -757,6 +806,106 @@ class Recorder(Node):
             os.replace(tmp, self.index_path)
         except Exception as e:
             self.get_logger().warn(f'重写索引失败：{e}')
+
+    def _gc_events(self, now):
+        """事件视频保留策略：按天数 + 总容量，且至少留 min_events 条。
+
+        之前只清 clips/，events/ 是只进不出的。真机上一次跌倒事件 35s 视频约
+        2~3MB，一天几次、一个月就是几百 MB —— SD 卡写满以后录像、事件切片、
+        告警落盘全部失败，而且通常发生在半夜。
+        """
+        try:
+            names = os.listdir(self.events_dir)
+        except OSError:
+            return
+
+        items = []
+        for name in names:
+            d = os.path.join(self.events_dir, name)
+            if not os.path.isdir(d):
+                continue
+            # 正在合成的目录绝对不能删：video.part.mp4 还在写
+            if os.path.exists(os.path.join(d, 'video.part.mp4')):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(d, 'meta.json'))
+            except OSError:
+                try:
+                    mtime = os.path.getmtime(d)
+                except OSError:
+                    continue
+            size = 0
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_file(follow_symlinks=False):
+                                size += e.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            items.append((name, mtime, size))
+
+        if not items:
+            return
+        items.sort(key=lambda x: x[1])          # 最老的在前
+        total = sum(x[2] for x in items)
+        keep_from = max(0, len(items) - self.min_events)
+
+        removed = 0
+        for idx, (name, mtime, size) in enumerate(items):
+            if idx >= keep_from:
+                break                            # 进入「至少保留」区间
+            too_old = (now - mtime) > self.event_retain_days * 86400.0
+            too_big = total > self.max_event_mb * 1048576.0
+            if not (too_old or too_big):
+                continue
+            if self._rm_tree(os.path.join(self.events_dir, name)):
+                total -= size
+                removed += 1
+
+        if removed:
+            self.get_logger().info(
+                f'事件清理：删除 {removed} 条，剩余 {total/1048576.0:.1f}MB '
+                f'（上限 {self.max_event_mb:.0f}MB / {self.event_retain_days:.0f} 天）')
+
+    @classmethod
+    def _rm_tree(cls, path):
+        """删除一个目录及其内容；失败只返回 False，不抛（清理不能影响录像）。"""
+        try:
+            with os.scandir(path) as it:
+                entries = list(it)
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        cls._rm_tree(e.path)
+                    else:
+                        os.remove(e.path)
+                except OSError:
+                    pass
+            os.rmdir(path)
+            return True
+        except OSError:
+            return False
+
+    def _gc_snapshots(self):
+        """快照按文件名（时间戳）保留最新的 max_snapshots 张。"""
+        if self.max_snapshots <= 0:
+            return
+        try:
+            names = [n for n in os.listdir(self.snaps_dir)
+                     if n.lower().endswith('.jpg')]
+        except OSError:
+            return
+        if len(names) <= self.max_snapshots:
+            return
+        names.sort()
+        for n in names[:len(names) - self.max_snapshots]:
+            try:
+                os.remove(os.path.join(self.snaps_dir, n))
+            except OSError:
+                pass
 
     # ---------- 状态 ----------
 

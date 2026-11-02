@@ -39,6 +39,12 @@
     rate: 10.0
     max_range: 3.0
     publish_debug: true
+    # 相机断流判据（墙钟秒）。超时后主动把 /dock/marker_visible 置 false，
+    # 否则对准逻辑会以为桩还在视野里、原地微调而不进入扫描。
+    frame_timeout: 1.0
+    # marker 的 +x 方向与预期差 180° 时用（贴纸贴反/换了一家供应商的板子），
+    # 打开后解出来的 yaw 整体翻转。正常情况下保持 false。
+    invert_marker_yaw: false
 
 /lightdog_dock_manager:
   ros__parameters:
@@ -64,6 +70,17 @@
     # 手机端「取消回充」等于没有。
     cancel_cooldown: 120.0
     auto_dock: true
+
+    # 停靠成功 != 充上电。docking_server 只保证"停到位"，触点没接触上时
+    # 界面照样显示 DOCKED、电量却不动。这里在 DOCKED 后抽查电量是否在涨，
+    # 30s 没涨就报 error（不自动离桩，避免 BMS 上报滞后时来回折腾）。
+    verify_charging: true
+    charge_check_timeout: 30.0
+
+    # 离桩超时（秒）。真机桩前净空不同，不能写死：给 30s 时车稍慢一点就
+    # 返回 905 FAILED_TO_CONTROL。仿真 0.2x 实时因子下更要放宽（实测 30s
+    # 只有约 6s 仿真时间，手动 undock 会失败，仿真里建议 60~90）。
+    max_undocking_time: 30.0
 
     # 视觉对准：docking_server 进 INITIAL_PERCEPTION 后只会等、不会转，所以
     # 必须先由本节点把车头摆正（否则 error_code=904 FAILED_TO_DETECT_DOCK）。

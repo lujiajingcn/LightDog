@@ -50,6 +50,7 @@ iOS Safari 播 `<video>` 会先发 `Range: bytes=0-1` 探一下，服务端回 `
 `206` 时它直接拒绝播放（且不报错，只是黑屏）。这是「手机上看录像」最容易踩的坑。
 """
 
+import hmac
 import json
 import os
 import shutil
@@ -662,6 +663,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = 'LightDog/0.4.0'
     protocol_version = 'HTTP/1.1'
 
+    # 请求体上限。联系人列表最多 16 条、事件请求就几十字节，1MB 已经宽得离谱；
+    # 不设的话一个 Content-Length: 999999999 就能把进程内存吃干。
+    MAX_BODY = 1 << 20
+
     # ---- 基础设施 ----
 
     @property
@@ -680,14 +685,21 @@ class Handler(BaseHTTPRequestHandler):
         tok = self.node.token
         if not tok:
             return True
-        q = self._query()
-        if q.get('token', [''])[0] == tok:
-            return True
-        if self.headers.get('X-Auth-Token', '') == tok:
-            return True
+        cands = [self._query().get('token', [''])[0],
+                 self.headers.get('X-Auth-Token', '')]
         a = self.headers.get('Authorization', '')
-        if a.startswith('Bearer ') and a[7:].strip() == tok:
-            return True
+        if a.startswith('Bearer '):
+            cands.append(a[7:].strip())
+        # 定长比较：`a == b` 会在第一个不同字节处返回，同网段的人能用响应
+        # 时间逐字节把 token 猜出来。hmac.compare_digest 与内容无关。
+        for c in cands:
+            try:
+                if hmac.compare_digest(str(c), tok):
+                    return True
+            except TypeError:
+                # 非 ASCII token（用户可能设中文）：compare_digest 只吃 ASCII
+                if str(c) == tok:
+                    return True
         return False
 
     def _send(self, code, body=b'', ctype='application/json; charset=utf-8',
@@ -745,7 +757,9 @@ class Handler(BaseHTTPRequestHandler):
             if start > end or start >= size:
                 self.send_response(416)
                 self.send_header('Content-Range', f'bytes */{size}')
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.send_header('Content-Length', '0')
+                self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 return
             partial = True
@@ -918,6 +932,10 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
             n = int(self.headers.get('Content-Length') or 0)
+            if n > self.MAX_BODY:
+                # 先把连接处理掉再回错误，否则剩余字节会被当成下一个请求
+                self.close_connection = True
+                return self._err(413, 'body too large')
             raw = self.rfile.read(n) if n > 0 else b''
             if not path.startswith('/api/'):
                 return self._err(404, 'no such endpoint')

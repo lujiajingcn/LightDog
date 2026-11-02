@@ -196,6 +196,7 @@ class PersonDetector(Node):
 
         self.present = False          # 上一次判定结果，供无新帧时重发
         self._warned_rgb_stall = False
+        self._warned_no_input = False
 
         sensor_qos = QoSProfile(
             depth=1,
@@ -252,13 +253,31 @@ class PersonDetector(Node):
 
     # ---------- 主循环 ----------
 
-    def _tick(self):
-        if self.rgb is None:
-            return
-        if self.fx is None or self.fx <= 1.0:
-            return
+    def _person_expired(self, now_mono):
+        """最后一次成功检出距今是否已超过 lost_timeout（墙钟秒）。"""
+        if self.last_seen is None:
+            return True
+        return (now_mono - self.last_seen) > self.lost_timeout
 
+    def _tick(self):
         now_mono = time.monotonic()
+
+        # 没相机 / 没内参：这是「看不见」，不等于「没人」，但下游只有这一个
+        # Bool 可看，所以必须明确发 false 并留一条日志。改之前这里直接
+        # return —— 真机上话题名写错的现象是「跟随和自动灯都不工作，
+        # 而节点日志一片安静」，只能靠猜。
+        if self.rgb is None or self.fx is None or self.fx <= 1.0:
+            if not self._warned_no_input:
+                self._warned_no_input = True
+                what = '彩色图' if self.rgb is None else 'camera_info（fx 无效）'
+                self.get_logger().error(
+                    f'尚未收到{what}，/person/present 固定发 false。'
+                    f'检查 rgb_topic / info_topic 是否与实际相机驱动一致')
+            self.present = False
+            self.pub_present.publish(Bool(data=False))
+            return
+        self._warned_no_input = False
+
         if (now_mono - self.rgb_wall) > self.frame_timeout:
             # 相机断流/冻帧：绝不能拿最后一帧反复判「有人」。否则跟随器会对着
             # 画面里的幽灵一直走，而这正是最危险的一种失效（人早就走开了）。
@@ -275,22 +294,25 @@ class PersonDetector(Node):
         if self.rgb_seq == self._det_seq:
             # 没有新帧就不重复检测，但仍然按 rate 重发判定结果，
             # 让下游的超时逻辑（/person/present 是 Bool，没有时间戳）照常工作。
-            self.pub_present.publish(Bool(data=self.present))
+            # 重发值也要按 lost_timeout 老化：相机还在出帧、但这一帧检不到人时，
+            # 若原样重发 true，连续丢检期间的 present 会一直粘在 true 上。
+            present = self.present and not self._person_expired(now_mono)
+            self.present = present
+            self.pub_present.publish(Bool(data=present))
             return
         self._det_seq = self.rgb_seq
 
         det = self._detect()
 
-        now = self.get_clock().now()
-        if det is None:
-            present = False
-            if self.last_seen is not None:
-                age = (now - self.last_seen).nanoseconds / 1e9
-                present = age < self.lost_timeout
-        else:
-            present = True
-            self.last_seen = now
+        # 计龄一律用墙钟：这里问的是「多久没检出人了」，与仿真跑多快无关。
+        # 用 ROS 时钟时若 use_sim_time 被误开而没有 /clock，时钟停走，
+        # 这个超时永远不会到，灯就一直亮着。
+        if det is not None:
+            self.last_seen = now_mono
             self._publish_position(*det)
+            present = True
+        else:
+            present = not self._person_expired(now_mono)
 
         self.present = present
         self.pub_present.publish(Bool(data=present))

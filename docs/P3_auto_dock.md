@@ -258,3 +258,5 @@ NAV_TO_STAGING → INITIAL_PERCEPTION → error_code=904 (FAILED_TO_DETECT_DOCK)
   录像要能按事件切片。
 - **P5 跌倒检测**：与回充共享 `dock_manager` 的状态机骨架
   （低电触发 → 动作 → 完成 → 复位），告警链路可以照这个结构写。
+
+> 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。

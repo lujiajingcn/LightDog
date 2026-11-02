@@ -344,3 +344,5 @@ bash sim/p1.sh led 0.5
   跟随期间要回充则需先 `enable_follow:=false`
 - **P5 跌倒检测**：需要姿态关键点，届时把检测器换成 YOLOv8-pose / MediaPipe，
   本文件的接口不变
+
+> 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。

@@ -77,6 +77,11 @@ class AlertManager(Node):
         # ---- 一级：姿态持续性 ----
         self.declare_parameter('suspect_hold', 5.0)      # 连续躺倒多少秒算"可疑"
         self.declare_parameter('lying_gap', 1.0)         # 判据抖动容忍（丢帧不算起身）
+        # 画面里连续这么久看不到人 -> 判为「人已离开」并回到 NORMAL。
+        # 这个参数只在 SUSPECTED 用：unknown（蹲着/被挡住/相机故障）**不算**
+        # 人走了，必须靠"明确看到站立"或"明确连续无人"才撤销，否则一次遮挡
+        # 就能把已经开始的确认流程抹掉。
+        self.declare_parameter('absent_grace', 10.0)
 
         # ---- 二级：交互无响应 ----
         self.declare_parameter('confirm_window', 15.0)   # 问询后再等多少秒
@@ -104,6 +109,7 @@ class AlertManager(Node):
         p = self.get_parameter
         self.suspect_hold = float(p('suspect_hold').value)
         self.lying_gap = float(p('lying_gap').value)
+        self.absent_grace = float(p('absent_grace').value)
         self.confirm_window = float(p('confirm_window').value)
         self.recover_hold = float(p('recover_hold').value)
         self.resolved_hold = float(p('resolved_hold').value)
@@ -119,6 +125,8 @@ class AlertManager(Node):
         self.z_p95 = None
         self.last_lying = None        # 最近一次看到 lying 的 ROS 时间
         self.last_standing = None
+        self.last_absent = None
+        self.absent_since = None      # 本轮"连续无人"的起点
         self.standing_since = None    # 本轮"连续站立"的起点（恢复判定用）
         self.since = self._now()      # 进入当前状态的时刻
         self.alarm_id = ''
@@ -186,7 +194,10 @@ class AlertManager(Node):
             self.last_standing = None
         elif st == 'standing':
             self.last_standing = now
-        # unknown / absent：两边都不更新，靠 lying_gap 自然过期
+        elif st == 'absent':
+            self.last_absent = now
+        # unknown：两个姿态都不更新，靠 lying_gap 自然过期
+        # （unknown 是「看不清」，不能当成起身 —— 相机坏了的时候尤其如此）
 
     def _on_z(self, msg: Float32):
         self.z_p95 = float(msg.data)
@@ -217,6 +228,10 @@ class AlertManager(Node):
         return (self.last_standing is not None
                 and (self._now() - self.last_standing) <= self.lying_gap)
 
+    def _is_absent(self) -> bool:
+        return (self.last_absent is not None
+                and (self._now() - self.last_absent) <= self.lying_gap)
+
     def _tick(self):
         # 维护「本轮连续站立时长」。
         #
@@ -229,16 +244,33 @@ class AlertManager(Node):
         else:
             self.standing_since = None
 
+        # 「连续无人」的起点。用它把"人走了"和"看不清"分开：
+        # 前者一段宽限时间后复位，后者保持状态不动。
+        if self._is_absent():
+            if self.absent_since is None:
+                self.absent_since = self._now()
+        else:
+            self.absent_since = None
+
         if self.state == self.NORMAL:
             if self._is_lying():
                 self._set_state(self.SUSPECTED, '检测到躺倒姿态，开始计时')
             return
 
         if self.state == self.SUSPECTED:
-            if not self._is_lying():
-                self._set_state(self.NORMAL, '已起身，判定为弯腰/蹲下等误报')
+            # 只有「明确看到站立」或「明确连续无人」才撤销。
+            # unknown（蹲下、被遮挡、相机断流）保持状态等判据回来 —— 原来写的是
+            # 「不是躺着就复位」，一次遮挡或相机故障就能把已经开始的确认流程抹掉。
+            if self._is_standing():
+                self._set_state(self.NORMAL, '已起身（看到站立），判定为弯腰/蹲下等误报')
                 return
-            if self._age() >= self.suspect_hold:
+            if (self.absent_since is not None
+                    and (self._now() - self.absent_since) >= self.absent_grace):
+                self._set_state(
+                    self.NORMAL,
+                    f'连续 {self.absent_grace:.0f}s 画面里没人，判为人已离开')
+                return
+            if self._is_lying() and self._age() >= self.suspect_hold:
                 # 一级确认通过
                 self._set_state(self.CONFIRMING, f'连续躺倒 {self.suspect_hold:.0f}s')
                 self._say('您还好吗？需要帮忙请回答我。')

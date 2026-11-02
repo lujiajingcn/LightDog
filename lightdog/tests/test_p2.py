@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness import (  # noqa: E402
     Bool, Clock, Log, Msg, PointStamped, Pub, String, Twist,
-    bind, extract_class, extract_methods, source_of,
+    bind, extract_class, extract_funcs, extract_methods, source_of,
 )
 
 DETECTOR = source_of('lightdog_person_detector.py')
@@ -48,8 +48,9 @@ def make_detector(detection=(1.20, 0.0, 1.10, (10, 10, 40, 80))):
     d.frame_timeout = 1.5
     d.lost_timeout = 1.0
     d.present = False
-    d.last_seen = None
+    d.last_seen = None            # 墙钟时刻（time.monotonic()）
     d._warned_rgb_stall = False
+    d._warned_no_input = False
     d.pub_present = Pub()
     d.pub_pos = Pub()
     d.clock = Clock()
@@ -65,7 +66,8 @@ def make_detector(detection=(1.20, 0.0, 1.10, (10, 10, 40, 80))):
     d._detect = _detect
     d._publish_position = lambda *a: d.pub_pos.publish(Msg(a[0]))
     bind(d, extract_methods(DETECTOR, 'PersonDetector',
-                            {'_tick', '_on_rgb', '_on_depth'},
+                            {'_tick', '_person_expired',
+                             '_on_rgb', '_on_depth'},
                             ns={'time': time, 'Bool': Bool, 'Image': _Image}))
     return d
 
@@ -79,16 +81,20 @@ def make_mux():
         Src('nav', '/cmd_vel_smoothed', 10, 0.6, 0.30),
     ]
     m.zero_on_idle = True
+    m.max_lin = 0.50
+    m.max_ang = 1.50
+    m._warned_clamp = False
     m.pub = Pub()
     m.pub_state = Pub()
     m.active_name = None
     m._stale = False
     m.log = Log()
     m.get_logger = lambda: m.log
+    clamp = extract_funcs(MUX, {'clamp_speed'})['clamp_speed']
     bind(m, extract_methods(MUX, 'TwistMux',
                             {'_tick', '_pick', '_on_twist'},
                             ns={'time': time, 'Twist': Twist, 'String': String,
-                                'CmdVelSource': Src}))
+                                'CmdVelSource': Src, 'clamp_speed': clamp}))
     return m
 
 
@@ -99,8 +105,12 @@ def make_follower():
     f.inhibit_stamp = 0.0
     f.inhibit_timeout = 5.0
     f.person = PointStamped(1.5, 0.0)
-    f.last_present = Clock(0).now()
-    f.clock = Clock(0)
+    # 墙钟口径：last_present / pos_wall 都是 time.monotonic() 的值
+    f.last_present = time.monotonic()
+    f.pos_wall = time.monotonic()
+    f.expected_frame = 'base_link'
+    f._warned_frame = ''
+    f._warned_pos = False
     f.timeout = 1.5
     f.target = 1.20
     f.tol = 0.15
@@ -116,9 +126,11 @@ def make_follower():
     f.get_clock = lambda: f.clock
     f.get_logger = lambda: f.log
     bind(f, extract_methods(FOLLOWER, 'PersonFollower',
-                            {'_tick', '_person_lost', '_on_present', '_on_inhibit'},
+                            {'_tick', '_person_lost', '_check_frame',
+                             '_on_present', '_on_pos', '_on_inhibit'},
                             ns={'time': time, 'math': __import__('math'),
-                                'Twist': Twist, 'Bool': Bool}))
+                                'Twist': Twist, 'Bool': Bool,
+                                'PointStamped': PointStamped}))
     return f
 
 
@@ -160,6 +172,35 @@ class TestDetectorFreshness(unittest.TestCase):
         d._tick()
         self.assertEqual(d.detect_calls, 2)
         self.assertEqual(d.pub_present.values, [True])
+
+    def test_no_camera_publishes_false_and_warns_once(self):
+        """话题名写错/相机没起来时，下游必须立刻看到 false，且日志里要有一条。"""
+        d = make_detector()
+        d.rgb = None
+        for _ in range(5):
+            d._tick()
+        self.assertEqual(d.pub_present.values, [False] * 5,
+                         '没有相机时必须持续发 false（下游只有这个 Bool 可看）')
+        self.assertEqual(d.log.text('error').count('尚未收到'), 1, '告警刷屏了')
+
+    def test_republish_ages_out_present_flag(self):
+        """相机还在出帧、但这一帧没检出人：重发的 present 也要按 lost_timeout 老化。"""
+        d = make_detector()
+        d._tick()
+        self.assertTrue(d.pub_present.last.data)
+
+        d._detect = lambda: None
+        d._on_rgb(object())                     # 新帧，但检测失败
+        d.pub_present.clear()
+        d._tick()                               # 刚丢一帧，仍在 lost_timeout 窗口内
+        self.assertEqual(d.pub_present.values, [True],
+                         '单帧丢检不该立刻报无人（灯会闪）')
+
+        d.last_seen = time.monotonic() - 2.0    # 已超过 lost_timeout=1.0
+        d.pub_present.clear()
+        d._tick()                               # 没有新帧 → 走重发分支
+        self.assertEqual(d.pub_present.values, [False],
+                         '重发分支没有老化，连续丢检期间 present 会粘在 true')
 
 
 # ------------------------------------------------------------------ 仲裁
@@ -218,6 +259,28 @@ class TestTwistMux(unittest.TestCase):
         s = Src('x', '/x', 1, 0.30, 0.90)          # 配置写反
         self.assertLessEqual(s.hold, s.timeout)
 
+    def test_output_is_clamped_to_platform_limits(self):
+        """上游算错（P 控制增益写大、Nav2 给了个离谱目标）时，最后一道闸。"""
+        m = make_mux()
+        self._feed(m, 'follow', 3.0)
+        src = next(s for s in m.sources if s.name == 'follow')
+        src.msg.angular.z = -9.0
+        m._tick()
+        self.assertAlmostEqual(m.pub.last.linear.x, m.max_lin)
+        self.assertAlmostEqual(m.pub.last.angular.z, -m.max_ang)
+        self.assertIn('已钳制', m.log.text('warn'))
+
+        m.log.lines.clear()                         # 只报一次，不刷屏
+        m._tick()
+        self.assertEqual(m.log.text('warn'), '')
+
+    def test_normal_speed_is_not_touched(self):
+        m = make_mux()
+        self._feed(m, 'follow', 0.20)
+        m._tick()
+        self.assertAlmostEqual(m.pub.last.linear.x, 0.20)
+        self.assertEqual(m.log.text('warn'), '')
+
 
 class TestTwistMuxAdaptive(unittest.TestCase):
     """窗口必须按上游实测周期放大。仿真 0.21x 实时因子下跟随节点墙钟只有
@@ -261,10 +324,38 @@ class TestFollower(unittest.TestCase):
 
     def test_zero_when_person_lost(self):
         f = make_follower()
-        f.clock.advance(3.0)                        # 超过 timeout=1.5
+        # 两条判据都要过期：present 到期 与 坐标到期
+        f.last_present = time.monotonic() - 3.0     # 超过 timeout=1.5
+        f.pos_wall = time.monotonic() - 3.0
         f._tick()
         self.assertTrue(f.pub.last.is_zero())
         self.assertTrue(f._person_lost())
+
+    def test_zero_when_position_frozen_but_present_true(self):
+        """检测器还在发 present=True，但坐标不再更新（连续丢检在
+        lost_timeout 窗口内就是这种表现）。只看 present 会拿旧坐标继续走。"""
+        f = make_follower()
+        f._on_present(Bool(True))                   # present 是新鲜的
+        f.pos_wall = time.monotonic() - 3.0         # 但坐标已经 3s 没动
+        f._tick()
+        self.assertTrue(f.pub.last.is_zero(), '坐标过期后仍在按旧坐标发速度')
+        self.assertTrue(f._person_lost())
+        self.assertIn('坐标已', f.log.text('warn'))
+
+    def test_zero_when_frame_mismatch(self):
+        """检测器换了实现、改发 camera_link：坐标含义完全不同，必须停。"""
+        f = make_follower()
+        f.person = PointStamped(1.5, 0.0, frame_id='camera_link')
+        f._tick()
+        self.assertTrue(f.pub.last.is_zero(), '坐标系不符时仍在用该坐标算速度')
+        self.assertIn('expected_frame', f.log.text('error'))
+
+    def test_slash_prefixed_frame_is_accepted(self):
+        """TF 树里常见 `/base_link` 写法，不该被判成不符。"""
+        f = make_follower()
+        f.person = PointStamped(1.5, 0.0, frame_id='/base_link')
+        f._tick()
+        self.assertGreater(f.pub.last.linear.x, 0.0)
 
     def test_forward_when_far(self):
         f = make_follower()

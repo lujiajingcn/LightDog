@@ -102,7 +102,7 @@ def make_dock(state=IDLE):
     bind(d, extract_methods(
         DOCK, 'DockManager',
         {'tick', 'battery_ratio', 'cancel', '_log_cancel', 'fail_docking',
-         'on_dock_result', 'on_dock_goal_response'},
+         'on_dock_result', 'on_dock_goal_response', '_check_charging'},
         ns={'time': time, 'math': math, 'Float32': Float32, 'String': String,
             'Bool': Bool, 'Twist': Twist, **CONSTS}))
     return d

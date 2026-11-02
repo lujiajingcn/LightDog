@@ -382,6 +382,20 @@ docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash; \
 7. **`/data` 没有做落盘同步**（`fsync`）。进程崩溃没事（分段已 rename），
    整机断电可能丢最后一个分段的尾部。真机应该用带超级电容的 SD 卡或定期 sync。
 
+8. **`events/` 会无限增长**，除非打开保留策略。`lightdog_recorder` 每 60 秒
+   （墙钟）跑一次 `_gc_events` / `_gc_snapshots`：
+
+   | 参数 | 默认 | 含义 |
+   |---|---|---|
+   | `event_retain_days` | 30 | 超过这么多天的事件目录整个删掉 |
+   | `max_event_mb` | 512 | `events/` 总量上限，从**最旧**的开始删 |
+   | `min_events` | 20 | 至少留这么多条，最近的取证永远不会被容量策略删掉 |
+   | `max_snapshots` | 200 | `snapshots/` 只保留最新这么多张 |
+
+   两个保护：正在合成的目录（含 `video.part.mp4`）一律跳过，不会删到写了一半
+   的事件；删除失败只记 warn，不会把整个节点带崩。真机上按存储卡容量调
+   `max_event_mb`，否则半夜写满分区，告警录像也跟着一起失败。
+
 ---
 
 ## 八、与其它阶段的关系
@@ -403,3 +417,5 @@ docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash; \
 
   换句话说，P5 要做的事是「判断 + 决定打给谁」，取画面和取证据这一步
   在 P4 已经闭环了。
+
+> 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。

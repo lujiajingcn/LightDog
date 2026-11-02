@@ -31,10 +31,15 @@ command_timeout 一群发布者，跟随指令会被它们的空闲零速淹没�
     v = clamp(k_linear * err_dist, -0.6*max_v, max_v)，|err_dist| <= tol 时归零
     w = clamp(k_angular * err_theta, -max_w, max_w)，   |err_theta| <= ang_tol 时归零
 
-三条安全约束（真机上这几条比控制精度重要）：
+四个安全约束（真机上这几条比控制精度重要）：
 1. 距离小于 stop_distance 直接后退，不因为「还差一点没到目标距离」而继续顶上去。
 2. 人离开视野超过 person_timeout 秒立刻停，宁可停在原地也不凭记忆往前冲。
+   「离开视野」有两条判据：`/person/present` 到期，**或者**坐标本身到期
+   （检测器可能连着发 present=True 却不再更新 position）。
 3. 人在侧后方（|theta| > side_turn_only）时只转不走，避免绕着人画大圈。
+4. 坐标的 frame_id 必须是 expected_frame（默认 base_link）。检测器换实现
+   （比如换 YOLO 后改成发 camera_link）时宁可停住，也不能把别的坐标系下的
+   点当成 base_link 的 x/y 去算速度 —— 那是一脚油门直奔墙。
 """
 
 import math
@@ -63,6 +68,10 @@ class PersonFollower(Node):
         self.declare_parameter('angle_tol', 0.06)         # 角度死区
         self.declare_parameter('side_turn_only', 0.9)     # 超过此角度只转不走
         self.declare_parameter('person_timeout', 1.5)
+        # 坐标必须在这个坐标系下。/person/position 的语义（x 前 / y 左，米）
+        # 只对 base_link 成立；换检测器实现时若不改本参数，就会把 camera_link
+        # 下的点当 base_link 用，速度方向直接错掉。
+        self.declare_parameter('expected_frame', 'base_link')
         # dock_manager 以 10Hz 发 /dock/inhibit。它要是崩了/被杀，最后那条
         # true 会永远留在跟随器里 —— 表现为「跟随彻底不工作，日志里什么都没有」。
         # 超过这个墙钟时间没再收到 inhibit 就视为回充已结束（并打一条 error）。
@@ -81,12 +90,18 @@ class PersonFollower(Node):
         self.ang_tol = float(p('angle_tol').value)
         self.side_only = float(p('side_turn_only').value)
         self.timeout = float(p('person_timeout').value)
+        self.expected_frame = str(p('expected_frame').value).lstrip('/')
         self.inhibit_timeout = float(p('inhibit_timeout').value)
         self.enabled = bool(p('enabled').value)
 
         self.person = None            # 最新一次人位置
         self.present = False
-        self.last_present = None      # rclpy Time
+        # 两者都用**墙钟** time.monotonic()，不是 ROS 时钟：
+        # 这两个量回答的都是「上一条消息多久以前到的」，与仿真/系统时钟无关。
+        # 真机上若 use_sim_time 被误开成 true 而没有 /clock，ROS 时钟会停走，
+        # 超时判据永远不触发 —— 表现为机器人对着早就离开的人一直开。
+        self.last_present = None      # 最后一次 present=True 的到达时刻
+        self.pos_wall = 0.0           # 最后一次 /person/position 的到达时刻
         # 回充期间让位。dock_manager 在 ALIGNING/DOCKING/DOCKED/UNDOCKING 时把
         # /dock/inhibit 置 true（DOCKED 也置 true，否则充电时人一经过就会被开走）。
         # 只靠优先级其实也能压住（dock 30 > follow 20），但跟随节点会一直发
@@ -94,6 +109,8 @@ class PersonFollower(Node):
         # 这不是低电回充该有的行为。所以显式认这个标志。
         self.inhibited = False
         self.inhibit_stamp = 0.0      # 最后一条 /dock/inhibit 的墙钟时刻
+        self._warned_frame = ''       # 已报过的 frame_id（避免每拍刷日志）
+        self._warned_pos = False
 
         self.create_subscription(PointStamped, '/person/position', self._on_pos, 10)
         self.create_subscription(Bool, '/person/present', self._on_present, 10)
@@ -113,11 +130,12 @@ class PersonFollower(Node):
 
     def _on_pos(self, msg: PointStamped):
         self.person = msg
+        self.pos_wall = time.monotonic()
 
     def _on_present(self, msg: Bool):
         self.present = bool(msg.data)
         if self.present:
-            self.last_present = self.get_clock().now()
+            self.last_present = time.monotonic()
 
     def _on_inhibit(self, msg: Bool):
         if bool(msg.data) != self.inhibited:
@@ -129,10 +147,58 @@ class PersonFollower(Node):
     # ---------- 控制 ----------
 
     def _person_lost(self) -> bool:
+        """人是否已经「不该再跟」了。
+
+        两条判据缺一不可：
+        * `/person/present` 到期 —— 常规丢检；
+        * 坐标本身上一次到达已超时 —— 检测器存在「还在发 present=True，但
+          连续几帧没检出目标、于是不再发 position」的窗口（person_detector
+          的 lost_timeout 就是干这个的）。只看 present 会拿一份旧坐标继续走，
+          表现为「人已经拐弯，机器人还朝原来的方向直冲」。
+
+        两条都按墙钟计龄，理由见 __init__ 里的注释。
+        """
         if self.last_present is None:
             return True
-        age = (self.get_clock().now() - self.last_present).nanoseconds / 1e9
-        return age > self.timeout
+        now = time.monotonic()
+        if (now - self.last_present) > self.timeout:
+            return True
+        if self.pos_wall <= 0.0:
+            return True               # 还没收到过坐标，等同于没看见人
+        if (now - self.pos_wall) > self.timeout:
+            if not self._warned_pos:
+                self._warned_pos = True
+                self.get_logger().warn(
+                    f'收到 present=True 但坐标已 {now - self.pos_wall:.1f}s 没更新，'
+                    f'按丢失处理并停车（检查 /person/position 发布频率）')
+            return True
+        self._warned_pos = False
+        return False
+
+    def _check_frame(self) -> bool:
+        """坐标必须是我期望的那个坐标系，否则拒绝使用。"""
+        want = self.expected_frame
+        if not want:
+            return True
+        if self.person is None:       # 没有坐标当然不能用（正常路径已被 _person_lost 挡掉）
+            return False
+        got = ''
+        try:
+            got = str(self.person.header.frame_id or '')
+        except AttributeError:
+            got = ''
+        got = got.lstrip('/')
+        if got == want:
+            self._warned_frame = ''
+            return True
+        if self._warned_frame != got:
+            self._warned_frame = got
+            self.get_logger().error(
+                f'/person/position 的 frame_id={got!r} 与 expected_frame={want!r} '
+                f'不一致，拒绝使用该坐标并停车。'
+                f'（若确实换了坐标系，请同时改本节点的 expected_frame，'
+                f'或让检测器在发布前先变换到 {want}）')
+        return False
 
     def _tick(self):
         cmd = Twist()
@@ -150,7 +216,8 @@ class PersonFollower(Node):
                     f'{silent:.1f}s 没收到 /dock/inhibit，判定回充节点已退出，'
                     f'跟随恢复（若回充仍在进行，请检查 dock_manager）')
 
-        if not self.enabled or inhibited or self._person_lost() or self.person is None:
+        if (not self.enabled or inhibited
+                or self._person_lost() or not self._check_frame()):
             self.pub.publish(cmd)     # 持续发零速，防止底层保持上一条指令
             return
 

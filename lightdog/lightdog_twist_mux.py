@@ -104,6 +104,19 @@ from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 
 
+def clamp_speed(value, limit):
+    """按上限钳制；limit <= 0 表示不限制。NaN 一律归零（宁可不动）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:                     # NaN
+        return 0.0
+    if limit is None or limit <= 0.0:
+        return v
+    return max(-limit, min(limit, v))
+
+
 class CmdVelSource:
     """一个速度输入源：话题、优先级、源窗口（timeout）、指令窗口（hold）。
 
@@ -195,6 +208,11 @@ class TwistMux(Node):
         self.declare_parameter('out_topic', '/cmd_vel_muxed')
         self.declare_parameter('publish_rate', 20.0)
         self.declare_parameter('zero_on_idle', True)
+        # 平台物理上限，作用在**输出**上：任何上游（跟随 P 控制、Nav2、
+        # docking_server）算错了，最终发给底层的速度都不会超过这里。
+        # 0 表示不限制。真机上按电机实际能力设（本项目底盘建议 0.30 / 1.0）。
+        self.declare_parameter('max_linear', 0.50)
+        self.declare_parameter('max_angular', 1.50)
 
         p = self.get_parameter
         # 顺序即同优先级下的偏好：dock > follow > nav
@@ -213,6 +231,9 @@ class TwistMux(Node):
                          float(p('nav_hold').value)),
         ]
         self.zero_on_idle = bool(p('zero_on_idle').value)
+        self.max_lin = float(p('max_linear').value)
+        self.max_ang = float(p('max_angular').value)
+        self._warned_clamp = False
         rate = max(1.0, float(p('publish_rate').value))
 
         self.pub = self.create_publisher(Twist, str(p('out_topic').value), 10)
@@ -286,7 +307,30 @@ class TwistMux(Node):
                 self.pub.publish(Twist())
             return
 
-        self.pub.publish(best.msg)
+        # 输出前按平台上限钳制。这里刻意**新建**一条消息而不是改 best.msg：
+        # 改源里的那条会污染 CmdVelSource 缓存（下一拍读到的就是被改过的值），
+        # 也看不出「谁超速了」。
+        src = best.msg
+        out = Twist()
+        out.linear.x = clamp_speed(src.linear.x, self.max_lin)
+        out.linear.y = clamp_speed(src.linear.y, self.max_lin)
+        out.linear.z = src.linear.z
+        out.angular.x = src.angular.x
+        out.angular.y = src.angular.y
+        out.angular.z = clamp_speed(src.angular.z, self.max_ang)
+
+        clamped = (out.linear.x != src.linear.x or out.angular.z != src.angular.z)
+        if clamped and not self._warned_clamp:
+            self._warned_clamp = True
+            self.get_logger().warn(
+                f'{best.name} 的指令超出平台上限，已钳制：'
+                f'v {src.linear.x:+.2f}->{out.linear.x:+.2f} '
+                f'w {src.angular.z:+.2f}->{out.angular.z:+.2f} '
+                f'（max_linear={self.max_lin}, max_angular={self.max_ang}）')
+        elif not clamped:
+            self._warned_clamp = False
+
+        self.pub.publish(out)
 
 
 def main(args=None):

@@ -47,6 +47,7 @@ fields/offsets/data，而深度图 + camera_info 已经够算这个高度了，�
 
 import math
 import sys
+import time
 
 import numpy as np
 import rclpy
@@ -142,6 +143,15 @@ class FallDetector(Node):
 
         self.declare_parameter('rate', 10.0)
         self.declare_parameter('absent_timeout', 1.5)   # 这么久看不到人 -> absent
+        # 帧新鲜度（**墙钟**秒）。与 P2 检测器同一个理由：没有它，相机冻帧/断线后
+        # _tick 会以 10Hz 对同一张旧图反复判定，永远得出同一个结论。
+        # 对跌倒检测尤其危险：
+        #   · 冻在「站着」-> 人真的倒下了也永远报 standing，告警永远不触发；
+        #   · 冻在「躺着」-> 人早起来了还在 ALARM，半夜把全家叫醒。
+        # 超时后改报 unknown（不是 absent）：告警状态机据此知道「看不见」，
+        # 不会把它误当成「人站起来了」而撤销告警。
+        self.declare_parameter('frame_timeout', 1.5)
+        self.declare_parameter('depth_timeout', 1.0)
         self.declare_parameter('publish_debug', True)
 
         p = self.get_parameter
@@ -157,6 +167,8 @@ class FallDetector(Node):
         self.lying_top_max = float(p('lying_top_max').value)
         self.stand_top_min = float(p('stand_top_min').value)
         self.absent_timeout = float(p('absent_timeout').value)
+        self.frame_timeout = float(p('frame_timeout').value)
+        self.depth_timeout = float(p('depth_timeout').value)
         self.publish_debug = bool(p('publish_debug').value)
 
         # 光心离地高度 = base_link 高度 + 相机在 base_link 上的 z 偏移
@@ -166,6 +178,21 @@ class FallDetector(Node):
         self.rgb = None
         self.depth = None
         self.last_seen = None
+
+        # 帧序号 + 到达时刻（墙钟）：只对**新帧**做一次检测，并能在相机断流时
+        # 明确报 unknown。没有这两个量，_tick 会以 10Hz 反复解同一张旧图。
+        self.rgb_seq = 0
+        self._det_seq = -1
+        self.rgb_wall = 0.0
+        self.depth_wall = 0.0
+        self._warned_stall = False
+        self._warned_shape = False
+        self._warned_depth = False
+        self._last_state = None       # 上一次的结论，无新帧时重发
+        self._last_z = None
+        self._last_spread = None
+        self._last_mask = None
+        self._last_rgb = None
 
         sensor_qos = QoSProfile(depth=1,
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -201,9 +228,12 @@ class FallDetector(Node):
 
     def _on_rgb(self, msg: Image):
         self.rgb = msg
+        self.rgb_seq += 1
+        self.rgb_wall = time.monotonic()
 
     def _on_depth(self, msg: Image):
         self.depth = msg
+        self.depth_wall = time.monotonic()
 
     # ---------- 主循环 ----------
 
@@ -213,16 +243,60 @@ class FallDetector(Node):
         if self.fx is None:
             return
 
+        now_mono = time.monotonic()
+
+        # 1) 彩色断流：绝不能拿最后一帧反复判定（见 frame_timeout 的注释）
+        if (now_mono - self.rgb_wall) > self.frame_timeout:
+            if not self._warned_stall:
+                self._warned_stall = True
+                self.get_logger().error(
+                    f'相机 {now_mono - self.rgb_wall:.1f}s 没有新帧，跌倒检测改为 '
+                    f'unknown（检查相机/线缆/USB 带宽）。告警状态机会保持当前判断，'
+                    f'不会把它当成「人已起身」而撤销告警。')
+            self._emit_unknown()
+            return
+        if self._warned_stall:
+            self._warned_stall = False
+            self.get_logger().info('相机图像恢复，跌倒检测继续')
+
+        # 2) 没有新帧：按 rate 重发上次结论。
+        #    alert_manager 用 lying_gap（默认 1s）判"还在躺着"，不重发会被当成起身。
+        if self.rgb_seq == self._det_seq:
+            self._republish()
+            return
+
+        # 3) 深度断流：不要拿旧深度配新彩色。人走动时旧深度会把位置算在上一次
+        #    的地方（"距离粘住"），算出来的离地高度跟着错。
+        if (now_mono - self.depth_wall) > self.depth_timeout:
+            if not self._warned_depth:
+                self._warned_depth = True
+                self.get_logger().error(
+                    f'深度图 {now_mono - self.depth_wall:.1f}s 没有新帧，算不了离地高度，'
+                    f'本帧判 unknown（不拿旧深度配新彩色）')
+            self._emit_unknown()
+            return
+        if self._warned_depth:
+            self._warned_depth = False
+            self.get_logger().info('深度图恢复')
+
+        self._det_seq = self.rgb_seq
         rgb = image_to_rgb(self.rgb)
         dep = image_to_depth(self.depth)
         if rgb is None or dep is None:
             return
 
-        # 深度图和彩色图必须同尺寸；gz 的 rgbd_camera 是对齐的，不一致说明配置错了
+        # 深度图和彩色图必须同尺寸。仿真里 gz 的 rgbd_camera 是对齐的；
+        # 真机 RealSense 的 /camera/depth/image_rect_raw 默认 848x480，与彩色
+        # 640x480 不同 —— 必须在驱动侧开 align_depth，或改订阅
+        # /camera/aligned_depth_to_color/image_raw。这里明说，不静默失败。
         if rgb.shape[:2] != dep.shape[:2]:
-            self.get_logger().warn(
-                f'彩色/深度尺寸不一致 {rgb.shape[:2]} vs {dep.shape[:2]}',
-                throttle_duration_sec=10.0)
+            if not self._warned_shape:
+                self._warned_shape = True
+                self.get_logger().error(
+                    f'彩色/深度尺寸不一致 {rgb.shape[:2]} vs {dep.shape[:2]}：'
+                    f'真机需在 realsense2_camera 开 align_depth:=true，'
+                    f'或把 depth_topic 改成 /camera/aligned_depth_to_color/image_raw')
+            self._emit_unknown()
             return
 
         mask, n_px = self._person_mask(rgb, dep)
@@ -261,6 +335,36 @@ class FallDetector(Node):
         n = int(np.count_nonzero(m))
         return m, n
 
+    def _emit_unknown(self):
+        """相机/深度不可用：明确报 unknown，且**不**刷新 last_seen。
+
+        为什么不报 absent：absent 的意思是「确定画面里没人」，而这里是
+        「我不知道」。两者对告警状态机含义相反 —— absent 可能是人走了，
+        不可用则意味着可能有人躺着但看不见。
+        """
+        self._publish_state('unknown', None)
+        self._last_state = 'unknown'
+        self._last_z = None
+        self._last_spread = None
+
+    def _republish(self):
+        """没有新帧时重发上次结论（只发状态类话题，不重复编码调试图）。"""
+        self._publish_state(self._last_state or 'unknown', self._last_z)
+
+    def _publish_state(self, state, z_p95):
+        msg = String()
+        msg.data = state
+        self.pub_state.publish(msg)
+
+        if z_p95 is not None:
+            m = Float32()
+            m.data = float(z_p95)
+            self.pub_z.publish(m)
+
+        b = Bool()
+        b.data = (state == 'lying')
+        self.pub_lying.publish(b)
+
     def _emit(self, state, z_p95, spread, mask, rgb):
         now = self.get_clock().now()
 
@@ -275,18 +379,10 @@ class FallDetector(Node):
         else:
             self.last_seen = now
 
-        msg = String()
-        msg.data = state
-        self.pub_state.publish(msg)
-
-        if z_p95 is not None:
-            m = Float32()
-            m.data = float(z_p95)
-            self.pub_z.publish(m)
-
-        b = Bool()
-        b.data = (state == 'lying')
-        self.pub_lying.publish(b)
+        self._publish_state(state, z_p95)
+        self._last_state = state
+        self._last_z = z_p95
+        self._last_spread = spread
 
         if self.pub_dbg is not None and mask is not None:
             self._publish_debug(rgb, mask, state, z_p95, spread)

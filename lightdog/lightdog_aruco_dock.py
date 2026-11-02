@@ -211,6 +211,10 @@ class ArucoDockDetector(Node):
         self.declare_parameter('rate', 10.0)
         self.declare_parameter('max_range', 3.0)
         self.declare_parameter('invert_marker_yaw', False)
+        # 多久没新帧就认为相机断流（墙钟秒）。断流后必须主动把
+        # marker_visible 置 false，否则对准逻辑会以为桩还在视野里、
+        # 原地微调而不进入扫描。
+        self.declare_parameter('frame_timeout', 1.0)
 
         p = self.get_parameter
         self.marker_length = float(p('marker_length').value)
@@ -219,6 +223,7 @@ class ArucoDockDetector(Node):
         self.publish_debug = bool(p('publish_debug').value)
         self.rate = float(p('rate').value)
         self.max_range = float(p('max_range').value)
+        self.frame_timeout = max(0.2, float(p('frame_timeout').value))
 
         cam_off = [float(v) for v in p('camera_offset').value]
         cam_off[2] += float(p('base_link_height').value)   # 相对 base_link -> base_footprint
@@ -278,7 +283,12 @@ class ArucoDockDetector(Node):
         # 而且 `rate` 参数形同虚设。对准只需要 10Hz。
         self.latest = None
         self.latest_wall = 0.0
-        self._last_processed = None      # 上一帧的 header.stamp，避免重复检测
+        # 「这一帧处理过没有」用**计数**判，不用 header.stamp：
+        # 真机驱动若因时钟未同步/未置 use_sim_time 而把所有帧的 stamp 都发成 0，
+        # 按 stamp 去重会让第一帧之后的每一帧都被当成重复帧直接 return ——
+        # 表现为「开机测到一次 marker 之后再也不测」，而且不报任何错。
+        self.img_seq = 0
+        self._det_seq = -1
         self.visible = False
 
         sensor_qos = QoSProfile(depth=1,
@@ -305,6 +315,12 @@ class ArucoDockDetector(Node):
         if len(msg.k) < 9:
             return
         k = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        # fx/fy 为 0 的 CameraInfo 是「驱动已经起来了但还没标定」，送去 solvePnP
+        # 只会一直返回失败，现象是「看到框但解不出位姿」。
+        if not np.isfinite(k[0, 0]) or k[0, 0] <= 1.0:
+            self.get_logger().warn('camera_info 的 fx 无效，忽略这一条',
+                                   throttle_duration_sec=10.0)
+            return
         d = np.array(msg.d, dtype=np.float64) if len(msg.d) > 0 else np.zeros(5)
         self.camera_matrix = k
         self.dist = d
@@ -313,6 +329,7 @@ class ArucoDockDetector(Node):
         """只收帧，不做检测（检测在 _tick 里按 rate 跑）。"""
         self.latest = msg
         self.latest_wall = time.monotonic()
+        self.img_seq += 1
 
     def _detect_markers(self, gray):
         if self._aruco is not None:
@@ -334,16 +351,15 @@ class ArucoDockDetector(Node):
             return
         # 相机断流时不能让 marker_visible 一直停在 true：对准逻辑会以为
         # 桩还在视野里，于是原地微调、永远不进入扫描。
-        if (time.monotonic() - self.latest_wall) > 1.0:
+        if (time.monotonic() - self.latest_wall) > self.frame_timeout:
             if self.visible:
                 self.visible = False
                 self.vis_pub.publish(Bool(data=False))
             return
 
-        stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
-        if stamp == self._last_processed:
+        if self.img_seq == self._det_seq:
             return                      # 没有新帧，别重复算
-        self._last_processed = stamp
+        self._det_seq = self.img_seq
 
         gray = image_to_gray(msg)
         if gray is None:

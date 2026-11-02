@@ -17,7 +17,8 @@
     # 段长 / 环形保留 / 配额。
     #
     # 单位刻意不一样，别混：
-    #   segment_sec  = ROS 秒，表示「这一段装多少秒的画面」（仿真相机约 15Hz，10 秒 ≈ 150 帧）
+    #   segment_sec  = ROS 秒，表示「这一段装多少秒的画面」（仿真相机实测约 1.5Hz，
+    #                  10 秒 ≈ 15 帧；真机 30Hz 则约 300 帧）
     #   retain_sec   = **墙钟**秒，表示「卡里的东西留多久」。用墙钟是因为 ROS 时间
     #                  重启后会归零（仿真每次重启 /clock 从 0 开始，真机 NTP 校时同理），
     #                  拿它算"多久以前录的"会得到负数，旧录像永远清不掉。
@@ -25,7 +26,7 @@
     segment_sec: 10.0
     retain_sec: 1800.0
     min_segments: 6          # 至少留 6 段，防止 retain_sec 配小以后立刻被清空
-    max_disk_mb: 512.0       # 容量上限（只算 clips/，事件视频另算）
+    max_disk_mb: 512.0       # 容量上限（只算 clips/；events/ 的配额见下面三项）
 
     # 事件窗口默认值。P5 的跌倒检测可以在消息里覆盖。
     pre_sec: 10.0
@@ -36,9 +37,22 @@
     # 实测：本机 25.9fps × 35s = 910 帧，旧的 900 已经丢掉 0.3 秒。
     max_event_frames: 1200
 
+    # 事件目录的保留策略（与上面的环形缓冲是两套）。
+    # 一次跌倒事件 35s：仿真约 80KB，真机 30fps H.264 约 2~3MB。
+    # 不设上限的话 events/ 只进不出，一个月几百 MB，SD 卡写满后录像、事件、
+    # 告警落盘会一起失败（ENOSPC），而且多半发生在半夜。
+    event_retain_days: 30.0
+    max_event_mb: 512.0
+    min_events: 20            # 至少留这么多条，最近的取证不会被容量策略删掉
+    max_snapshots: 200        # snapshots/ 只保留最新这么多张
+
     # avc1 = H.264。手机（尤其 iOS）只认这个；打不开会自动降级 mp4v 并报错日志。
     codec: avc1
     jpeg_quality: 80
+    # 环形缓冲里每帧 JPEG 的质量。这个值直接决定常驻内存：
+    # 640x480、q=80 约 40KB/帧，720 帧上限 ≈ 28MB；调到 95 会翻倍以上，
+    # 而树莓派/Orin Nano 上这部分是**常驻**的，不是峰值。
+    buffer_jpeg_quality: 80
     recording: true
     state_topic: /recorder/state
 
@@ -52,7 +66,14 @@
     auth_token: ''
 
     data_dir: /data
+    # 空 = 自动用包内安装的 web/ 目录（colcon install 后的 share/lightdog/web）。
+    # 只有想把网页放到别处（例如放在只读分区/独立部署）时才需要写死。
+    web_dir: ''
     image_topic: /camera/color/image_raw
+    # 下面两个话题名是**跨模块契约**：变了以后 /api/v1/status 里的电量与告警
+    # 会静默变成 null / NORMAL，界面上看不出来。改之前先 grep 发布方。
+    battery_topic: /battery_state          # 发布方：lightdog_dock_manager
+    alert_topic: /alert/state              # 发布方：lightdog_alert_manager
     jpeg_quality: 75
     # 推流频率上限。相机只有 1.5Hz 时，这个值再大也只是重复同一张图，
     # 所以取 10 是为了真机 30Hz 场景留余量。

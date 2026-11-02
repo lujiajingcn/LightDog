@@ -435,6 +435,21 @@ fall=standing z_p95=1.14  alert=NORMAL
 6. **仿真时间与墙钟的比例**在软件渲染下约 0.26x，所以"5 秒 → 告警"墙上要等
    约 20 秒。真机上两者一致，不需要改参数。
 
+7. **传感器失效时的语义必须分清 `unknown` 和 `absent`**。这是本轮复查补的，
+   也是上真机最容易踩的一条：
+
+   | 情况 | `lightdog_fall_detector` 发什么 | 告警状态机怎么处理 |
+   |---|---|---|
+   | 相机断流 / 尺寸不一致 / 内参缺失 | `unknown`（且**不刷新** `last_seen`） | 不改任何姿态时间戳，SUSPECTED 保持、CONFIRMING 继续倒计时（fail-safe：宁报不误复位） |
+   | 相机正常、画面里确实没人 | `absent` | 连续 `absent_grace`(10s) 才判「人已离开」并复位到 NORMAL |
+
+   改之前没有 `unknown` 这一档：一次遮挡（有人从镜头前走过、被子盖住）会被当成
+   「人站起来了」，把已经开始的确认流程直接抹掉。反过来，如果为了省事把
+   `unknown` 也当 `absent`，相机一坏就会静默复位 —— 两种都是真机上会出人命的错。
+
+   参数：`frame_timeout` 1.5s、`depth_timeout` 1.0s（都是**墙钟**，与仿真跑多快
+   无关）、`absent_grace` 10s。
+
 ---
 
 ## 八、与其它阶段的关系
@@ -462,3 +477,5 @@ bash sim/p5.sh test | ack | reset     # 绕过两级确认 / 确认 / 复位
 bash sim/p5.sh probe                  # 告警 HTTP 接口自检
 bash sim/p5.sh log                    # 状态机日志
 ```
+
+> 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。
