@@ -115,9 +115,11 @@ dock / undock / cancel / status`。未知命令只记一条 warn 并返回，**�
                                           └─(可选) tts_command 直接起子进程
 ```
 
-麦克风、唤醒词、ASR 模型全都依赖算力平台，这三样定不下来语音就一天都动不了。
-所以先把**不依赖硬件的那一半**做成契约：真机上唯一要做的是「把 ASR 的输出灌进
-`/voice/command`、让某个 TTS 引擎订阅 `/voice/say`」，本节点一行都不用改。
+麦克风、唤醒词、ASR 模型全都依赖算力平台。平台已定（**树莓派 5**，无 CUDA），
+引擎随之定为 openWakeWord + whisper.cpp/sherpa-onnx + Piper，全部 CPU 实时
+（`docs/hardware_readiness.md` §8.5/8.6）。所以这里先把**不依赖硬件的那一半**
+做成契约：真机上唯一要做的是「把 ASR 的输出灌进 `/voice/command`、让某个 TTS
+引擎订阅 `/voice/say`」，本节点一行都不用改。
 
 `/voice/command` 三种格式都收：
 

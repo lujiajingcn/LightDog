@@ -29,14 +29,14 @@
 | 需求 | 状态 | 落在哪 | 还差什么（硬件相关） |
 |---|---|---|---|
 | 可以灵活移动 | ✅ 完成 | `lightdog_twist_mux` 仲裁 + `/cmd_vel_muxed`；Nav2 巡游 | 底盘、编码器、MCU 看门狗（见 `docs/firmware_protocol.md`） |
-| 通过麦克风能听到指令 | 🟡 链路完成 | `lightdog_voice`：`/voice/command` 文本进 → 语义解析 → 调度层动作。13 类意图，含「别跟着我」「解除急停」这类高风险歧义 | **麦克风、唤醒词、ASR 模型**（等算力平台定下来）。真机只需把 ASR 输出灌进 `/voice/command`，本节点一行不用改 |
+| 通过麦克风能听到指令 | 🟡 链路完成 | `lightdog_voice`：`/voice/command` 文本进 → 语义解析 → 调度层动作。13 类意图，含「别跟着我」「解除急停」这类高风险歧义 | 平台已定：**树莓派 5**（无 CUDA）→ ASR 走 whisper.cpp/sherpa-onnx、TTS 走 Piper，见 `docs/hardware_readiness.md` §8.5/8.6。真机只需把 ASR 输出灌进 `/voice/command`，本节点一行不用改 |
 | 通过摄像头能看见动作 | ✅ 完成（仿真） | `lightdog_person_detector` + `lightdog_fall_detector`；后端可插拔（`color` / `yolo`） | 真机换 `backend: yolo`；相机高度 0.3745m 偏低，需抬高后重标定 |
 | 可以调节 led 亮度 | 🟡 ROS 侧完成 | `/led/brightness` + 自动调光 + 手动覆盖（`/light/mode`）+ 语音控制；按时间积分的渐变 | **LED 固件**（订阅 `/led/brightness` 转 PWM） |
 | 电量低时自动去充电 | ✅ 完成（仿真） | `lightdog_dock_manager`（ArUco 对准/重试/充电确认）+ `lightdog_mission` 的低电迟滞（35% 接近 / 45% 解除） | 10Ah 级电池 + 60~100W 磁共振无线充；`marker_length` 需卡尺实测 |
 | 通过 wifi 模块联网 | ✅ 完成 | `lightdog_server`：HTTP API + 手机端页面 + **SSE 实时事件流** + 可选 HTTPS（证书失败时拒绝明文启动） | WiFi 模块本身；真机务必设 `auth_token` |
 | 存储卡存视频 | ✅ 完成 | `lightdog_recorder`：事件前后各 N 秒合成；可选 `faststart`（手机端边下边播） | 存储卡容量决定 `event_retain_days` |
 | 可以播放声音 | 🟡 链路完成 | `lightdog_voice`：`/alert/voice` → `/voice/say`；`tts_command` 非空时直接起 TTS 子进程（去重 1.5s、截断 200 字） | **扬声器 + TTS 引擎**（espeak-ng / 云 TTS 都行，换个命令模板即可） |
-| 摔倒 → 打电话给紧急联系人 | 🟡 部分 | 告警状态机 `lightdog_alert_manager` + 手机端推送/查看画面；`call_command` 是**空模板** | 需要选定通话方案（SIP / 运营商 / 微信）才有意义 |
+| 摔倒 → 打电话给紧急联系人 | ✅ 完成（仿真）/ 🟡 待现场验证 | 告警状态机 + 自建 SIP 外呼（`lightdog_call.py`，AMI）：能区分接通/无人接听/忙；`ack` 会挂断正在响的那一通 | 方案已定：**自建 SIP**（Asterisk）。部署与四步验收见 `deploy/sip/README.md`；协议层已用假 AMI 服务器测过（`tests/test_call.py`），真机需现场走一遍 |
 
 图例：✅ 逻辑闭环且仿真验收 · 🟡 软件侧完成、等硬件或外部服务 · ❌ 未开工
 

@@ -8,6 +8,25 @@
 
 ---
 
+## 〇、选型已定（D1–D4）
+
+这四项原先在所有文档里都是「待定」，定了之后很多判断才有意义，所以先摆在这里。
+具体落地约束见 §八。
+
+| # | 项 | 决定 | 直接后果 |
+|---|---|---|---|
+| D1 | 算力平台 | **树莓派 5**（8GB） | ARM64 Ubuntu 24.04 + ROS 2 Jazzy。**没有 CUDA**：YOLO 只能走 CPU（onnxruntime/NCNN 320）或加 Hailo-8L；供电与散热从此是故障源而不是配置项 |
+| D2 | 通话方案 | **自建 SIP**（Asterisk） | 走 AMI 外呼家属分机，能区分「接通/无人接听/忙」。部署见 `deploy/sip/README.md`，代码见 `lightdog/lightdog_call.py` |
+| D3 | MCU | **STM32** | 串口帧格式定稿（`docs/firmware_protocol.md` §六）；Pi 不再直接驱动电机/LED，GPIO 兼容性问题一次性消失 |
+| D4 | 摄像头权限 | **保持现状** | 静态页不鉴权、`/api/*` 全部要 `auth_token`；不引入账号体系。所以 `auth_token` 从「建议改」升级为「不改等于裸奔」 |
+
+> D4「保持现状」的含义要说清楚：现在的模型是**单令牌**，同一个 WiFi 下的人只要
+> 拿到 token 就能看画面、翻录像、读联系人、发急停。它适合「家里一个可信局域网」，
+> 不适合出租屋或多户共用网络。真到那种场景要加的是「每设备令牌 + 只读令牌」，
+> 不是把页面藏起来。
+
+---
+
 ## 一、上真机前必须改的参数
 
 | 文件 | 参数 | 仿真值 | 真机值 | 不改会怎样 |
@@ -19,6 +38,8 @@
 | `p3_params.yaml` | `marker_length` | `0.084` | **用卡尺量黑框边长** | 距离按比例整体缩放。0.084 填成 0.10 会让距离多算 19%，表现为提前停或一直往桩里顶 |
 | `p3_params.yaml` | `max_undocking_time` | `30.0` | 桩前净空不同需实测 | 太短 → 返回 905 `FAILED_TO_CONTROL`；太长 → 卡住时干等 |
 | `p4_params.yaml` | `event_retain_days` / `max_event_mb` | `30` / `512` | 按存储卡容量 | 不设保留策略时 `events/` 会一直涨到写满分区，而告警录像恰恰在半夜写 |
+| `p5_params.yaml` | `sip_ami_secret` | `''` | **与 `manager.conf` 一致的随机串** | 空 = 不外呼（`call_mode=auto` 退化成仅记录）。告警照常弹窗、事件视频照常切，只是**一个电话都不会打**，日志里只有一行「仅记录」 |
+| `p5_params.yaml` | `sip_channel_template` | `PJSIP/{number}` | 按中继/分机改 | 填错的表现是 `channel not found`：AMI 通了、电话没打出去 |
 | `p2_params.yaml` | `backend` | `color` | **`yolo`**（装好依赖后） | `color` 只认「高饱和橙色上衣」，真人穿什么都有，见 §四.1 |
 | `p4_params.yaml` | `ssl_certfile` / `ssl_keyfile` | `''` | 自签或真证书路径 | 留空 = 全明文。局域网可用，但只要经过公共 WiFi 就必须开。**证书读失败时服务会拒绝启动而不是退回明文**（这是刻意的） |
 | `p4_params.yaml` | `faststart` | `false` | `true`（需 ffmpeg） | 视频的 `moov` 在文件尾，手机端边下边播要等整段下完。真机上 ffmpeg 一般都有，开了只是多一次 `-c copy` 重封装 |
@@ -191,3 +212,105 @@ python3 deploy/acceptance.py --quick    # 自查（时长缩短，不能签字�
 > 根因是 CLI 发布进程发完就退，RELIABLE 的样本还没被所有订阅者 ACK 就析构了。
 > 所以：**脚本里的每条命令都要「发 → 读回 → 不行再发」**，`sim/system.sh` 已经
 > 按这个原则改过；生产路径上的急停必须由常驻节点发（语音 / server / 固件桥接）。
+
+---
+
+## 八、树莓派 5 与 STM32 的落地约束（D1 / D3）
+
+选型定了之后，下面这些从「可能需要考虑」变成了「一定会遇到」。每条都给了
+**判据**和**症状**：不写判据的话，现场只会看到「有时候卡」这种没法复现的描述。
+
+### 8.1 供电：最先咬人的一项
+
+| 项 | 要求 | 不满足的症状 |
+|---|---|---|
+| 电源 | 官方 5V/5A（27W）USB-C，或等规格 | 欠压下 CPU 从 2.4GHz 掉到 1.5GHz，10Hz 的 `twist_mux` 变成 6~8Hz；电机启动瞬间还可能直接重启 |
+| 判据 | `vcgencmd get_throttled` 必须是 `0x0` | 非 0 说明**过去**发生过欠压/降频，这个寄存器是粘滞的，断电才清 |
+| 电机构电 | 电机与 Pi **分开供电、共地**，H 桥侧并 1000~4700µF | Pi 和电机共用一路 5V 时，加速瞬间的画面卡顿和 WiFi 掉线是同一个原因 |
+
+`get_throttled` 的位含义（只用记这两个）：bit0 = 当前欠压，bit16 = 曾经欠压。
+`deploy/verify.sh` 不查它（Pi 专属），上车时手工跑一次并记进验收报告。
+
+### 8.2 散热：80°C 软降频，85°C 硬降频
+
+- 判据：`vcgencmd measure_temp` 稳态 < 70°C；`vcgencmd get_throttled` 的 bit2/bit18
+  （当前/曾经因温度降频）必须为 0。
+- 症状：录像丢帧、跟随变慢、**日志里没有任何异常**。封闭外壳 + 连续写 NVMe/SD 是
+  最坏组合。
+- 结论：必须上主动散热（官方风扇或铝制散热壳），不要指望「室内 25°C 不会热」。
+
+### 8.3 存储：SD 卡是消耗品
+
+`events/` 里是 mp4 + `alarms.jsonl`，告警恰恰在半夜写。SD 卡的写放大 + 掉电
+（直接拔电源）是这块板子最常见的「用三个月就坏」的原因。
+
+| 做法 | 为什么 |
+|---|---|
+| 优先 NVMe（M.2 HAT+），至少 A2 级 SD | 事件视频是持续小文件写，A1 卡会明显拖慢 |
+| `event_retain_days` / `max_event_mb` **必须设** | 默认 30 天/512MB 是给仿真的；真机按卡容量改，见 §一 |
+| 开 `fstrim.timer` | 不 trim 的 eMMC/SD 写性能会一路衰减 |
+| 留 10% 空闲 | 分区满了以后 recorder 的失败日志会淹没 journal |
+| 数据目录放 NVMe，系统放 SD | `data_dir` 指到 `/mnt/nvme/lightdog`，坏卡只丢系统 |
+
+### 8.4 WiFi 省电：一个必须关掉的默认值
+
+```bash
+# 症状：MJPEG 流每隔几秒卡 300ms，SSE 偶发断连，ros2 topic hz 有周期性缺口
+sudo iw dev wlan0 set power_save off
+```
+
+开机自动执行：`/etc/systemd/system/wifi-powersave-off.service`（`Type=oneshot`,
+`ExecStart=/sbin/iw dev wlan0 set power_save off`, `After=network.target`,
+`WantedBy=multi-user.target`）。这条不做，后面所有「网络相关」的排查都会被它污染。
+
+### 8.5 没有 CUDA：检测后端必须换算法，不是换参数
+
+`p2_params.yaml` 的 `backend: yolo` 在 Pi 5 上直接跑 `ultralytics`（PyTorch，CPU）
+大约 **1~2 FPS**（640×640），撑不住 `frame_timeout: 1.5s` 要求的节奏（它需要
+≥3 FPS 才算「帧是新的」，实际希望 ≥8）。三条可行路线：
+
+| 路线 | 预期 | 代价 |
+|---|---|---|
+| onnxruntime / NCNN + `yolov8n` 输入 320 | 6~10 FPS | 需要导出 onnx 并改检测器里的预处理（letterbox + 320 缩放） |
+| Hailo-8L（M.2 HAT，26 TOPS） | 30+ FPS | 要 `.hef` 模型和 HailoRT，驱动与内核版本绑定 |
+| 保持 `color` 后端 | 与仿真一致 | 只认「高饱和橙色上衣」，见 §四.1 |
+
+跌倒检测（P5）用的判据是深度图上的 `z_p95`，**不依赖检测框精度**，所以
+「320 输入的 yolov8n」对它够用；跟随（P2）需要的是「人在画面里的大致方位 +
+距离」，也够用。真正需要高精度的是「多人场景里认准要跟的那个人」——这不在当前
+需求里，不要为它提前上算力。
+
+### 8.6 音频与 USB 带宽
+
+- Pi 5 **没有 3.5mm 模拟输出**。TTS 只能走 HDMI、USB 声卡或 I2S DAC。
+  `lightdog_voice` 的 `tts_command` 要指向实际能出声的那条链路，配错的表现是
+  「日志里 TTS 成功、现场没声音」。
+- RealSense（USB3）+ USB 麦克风**分插两个控制器**，不要串在同一个 Hub 上：
+  带宽抢不到的症状是深度图掉帧，而彩色正常 —— 会被误判成「深度相机坏了」。
+- 麦克风灵敏度按现场调：老人说话音量低、距离远（2~3m），
+  唤醒词阈值宁低勿高，但**误唤醒的代价只是多问一句**，漏唤醒的代价是叫不应。
+
+### 8.7 CPU 调频：别用省电模式
+
+```bash
+# 10Hz 控制环在 powersave 下会抖到 8Hz，跟随表现为一顿一顿
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
+不需要 `PREEMPT_RT` 内核：控制频率只有 10Hz，抖动预算是几十毫秒，普通内核够用。
+上 RT 的收益远小于它带来的驱动兼容问题（尤其 RealSense 与 WiFi）。
+
+### 8.8 STM32 侧
+
+| 项 | 决定/要求 | 理由 |
+|---|---|---|
+| 型号 | STM32F405/F407 级（168MHz，1MB Flash，192KB RAM，FPU） | 4 路 PWM + 4 路编码器 + 2 路 UART + CAN 全部够；F4 的生态与例程最厚 |
+| 与 Pi 的连接 | UART，**3.3V 直连**（不要接 5V TTL），共地，短线或串 22Ω | 两边都是 3.3V 逻辑；5V TTL 会打坏 Pi 的 GPIO |
+| 帧格式 | 定稿见 `docs/firmware_protocol.md` §六 | CRC16-CCITT-FALSE + 长度 + 类型；CRC 错整帧丢弃 |
+| 波特率 | 115200 起步，验收通过后可提到 460800 | 心跳 10Hz + 速度 10Hz + 电量 1Hz 在 115200 下占用 < 5% |
+| 看门狗 | **独立看门狗 IWDG 只在「收到心跳」时喂**，不要在 `while(1)` 里喂 | 主循环卡死时 `while(1)` 里的喂狗照样跑，等于没有看门狗 |
+| 电机 PWM 布线 | 远离编码器线与 UART | 编码器计数乱跳的表现是 odom 原地漂移，通常被误判成「轮距没标定」 |
+| 上电默认 | 驱动使能脚**默认低**（断 PWM），必须由固件主动拉高 | 见 §二：宁可多等 100ms，也不要「一上电就使能、等上位机来告诉它停」 |
+
+> 分工没变：Pi 决定「该走多快」，STM32 决定「一旦上位机失联立刻自己停」。
+> ROS 侧的 `twist_mux` 只是软件兜底，`kill -9` 掉它之后唯一还能刹住车的是固件。

@@ -4,7 +4,11 @@
 ## 为什么先把「链路」做完，而不是等麦克风
 
 `Readme.md` 的第一条功能是「通过麦克风能听到指令」。但麦克风、唤醒词、ASR 模型
-全都依赖硬件和算力平台（板子还没定），这三样定不下来，语音这块就一天都动不了。
+全都依赖硬件和算力平台。平台已定（树莓派 5，**没有 CUDA**），所以引擎选择也定了：
+唤醒词 openWakeWord、ASR whisper.cpp `base` int8 或 sherpa-onnx paraformer、
+TTS Piper `zh_CN-huayan`。三者在 Pi 5 的 4 核 A76 上都是 CPU 实时，不需要加速卡；
+代价是不能用需要 GPU 的方案（faster-whisper CUDA / 云端大模型），见
+`docs/hardware_readiness.md` §8.5。
 
 所以这里把**不依赖硬件的那一半**先做成契约：
 
