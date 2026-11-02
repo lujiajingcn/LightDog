@@ -1,0 +1,25 @@
+; LightDog 自建 SIP —— AMI 帐号
+;
+; 放到 /etc/asterisk/manager.conf（或 include 进来），然后 `asterisk -rx "manager reload"`。
+;
+; 三条必须保持的约束：
+;   1. bindaddr 只绑 127.0.0.1 —— AMI 是**明文**协议，密码在网上裸奔。
+;      机器人自己就是 Asterisk，不需要任何外部来源连它。
+;   2. permit 只放行本机网段。就算以后 Asterisk 挪到家里另一台机器，
+;      也只放行那一台，不要用 0.0.0.0/0。
+;   3. secret 用 `openssl rand -hex 24` 生成，并且与 p5_params.yaml 的
+;      sip_ami_secret 一字不差。配错时的表现是「告警照常弹窗，但一个电话
+;      都打不出去」，日志里有一行 `AMI 登录被拒绝`。
+
+[general]
+enabled = yes
+port = 5038
+bindaddr = 127.0.0.1
+
+[lightdog]
+secret = 在这里填 openssl rand -hex 24 的输出
+; read all 只是为了收 OriginateResponse / CoreShowChannels 的事件；
+; 这些事件里没有通话内容，只有频道名与结果。
+read = all
+write = all
+permit = 127.0.0.1/255.255.255.0

@@ -1,0 +1,58 @@
+; LightDog 自建 SIP —— 分机（家属的手机 / 软电话）
+;
+; 放到 /etc/asterisk/pjsip.conf，然后 `asterisk -rx "pjsip reload"`。
+; 家里几个人就复制几段：把 1001 换成 1002、密码换掉。
+;
+; 手机端装任何标准 SIP 客户端都行（Zoiper / Linphone / Groundwire），
+; 填：服务器 = 这台机器的局域网 IP，用户名/密码 = 下面这一对。
+; 不要用公网 IP：SIP 暴露在公网会被扫描器在几小时内找到并尝试盗打。
+
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+; 只在家里用，关掉 ICE/STUN，少一层故障源
+
+; ---- 分机 1001（家属 A）----
+[1001]
+type = endpoint
+context = internal
+disallow = all
+allow = ulaw
+allow = alaw
+; 不要开 allow = g722 之外的编解码猜谜：老人手机往往在弱网，
+; 编解码协商失败的表现是「响了但没声音」，排查起来很费时间。
+auth = auth1001
+aors = 1001
+direct_media = no
+; direct_media=no 是刻意的：强制媒体走 Asterisk，
+; 这样「接了没声音」只可能是单点问题，而不是两端 NAT 行为不一致。
+
+[auth1001]
+type = auth
+auth_type = userpass
+username = 1001
+password = 换成随机串
+
+[1001]
+type = aor
+max_contacts = 2
+remove_existing = yes
+
+; ---- 分机 1002（家属 B）----
+; 复制上面三段，把 1001 全改成 1002、密码换掉。
+
+; ---- 如果要打真实手机号（PSTN）----
+; 需要运营商 SIP 中继（或网关设备），把下面这段填好之后，
+; p5_params.yaml 里的 sip_channel_template 改成 PJSIP/{number}@trunk
+; 并在 extensions.conf 的 [alarm-out] 里按中继要求加前缀。
+;
+; [trunk]
+; type = endpoint
+; context = alarm-out
+; disallow = all
+; allow = ulaw
+; outbound_auth = authtrunk
+; aors = trunk
+; from_user = 你的中继账号
+; from_domain = 运营商给的域名

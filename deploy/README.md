@@ -129,6 +129,28 @@ RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ---
 
+## 外呼通道（自建 SIP）
+
+跌倒告警要真的打电话。方案已定：**自建 SIP**，Asterisk 与机器人同机，机器人通过
+AMI（TCP 5038）让 Asterisk 外呼家属分机，接听后播放预录语音。
+
+```bash
+# 完整部署（Asterisk 配置、密码、语音提示生成）见：
+cat deploy/sip/README.md
+
+# 装完之后 verify.sh 的第 4 层会自动检查（**只登录 AMI，不拨号**）
+sudo ./deploy/verify.sh
+```
+
+`verify.sh` 第 4 层只在 `p5_params.yaml` 的 `sip_ami_secret` 非空时生效；
+为空时打一行「未配置 → 只记录不拨号」并通过 —— 仿真/无电话环境不该因此变红。
+
+三条容易忽略的：
+
+- **`--check` 不拨号是刻意的**：自检脚本绝不能半夜把家里人叫起来。
+- AMI 是明文协议，`bindaddr` 必须是 `127.0.0.1`。
+- `call_mode` 默认 `auto`，所以**不用改模式**，填了 secret 就自动走 SIP。
+
 ## 上车验收：`acceptance.py`
 
 `docs/firmware_protocol.md` §七 有一张 10 条的上车验收清单。这个脚本把它变成
@@ -170,6 +192,7 @@ python3 deploy/acceptance.py --auto-only    # 无人值守：人工项记为「�
 | #4 物理急停按钮 | 按钮还没在固件侧实现（`firmware_protocol.md` §3.2） |
 | #6 真实语音链路 | 脚本注入的是 `/voice/command` 文本，麦克风→ASR 那一段要人说话 |
 | #8 实际亮度 | `/led/brightness` 的消费者是固件，ROS 侧没人回读；只能照度计 |
+| 外呼真的接通 | `verify.sh` 只验 AMI 登录；「接听后能听到语音」要真的用手机接一次，见 `deploy/sip/README.md` 第 ③④ 步 |
 
 ### 两个坑
 

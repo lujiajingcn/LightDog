@@ -37,22 +37,29 @@ LightDog P5：跌倒告警状态机（两级确认）
 
 ## 「打电话」这件事的边界
 
-真机上要真的拨号，得接 SIP（Asterisk/FreeSWITCH）或者运营商语音 API。
-仿真里两者都没有，所以：
+选型已定（D2）：**自建 SIP**。Asterisk 跑在本机（或家里的一台常开机器）上，
+`lightdog_call.SipDialer` 通过 AMI 让 Asterisk 外呼家属的软电话/手机分机。
 
-- `call_command` 参数是一个命令模板，含 `{phone}` / `{name}` / `{attempt}`。
-  默认空 = **只记录不真拨**。真机把它配成
-  `asterisk -rx "channel originate SIP/{phone} extension s@alarm"` 之类即可。
-- 无论有没有真拨，都会写 `/alert/state`、记日志、并让手机端弹窗 ——
-  手机 App 推送才是这个产品最现实的通知通道，电话是兜底。
+三种模式（`call_mode`）：
 
-这条边界写在代码里，也写在 docs/P5_fall_alert.md 里，免得以后误以为已经能打电话。
+    sip      走 AMI，能区分「接通 / 无人接听 / 忙 / 拥塞」
+    command  外部语音 API 的 CLI 模板，只知道命令是否成功（= 已发出，不知是否接听）
+    log      只记录，不真拨（仿真默认）
+
+不管哪种模式，`/alert/state`、日志、手机端弹窗都照常 —— App 推送才是这个产品
+最现实的通知通道，电话是兜底。**测试告警永不外呼**（`is_test` 直接返回）：
+半夜把女儿的手机打醒一次，这个功能就再也没人敢点了。
+
+三条容易踩的边界：
+
+- 拨号在后台线程里做，`_tick` 只非阻塞地收结果。同步拨号会把 5Hz 状态机
+  卡住十几秒，那段时间里人自己站起来了也不会进 RESOLVED。
+- `ack` 要**真的挂断**正在响的那一通，不只是「不再拨下一个」。
+- `call_command` 仍然保留，作为非 SIP 部署的逃生口；但它不是默认路径。
 """
 
 import json
 import os
-import shlex
-import subprocess
 import sys
 import time
 
@@ -60,6 +67,8 @@ import rclpy
 from rclpy.node import Node
 
 from std_msgs.msg import Float32, String
+
+from lightdog_call import SipConfig, make_dialer
 
 
 class AlertManager(Node):
@@ -90,9 +99,23 @@ class AlertManager(Node):
         # ---- 告警 ----
         self.declare_parameter('resolved_hold', 5.0)     # RESOLVED 显示多久
         self.declare_parameter('contacts_path', '/data/contacts.json')
-        self.declare_parameter('call_command', '')       # 空 = 只记录不真拨
+        # ---- 外呼 ----
+        # sip = 自建 SIP（Asterisk AMI）；command = 命令模板；log = 只记录。
+        # auto 的解析顺序：有 secret -> sip，有 call_command -> command，否则 log。
+        self.declare_parameter('call_mode', 'auto')
+        self.declare_parameter('call_command', '')       # 空 = 不启用命令通道
         self.declare_parameter('call_interval', 20.0)    # 两次呼叫间隔
         self.declare_parameter('max_rounds', 3)          # 联系人轮询几轮后放弃
+        self.declare_parameter('sip_ami_host', '127.0.0.1')
+        self.declare_parameter('sip_ami_port', 5038)
+        self.declare_parameter('sip_ami_user', 'lightdog')
+        self.declare_parameter('sip_ami_secret', '')
+        self.declare_parameter('sip_channel_template', 'PJSIP/{number}')
+        self.declare_parameter('sip_context', 'alarm')
+        self.declare_parameter('sip_exten', 's')
+        self.declare_parameter('sip_ring_timeout', 45.0)  # 响铃多久算没人接
+        self.declare_parameter('sip_max_call', 120.0)     # 接通后最多占线多久
+        self.declare_parameter('sip_connect_timeout', 5.0)
         # 事件视频窗口。pre 必须盖住「躺倒 suspect_hold + 问询 confirm_window」这段，
         # 否则视频从触发告警那刻往前算 15 秒，起点正好落在人已经躺平之后，
         # 最关键的"怎么倒的"没拍到。25 = 5 + 15 + 5 余量。
@@ -117,6 +140,43 @@ class AlertManager(Node):
         self.call_command = str(p('call_command').value).strip()
         self.call_interval = float(p('call_interval').value)
         self.max_rounds = int(p('max_rounds').value)
+        self.sip_secret = str(p('sip_ami_secret').value).strip()
+        # 模式解析与拨号器构造放在 logger 可用之后（下面），因为「配了 sip 却
+        # 没有 secret」必须留下一条 error，而不是安静地退回仅记录。
+        mode = self._resolve_call_mode(p('call_mode').value, self.sip_secret,
+                                       bool(self.call_command))
+        self.call_mode = mode
+        self._dialer = None
+        if mode == 'sip':
+            if not self.sip_secret:
+                self.get_logger().error(
+                    'call_mode=sip 但没有配置 sip_ami_secret —— 退化为仅记录。'
+                    '（manager.conf 的 secret 与 p5_params.yaml 必须一致）')
+                self.call_mode = mode = 'log'
+            else:
+                self._dialer = make_dialer(
+                    'sip',
+                    sip=SipConfig(
+                        host=str(p('sip_ami_host').value),
+                        port=int(p('sip_ami_port').value),
+                        username=str(p('sip_ami_user').value),
+                        secret=self.sip_secret,
+                        channel_template=str(p('sip_channel_template').value),
+                        context=str(p('sip_context').value),
+                        exten=str(p('sip_exten').value),
+                        ring_timeout=float(p('sip_ring_timeout').value),
+                        max_call=float(p('sip_max_call').value),
+                        connect_timeout=float(p('sip_connect_timeout').value)),
+                    log=self.get_logger().info)
+        elif mode == 'command':
+            if not self.call_command:
+                self.get_logger().warn(
+                    'call_mode=command 但 call_command 为空 —— 退化为仅记录')
+                self.call_mode = mode = 'log'
+            else:
+                self._dialer = make_dialer('command',
+                                           call_command=self.call_command,
+                                           log=self.get_logger().info)
         self.event_pre = float(p('event_pre').value)
         self.event_post = float(p('event_post').value)
         self.auto_reset = bool(p('auto_reset').value)
@@ -162,9 +222,29 @@ class AlertManager(Node):
         self.get_logger().info(
             f'LightDog alert manager ready: 一级={self.suspect_hold:.0f}s 躺倒 -> '
             f'二级={self.confirm_window:.0f}s 无起身 -> 告警；'
-            f'呼叫={"已配置命令" if self.call_command else "仅记录（未配置 call_command）"}')
+            f'外呼={self.call_mode}'
+            + (f'（{self._dialer.describe()}）' if self._dialer else '（仅记录）'))
 
     # ---------- 工具 ----------
+
+    @staticmethod
+    def _resolve_call_mode(mode, secret, has_command):
+        """把 `call_mode` 解析成 sip / command / log。
+
+        `auto` 是给「同一份 yaml 同时用于仿真和真机」准备的：真机配了 secret
+        就自动走 SIP，仿真里什么都没配就自动只记录，不必维护两份参数文件。
+        非法取值退回 log —— 外呼是往外打电话，宁可少打也不要打错。
+        """
+        mode = str(mode or '').strip().lower()
+        if mode in ('', 'auto'):
+            if str(secret or '').strip():
+                return 'sip'
+            if has_command:
+                return 'command'
+            return 'log'
+        if mode in ('off', 'none', 'log', 'command', 'sip'):
+            return 'log' if mode in ('off', 'none') else mode
+        return 'log'
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -220,6 +300,10 @@ class AlertManager(Node):
         if cmd == 'ack':
             if self.state in (self.ALARM,):
                 self._set_state(self.ACKED, '有人确认已知晓，停止继续呼叫')
+                # 「不再拨下一个」和「停止正在响的这一通」是两件事。只做前者的话，
+                # 家属手机要一直响到 sip_ring_timeout（默认 45 秒），而界面写着
+                # 「已收到确认，不再重复呼叫」。
+                self._hangup_call('ack')
                 # 语音不能说「正在联系家人」：进 ACKED 之后 _maybe_call 直接返回，
                 # 一个电话都不会再打。之前这句和同一行日志（停止继续呼叫）自相矛盾，
                 # 家属听到的承诺和系统的行为正好相反。
@@ -317,6 +401,10 @@ class AlertManager(Node):
                 if (self._now() - self.standing_since) >= self.recover_hold:
                     if self.auto_reset:
                         self._set_state(self.RESOLVED, '人已起身，告警解除')
+                        # 告警都解除了，电话还响着就是在骚扰：
+                        # 「现场已经没事了，但那通电话还在打」是最容易被投诉的
+                        # 一类行为，而且家属接起来只会更慌。
+                        self._hangup_call('resolved')
                     else:
                         self.get_logger().info(
                             '人已起身（auto_reset=false，保持告警状态）',
@@ -332,6 +420,7 @@ class AlertManager(Node):
 
     def _reset(self, why: str):
         self._set_state(self.NORMAL, why)
+        self._hangup_call('reset')
         self.alarm_id = ''
         self.alarm_wall = 0.0
         self.is_test = False
@@ -345,6 +434,9 @@ class AlertManager(Node):
     def _start_alarm(self, test: bool = False):
         self.alarm_wall = time.time()
         self.is_test = bool(test)
+        # 上一次告警如果还留着一通在途电话（比如连续两次跌倒），先挂掉：
+        # 记录已经被清空，再留着它只会在后台拨给上一位联系人。
+        self._hangup_call('new_alarm')
         self.alarm_id = 'alm_%s%s' % (
             time.strftime('%Y%m%d_%H%M%S', time.localtime(self.alarm_wall)),
             '_test' if test else '')
@@ -415,6 +507,11 @@ class AlertManager(Node):
         return out
 
     def _maybe_call(self):
+        # 先收上一通的结果。这一步必须在 ACKED 判断**之前**：确认之后那一通的
+        # 结局（接通了几秒 / 被 ack 挂断）仍然要落进 call_attempts，否则告警记录
+        # 里最后一通永远停在「呼叫中」。
+        self._drain_calls()
+
         if self.state == self.ACKED:
             return                       # 已被确认，不再打扰
         if self.is_test:
@@ -430,6 +527,10 @@ class AlertManager(Node):
         if self.last_call is not None and (now - self.last_call) < self.call_interval:
             return
         if self.rounds >= self.max_rounds:
+            return
+        # 上一通还在响铃/通话中，不要同时拨第二个联系人：两个号码一起响，
+        # 家属接起来第一句话是「谁啊」，互相打断反而没人听得清。
+        if self._dialer is not None and self._dialer.busy:
             return
 
         contacts = self._load_contacts()
@@ -453,35 +554,74 @@ class AlertManager(Node):
             self.rounds += 1
         self.last_call = now
 
+        attempt_no = len(self.call_attempts) + 1
+        # tag 用来把异步结果配回这一条 attempt。不能用下标：列表会被
+        # _start_alarm/_reset 重置，下标会串到上一次告警的记录上。
+        tag = f'{self.alarm_id or "noalarm"}#{attempt_no}'
         attempt = {
             'name': c['name'], 'phone': c['phone'],
             'at_wall': round(time.time(), 3),
             'round': round_no,
+            'tag': tag,
             'dialed': False,
+            'outcome': 'dialing',
+            'outcome_text': '呼叫中',
         }
+        self.call_attempts.append(attempt)
 
-        if self.call_command:
-            cmd = self.call_command.format(
-                phone=c['phone'], name=c['name'],
-                attempt=len(self.call_attempts) + 1)
-            try:
-                # 用 shlex 切分而不是 shell=True：号码/姓名是外部输入，
-                # 走 shell 等于把用户的地址簿内容当命令执行。
-                r = subprocess.run(shlex.split(cmd), capture_output=True, timeout=15.0)
-                attempt['dialed'] = (r.returncode == 0)
-                if r.returncode != 0:
-                    self.get_logger().warn(
-                        f'呼叫命令失败 rc={r.returncode}: '
-                        f'{r.stderr.decode(errors="replace")[:160]}')
-            except Exception as e:
-                self.get_logger().warn(f'呼叫命令异常：{e}')
+        if self._dialer is not None:
+            if not self._dialer.dial(c['phone'], c['name'],
+                                     tag=tag, attempt=attempt_no):
+                # dial() 返回 False 只会在「上一通还没结束」时发生，而上面刚查
+                # 过 busy —— 走到这里说明是启动/关闭竞态，记一条失败等下一轮。
+                self._mark_call(attempt, 'failed', '外呼通道忙，本轮跳过')
         else:
             self.get_logger().warn(
-                f'【仿真】本应拨打 {c["name"]} {c["phone"]}（未配置 call_command，仅记录）')
+                f'【仿真】本应拨打 {c["name"]} {c["phone"]}'
+                f'（call_mode=log，仅记录）')
+            self._mark_call(attempt, 'logged', '仅记录（未配置外呼）')
 
-        self.call_attempts.append(attempt)
         self._say(f'正在联系{c["name"]}。')
         self._publish()
+
+    def _mark_call(self, attempt, outcome, text):
+        attempt['outcome'] = outcome
+        attempt['outcome_text'] = text
+        attempt['dialed'] = outcome not in ('failed', 'cancelled', 'timeout')
+
+    def _drain_calls(self):
+        """非阻塞收外呼结果，回填到对应的 attempt 上。"""
+        if self._dialer is None:
+            return
+        for r in self._dialer.poll():
+            hit = None
+            for a in reversed(self.call_attempts):
+                if a.get('tag') == r.tag:
+                    hit = a
+                    break
+            if hit is None:
+                self.get_logger().warn(
+                    f'收到一通无主的呼叫结果（{r.tag} {r.name} {r.text()}）')
+                continue
+            # 保留 attempt 自己的 name/phone/at_wall/round，其余字段用结果覆盖
+            hit.update(r.as_dict())
+            hit['dialed'] = r.placed
+            self.get_logger().info(
+                f'呼叫结果：{r.name} {r.number} -> {r.text()}')
+            self._publish()
+
+    def _hangup_call(self, why):
+        """挂断正在响/正在通话的那一通。没有在途通话时安静返回。"""
+        if self._dialer is None:
+            return False
+        try:
+            if not self._dialer.hangup(why):
+                return False
+        except Exception as e:                      # 兜底：不能因挂断失败改变状态机
+            self.get_logger().warn(f'挂断请求异常：{e}')
+            return False
+        self.get_logger().info(f'已请求挂断当前通话（{why}）')
+        return True
 
     # ---------- 输出 ----------
 
@@ -502,11 +642,23 @@ class AlertManager(Node):
             'call_attempts': self.call_attempts[-8:],
             'rounds': self.rounds,
             'max_rounds': self.max_rounds,
-            'call_enabled': bool(self.call_command),
+            'call_enabled': bool(self._dialer is not None and self._dialer.enabled),
+            'call_mode': self.call_mode,
+            'call_detail': self._dialer.describe() if self._dialer else '仅记录',
         }
         m = String()
         m.data = json.dumps(payload, ensure_ascii=False)
         self.pub_state.publish(m)
+
+    def destroy_node(self):
+        # 节点停机（systemd 重启/上车断电前）必须挂断在途电话：
+        # 否则手机会一直响到 Asterisk 的超时，而没有任何人知道为什么。
+        if self._dialer is not None:
+            try:
+                self._dialer.close()
+            except Exception as e:
+                self.get_logger().warn(f'关闭外呼通道异常：{e}')
+        return super().destroy_node()
 
 
 def main(args=None):

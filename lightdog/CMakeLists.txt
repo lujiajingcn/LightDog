@@ -31,6 +31,7 @@ install(PROGRAMS
 # 就在 sys.path[0]，不需要额外的 package 结构。
 install(FILES
   lightdog_qos.py
+  lightdog_call.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

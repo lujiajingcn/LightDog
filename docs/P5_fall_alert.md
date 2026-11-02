@@ -145,21 +145,44 @@ self.pub_event.publish(String(data=json.dumps(req, ensure_ascii=False)))
 `pre=15` 的视频起点正好卡在问询开始那一刻，人已经躺平了，
 **最关键的"怎么倒的"反而没拍到**（踩过，见 §6.1）。
 
-### 3.4 「打电话」这件事的边界
+### 3.4 「打电话」：自建 SIP
 
-真机上要真的拨号，得接 SIP（Asterisk / FreeSWITCH）或运营商语音 API。
-仿真里两者都没有，所以：
+选型已定（D2）：**自建 SIP**。Asterisk 跑在本机，`lightdog_call.SipDialer` 通过
+AMI 让 Asterisk 外呼家属分机，接听后播放预录的告警语音。
 
-- `call_command` 是一个命令模板，支持 `{phone}` / `{name}` / `{attempt}` 占位符。
-  默认空 = **只记录不真拨**。真机配成
-  `asterisk -rx "channel originate SIP/{phone} extension s@alarm"` 之类即可。
-- 命令用 `shlex.split` 切分后 `subprocess.run`，**不走 `shell=True`** ——
-  号码和姓名是外部输入（用户可以在手机上随便加联系人），
-  走 shell 等于把用户的地址簿内容当命令执行。
-- 无论有没有真拨，都会写 `/alert/state`、记日志、并让手机端弹窗 ——
-  手机 App 推送才是这个产品最现实的通知通道，电话是兜底。
+```
+alert_manager ──AMI 5038(明文,只绑 127.0.0.1)──> Asterisk ──SIP──> 家属手机
+```
 
-这条边界写在代码注释里、也写在这里，免得以后误以为"P5 已经能打电话了"。
+三种模式（`call_mode`，默认 `auto`）：
+
+| 模式 | 触发条件 | 能知道什么 |
+|---|---|---|
+| `sip` | `sip_ami_secret` 非空 | 接通 / 无人接听 / 忙 / 拥塞 / 失败（`OriginateResponse`） |
+| `command` | `call_command` 非空（兜底通道，外部语音 API） | 只知道命令是否成功退出 → 记 `placed`「已发出外呼」 |
+| `log` | 都没有（仿真默认） | 只写记录，不拨号 |
+
+`auto` 是为了**同一份 yaml 同时用于仿真和真机**：真机填上 secret 就自动走 SIP，
+仿真里什么都不配就是 log。
+
+四条设计约束，每条都对应一个会真的发生的故障：
+
+1. **拨号不能在 `_tick` 里同步做。** 原实现是 `subprocess.run(timeout=15)` 直接
+   在 5Hz 的 tick 里跑：一通电话把状态机卡住十几秒，这段时间里人自己站起来了
+   也不会进 `RESOLVED`，事件视频窗口跟着错位。现在拨号在后台线程。
+2. **「命令返回 0」≠「有人接听」。** 走 AMI 才拿得到 `Reason`（0/4 接通、
+   3 无人接听、5 忙、8 拥塞）。把「没人接」记成「外呼失败」，事后就分不清
+   「那晚家里没人」和「那晚 SIP 挂了」。
+3. **`ack` 必须挂断正在响的那一通。** 只做「不再拨下一个」的话，家属手机要响满
+   `sip_ring_timeout`（45s），而界面写着「已确认，不再重复呼叫」。挂断要按频道名
+   前缀找（`PJSIP/1001-0000000a` 的流水号是 Asterisk 分的）。
+4. **`test` 告警永不外呼。** 半夜把女儿的手机打醒一次，这功能就再没人敢点了。
+
+部署与验收（Asterisk 配置、密码、语音提示生成、四种结果的现场实测）见
+**[`deploy/sip/README.md`](../deploy/sip/README.md)**。
+
+仍然成立的一条边界：**手机 App 推送才是最现实的通知通道，电话是兜底**。
+外呼失败不影响 `/alert/state`、事件视频和手机端弹窗。
 
 ---
 
@@ -460,7 +483,7 @@ fall=standing z_p95=1.14  alert=NORMAL
 | P2 | 颜色判据整套复用；`person` 模型直接复用；两个检测器订阅同一路图像互不影响 |
 | P3 | 无关。跌倒告警不触发回充，回充也不影响检测 |
 | P4 | **强依赖**：告警视频由 `lightdog_recorder` 切，`/api/v1/alarms` 由 `lightdog_server` 提供；但 P4 不依赖 P5，缺了 P5 一切照常 |
-| 真机 | 需要换掉：颜色掩膜 → 人体分割；`call_command` → SIP/运营商 API；`/alert/voice` → TTS 引擎 |
+| 真机 | 需要换掉：颜色掩膜 → 人体分割；外呼走 SIP（`deploy/sip/`）；`/alert/voice` → TTS 引擎 |
 
 ---
 

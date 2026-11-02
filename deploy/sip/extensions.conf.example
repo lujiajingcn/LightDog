@@ -1,0 +1,29 @@
+; LightDog 自建 SIP —— 拨号计划
+;
+; 放到 /etc/asterisk/extensions.conf，然后 `asterisk -rx "dialplan reload"`。
+;
+; 机器人不自己说话：它让 Asterisk 在对方接听之后播放一段预先渲染好的语音
+; （deploy/sip/make_prompt.sh 用 Piper 生成，8kHz 单声道 wav）。
+; 这样「说什么」和「打给谁」解耦 —— 改话术不用动代码，改号码不用重录。
+
+[alarm]
+exten => s,1,NoOp(LightDog 跌倒告警外呼)
+ same => n,Wait(1)
+ same => n,Answer()
+; 接听瞬间就播音会吃掉第一个字，等人的「喂」说完再播。
+ same => n,Playback(lightdog/alarm)
+ same => n,Wait(2)
+ same => n,Playback(lightdog/alarm)
+; 播两遍：第一遍对方常常还在「喂？喂？」，听不到内容。
+ same => n,Wait(2)
+ same => n,Hangup()
+
+; 家属分机互打（可选，方便验收时先确认手机能注册上）
+[internal]
+exten => _1XXX,1,Dial(PJSIP/${EXTEN},20)
+ same => n,Hangup()
+
+; 走运营商中继打真实手机号时用这个上下文（配合 pjsip.conf 的 [trunk]）
+[alarm-out]
+exten => _X.,1,Dial(PJSIP/${EXTEN}@trunk,45)
+ same => n,Hangup()

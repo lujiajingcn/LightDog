@@ -465,6 +465,13 @@ function renderAlarm(a) {
     ['联系人', contacts ? contacts + ' 位' : '未设置'],
     ['呼叫进度', maxRounds ? `${rounds}/${maxRounds} 轮` : '--'],
   ];
+  // 最近一通的结果。只写「已呼叫 3 次」是不够的：家属最想知道的是
+  // 「到底有人接了吗」——「无人接听 ×3」和「已接通 42s」是完全不同的处境。
+  const calls = a.call_attempts || [];
+  const lastCall = calls[calls.length - 1];
+  if (lastCall && lastCall.outcome_text) {
+    rows.push(['最近呼叫', `${lastCall.name || ''} · ${lastCall.outcome_text}`]);
+  }
   if (a.z_p95 !== null && a.z_p95 !== undefined) {
     rows.push(['人体高度', Number(a.z_p95).toFixed(2) + ' m']);
   }
@@ -491,8 +498,8 @@ function renderAlarm(a) {
   $('alarm-foot').textContent = isTest
     ? '测试告警：不拨号、不自动解除，点「我已知晓」或在设置里复位结束'
     : (a.call_enabled
-      ? '已按联系人顺序自动呼叫'
-      : '本机未配置外呼命令，仅记录并通知 App');
+      ? `已按联系人顺序自动呼叫（${a.call_mode || 'sip'}）`
+      : '本机仅记录、不外呼（未配置 SIP 或外呼命令）');
 
   el.hidden = false;
   document.title = isTest ? '模拟告警 · LightDog'

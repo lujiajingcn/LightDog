@@ -5,10 +5,11 @@
 #   sudo ./deploy/verify.sh              # 全套（含 ROS 话题）
 #   sudo ./deploy/verify.sh --no-ros     # 只查 unit 语法与 systemd 状态
 #
-# 检查分三层，任何一层报 FAIL 都会让退出码非零：
+# 检查分四层，任何一层报 FAIL 都会让退出码非零：
 #   1. unit 层   —— 文件在不在、systemd-analyze 认不认、ExecStart 引用的路径存不存在
 #   2. 进程层   —— 服务是否 active、有没有在重启循环里
 #   3. 数据层   —— 关键话题有没有人发、HTTP 端口通不通、急停闭锁是什么状态
+#   4. 外呼层   —— 配了 SIP 时 AMI 能不能登录、告警语音在不在（**不拨号**）
 #
 # 第 1 层不需要机器人跑起来，所以它能在「装完还没敢启动」时先抓拼写错误。
 #
@@ -29,7 +30,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --no-ros) CHECK_ROS=0; shift ;;
     --port)   PORT="${2:-8000}"; shift 2 ;;
-    -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf '未知参数：%s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -157,6 +158,45 @@ if [ "$CHECK_ROS" -eq 1 ]; then
     check_topic /mission/state      "调度层活着"
     check_topic /alert/state        "告警状态机活着"
   fi
+fi
+
+# ---------------------------------------------------------------- 4. 外呼
+
+head1 "4. 外呼通道（自建 SIP）"
+
+PARAMS="$WS_GUESS/install/lightdog/share/lightdog/config/p5_params.yaml"
+[ -f "$PARAMS" ] || PARAMS="$SELF_DIR/../lightdog/config/p5_params.yaml"
+
+MODE="?"
+SECRET=""
+if [ -f "$PARAMS" ]; then
+  # 只取这两个键，不引 yaml 解析器：verify.sh 要在装完、还没 source workspace
+  # 的干净 shell 里跑，依赖越少越不容易「检查脚本自己先崩」。
+  MODE="$(sed -n 's/^[[:space:]]*call_mode:[[:space:]]*//p' "$PARAMS" | head -1 | tr -d "\"' \r")"
+  SECRET="$(sed -n 's/^[[:space:]]*sip_ami_secret:[[:space:]]*//p' "$PARAMS" | head -1 | tr -d "\"' \r")"
+fi
+
+if [ -z "$SECRET" ]; then
+  ok "未配置 sip_ami_secret（call_mode=$MODE → 只记录不拨号）"
+else
+  command -v asterisk >/dev/null 2>&1 \
+    && ok "asterisk 已安装" || bad "没有 asterisk 命令（sudo apt install asterisk）"
+  AST="$(systemctl is-active asterisk 2>/dev/null || true)"
+  [ "$AST" = active ] && ok "asterisk active" || bad "asterisk 未运行（${AST:-unknown}）"
+
+  CALL_PY="$SELF_DIR/../lightdog/lightdog_call.py"
+  [ -f "$CALL_PY" ] || CALL_PY="$WS_GUESS/install/lightdog/lib/lightdog/lightdog_call.py"
+  if [ -f "$CALL_PY" ]; then
+    # --check 只登录、不拨号：自检脚本**不能**让家里人半夜接到测试电话。
+    OUT="$(python3 "$CALL_PY" --check --secret "$SECRET" 2>&1)" \
+      && ok "AMI 登录成功（$CALL_PY）" \
+      || bad "AMI 登录失败：$OUT"
+  else
+    warn "找不到 lightdog_call.py，跳过 AMI 登录检查"
+  fi
+  [ -f /var/lib/asterisk/sounds/lightdog/alarm.wav ] \
+    && ok "告警语音已就绪（deploy/sip/make_prompt.sh）" \
+    || warn "缺 /var/lib/asterisk/sounds/lightdog/alarm.wav —— 打通了也是静音"
 fi
 
 # ---------------------------------------------------------------- 结论

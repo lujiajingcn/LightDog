@@ -162,6 +162,10 @@ class TestSimEchoTruncation(unittest.TestCase):
 
     def test_json_topics_are_not_truncated(self):
         sim = os.path.join(os.path.dirname(PKG), 'sim')
+        if not os.path.isdir(sim):
+            # 仿真容器只挂载包目录（src/lightdog），`sim/` 不在里面。
+            # 跳过而不是失败：这项查的是仓库里的脚本，宿主机跑才有意义。
+            self.skipTest('找不到 sim/（容器只挂包目录）')
         checked = 0
         for path in sorted(glob.glob(os.path.join(sim, '*.sh'))):
             with open(path, encoding='utf-8') as f:

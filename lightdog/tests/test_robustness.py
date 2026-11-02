@@ -325,9 +325,30 @@ class TestLightAutoSurvivesDetectorDeath(unittest.TestCase):
 
 # ---------------------------------------------------------------- 呼叫轮次
 
+class _DialerStub:
+    """只记「拨了谁」，不真拨。轮次编排与拨号方式无关。"""
+
+    def __init__(self):
+        self.enabled = True
+        self.busy = False
+        self.calls = []
+
+    def dial(self, number, name, tag='', attempt=1):
+        self.calls.append((number, name, tag))
+        return True
+
+    def poll(self):
+        return []
+
+    def hangup(self, why='ack'):
+        return False
+
+    def describe(self):
+        return 'stub'
+
+
 def make_caller(contacts, interval=0.0):
     """只装 _maybe_call 需要的那几个属性，不碰 rclpy。"""
-    import shlex
     import time as _time
 
     d = type('AlertManager', (), {})()
@@ -340,7 +361,8 @@ def make_caller(contacts, interval=0.0):
     d.rounds = 0
     d.call_idx = 0
     d.call_attempts = []
-    d.call_command = ''
+    d.alarm_id = 'alm_test'
+    d._dialer = _DialerStub()
     d.clock = Clock()
     d.log = Log()
     d.get_clock = lambda: d.clock
@@ -348,8 +370,10 @@ def make_caller(contacts, interval=0.0):
     d._load_contacts = lambda: contacts
     d._say = lambda text: None
     d._publish = lambda: None
-    bind(d, extract_methods(ALERT, 'AlertManager', {'_maybe_call', '_now'},
-                            ns={'time': _time, 'shlex': shlex, 'subprocess': None}))
+    bind(d, extract_methods(
+        ALERT, 'AlertManager',
+        {'_maybe_call', '_now', '_drain_calls', '_mark_call'},
+        ns={'time': _time}))
     return d
 
 
@@ -689,6 +713,8 @@ class TestAlertCommands(unittest.TestCase):
         d._set_state = lambda new, why='': d.set_state.append((new, why))
         d._reset = lambda why: None
         d._start_alarm = lambda test=False: d.started.append(test)
+        d.hung = []
+        d._hangup_call = lambda why='ack': (d.hung.append(why), True)[1]
         bind(d, extract_methods(ALERT, 'AlertManager', {'_on_command'},
                                 ns={'Msg': Msg, 'String': Msg}))
         return d
@@ -714,6 +740,8 @@ class TestAlertCommands(unittest.TestCase):
         self.assertTrue(d.said, 'ack 之后没有任何语音反馈')
         self.assertNotIn('正在联系', d.said[0],
                          '语音承诺「正在联系家人」，但 ACKED 之后一个电话都不打')
+        self.assertEqual(d.hung, ['ack'],
+                         'ack 只停「下一个」，没挂断正在响的这一通')
 
 
 class TestEstopPersistence(unittest.TestCase):
@@ -808,12 +836,19 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 ACC = os.path.join(REPO_ROOT, 'deploy', 'acceptance.py')
 
+# deploy/ 不在包里。仿真容器只挂载了包目录（`src/lightdog`），所以这组测试
+# 在容器里会找不到 acceptance.py —— 那时应当**跳过**，而不是让整个 run.py
+# 在 import 阶段就崩掉（一崩全绿变全红，看不出是哪一项坏了）。
+HAS_ACC = os.path.isfile(ACC)
+
 # add() 里用到的模块级常量，exec 类体时必须一起给，否则运行到那一行就 NameError
 _ACC_NS = {n: extract_const(ACC, n) for n in
-           ('PASS', 'FAIL', 'SKIP', 'MANUAL', 'G', 'R', 'Y', 'D', 'B', 'E')}
+           ('PASS', 'FAIL', 'SKIP', 'MANUAL', 'G', 'R', 'Y', 'D', 'B', 'E')} \
+    if HAS_ACC else {}
 _ACC_NS.update({'sys': sys, 'time': time})
 
 
+@unittest.skipUnless(HAS_ACC, '找不到 deploy/acceptance.py（容器只挂包目录）')
 class TestAcceptanceVerdict(unittest.TestCase):
     """验收脚本的判定：跳过 ≠ 通过。"""
 

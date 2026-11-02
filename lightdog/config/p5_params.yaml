@@ -61,9 +61,29 @@
     # ---- 告警 ----
     resolved_hold: 5.0
     contacts_path: /data/contacts.json
-    # 空 = 只记录不真拨（仿真默认）。真机配成外呼命令模板，
-    # 例如：asterisk -rx "channel originate SIP/{phone} extension s@alarm"
-    # 支持占位符 {phone} {name} {attempt}；参数用 shlex 切分，不经过 shell。
+
+    # ---- 外呼（选型已定：自建 SIP / Asterisk）----
+    # auto 的解析顺序：sip_ami_secret 非空 -> sip；call_command 非空 -> command；
+    # 否则 log（只记录不真拨）。仿真里什么都不配就是 log，真机配上 secret 即
+    # 自动走 SIP —— 同一份 yaml 不用维护两个版本。
+    call_mode: auto
+    # 走 SIP 必须配 secret（与 /etc/asterisk/manager.conf 的 secret 一致）。
+    # 从 0600 的 yaml 读，不要写在 unit 的 -p 里：`systemctl status` 会把它
+    # 打给所有能看日志的人。
+    sip_ami_secret: ''
+    sip_ami_host: 127.0.0.1          # Asterisk 与本机同机；分机在别的机器也无妨
+    sip_ami_port: 5038
+    sip_ami_user: lightdog
+    sip_channel_template: 'PJSIP/{number}'   # 联系人号码 -> Asterisk 频道名
+    sip_context: alarm               # dialplan 里的告警上下文，见 deploy/sip/
+    sip_exten: s
+    sip_ring_timeout: 45.0           # 响铃多少秒算没人接（然后打下一个）
+    sip_max_call: 120.0              # 接通后最多占线多久，超时自动挂断
+    sip_connect_timeout: 5.0         # AMI 连接/登录超时
+
+    # 兜底通道：外部语音 API 的 CLI 模板，支持 {phone} {name} {attempt}。
+    # 参数用 shlex 切分、不走 shell（号码和姓名是手机端可编辑的外部输入）。
+    # 它只知道命令是否成功退出，所以界面文案是「已发出外呼」而不是「已接通」。
     call_command: ''
     call_interval: 20.0       # 两次呼叫间隔（仿真秒）
     max_rounds: 3             # 联系人轮询几轮后放弃
