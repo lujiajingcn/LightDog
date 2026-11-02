@@ -12,6 +12,7 @@
 
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -242,6 +243,46 @@ class TestTypeTable(unittest.TestCase):
         self.assertEqual(frame[:4], P.SYNC + b'\x00\x03')
         self.assertEqual(len(frame), 6)
         self.assertEqual(P.Parser().feed(frame)[0].payload, b'')
+
+    def test_doc_python_and_c_tables_agree(self):
+        """帧类型表三处必须一致：文档、Python 常量、C 宏。
+
+        docs/firmware_protocol.md 自己写了这条要求（"新增类型必须同时改三处，
+        三处漏一处的后果是帧发出去了但上位机当未知帧丢掉"），但一直没人守。
+        漏掉时两侧都不会报错：C 侧照样按长度搬字节，Python 侧把它归到「未知帧」，
+        日志里只有一行 warn —— 在真机上表现为「某个功能偶尔不生效」。
+
+        比的是「名字 -> 值」，不是两个集合：集合相等但 0x02/0x03 写反了照样是错的。
+        """
+        doc_p = os.path.join(REPO_ROOT, 'docs', 'firmware_protocol.md')
+        hdr = os.path.join(REPO_ROOT, 'firmware', 'core', 'lightdog_proto.h')
+        if not (os.path.isfile(doc_p) and os.path.isfile(hdr)):
+            self.skipTest('找不到 docs/ 或 firmware/（容器只挂包目录）')
+
+        table = dict(P.DOWN_TYPES)
+        table.update(P.UP_TYPES)
+        py_t = {name.upper(): typ for typ, name in table.items()}
+
+        with open(doc_p, encoding='utf-8') as f:
+            doc = f.read()
+        seg = doc[doc.index('下行（ROS → STM32）'):]
+        doc_t = {n: int(v, 16) for v, n in re.findall(
+            r'^\|\s*`(0x[0-9A-Fa-f]{2})`\s*\|\s*`?([A-Z_]+)`?\s*\|', seg, re.M)}
+
+        with open(hdr, encoding='utf-8') as f:
+            c_src = f.read()
+        c_t = {n: int(v, 16) for n, v in re.findall(
+            r'#define\s+LD_T_([A-Z_]+)\s+(0x[0-9A-Fa-f]+)', c_src)}
+
+        self.assertTrue(doc_t and py_t and c_t, '有一侧一个类型都没解析到，正则要更新')
+        for label, a, b in (('文档 vs Python', doc_t, py_t),
+                            ('Python vs C', py_t, c_t)):
+            only_a = sorted(set(a) - set(b))
+            only_b = sorted(set(b) - set(a))
+            diff = {k: (a[k], b[k]) for k in set(a) & set(b) if a[k] != b[k]}
+            self.assertEqual(
+                (only_a, only_b, diff), ([], [], {}),
+                f'{label} 不一致：仅左 {only_a}，仅右 {only_b}，值不同 {diff}')
 
 
 CROSS = os.path.join(REPO_ROOT, 'firmware', 'test', 'cross_stream.c')

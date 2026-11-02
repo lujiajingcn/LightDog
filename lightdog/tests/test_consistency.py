@@ -381,5 +381,41 @@ class TestWebEscaping(unittest.TestCase):
                          '这些字段被直接拼进了 innerHTML：\n' + '\n'.join(leaked))
 
 
+class TestSafetyQosInSync(unittest.TestCase):
+    """deploy/lightdog_estop.py 内联了一份 SAFETY_QOS，必须与包内那份逐字一致。
+
+    内联是有理由的：`deploy/` 装到 /usr/local/lib/lightdog 后 import 不到 ROS 包。
+    但两份副本是隐患：QoS 不兼容**不会报任何错**，只表现为「发出去没人收到」。
+    现场按急停、CLI 打印「急停已生效」（它回读的是锁存），车照走 ——
+    这正是这个文件要防的那类沉默失败。
+    """
+
+    FIELDS = ('depth', 'history', 'reliability', 'durability')
+
+    def _qos(self, src):
+        i = src.index('SAFETY_QOS = QoSProfile(')
+        blk = src[i:i + 400]
+        out = {}
+        for f in self.FIELDS:
+            m = re.search(r'\b%s\s*=\s*([A-Za-z_.0-9]+)' % f, blk)
+            self.assertIsNotNone(m, f'SAFETY_QOS 里找不到 {f}')
+            out[f] = m.group(1)
+        return out
+
+    def test_cli_copy_matches_package(self):
+        repo = os.path.dirname(PKG)
+        cli = os.path.join(repo, 'deploy', 'lightdog_estop.py')
+        if not os.path.isfile(cli):
+            self.skipTest('找不到 deploy/lightdog_estop.py（容器只挂包目录）')
+        with open(os.path.join(PKG, 'lightdog_qos.py'), encoding='utf-8') as f:
+            pkg = self._qos(f.read())
+        with open(cli, encoding='utf-8') as f:
+            dup = self._qos(f.read())
+        diff = {k: (pkg[k], dup[k]) for k in self.FIELDS if pkg[k] != dup[k]}
+        self.assertEqual(diff, {}, '两处 SAFETY_QOS 不一致（QoS 不兼容时静默收不到）：\n'
+                                   + '\n'.join(f'  {k}: 包内 {a} / CLI {b}'
+                                               for k, (a, b) in diff.items()))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
