@@ -344,5 +344,9 @@ bash sim/p1.sh led 0.5
   跟随期间要回充则需先 `enable_follow:=false`
 - **P5 跌倒检测**：需要姿态关键点，届时把检测器换成 YOLOv8-pose / MediaPipe，
   本文件的接口不变
+- **P6 系统层（调度 / 语音 / 安全闸）**：见 [P6_system_layer.md](P6_system_layer.md)。
+  这一层给跟随器加了 `/follow/enable` 放行门，并且要求「收回控制权时先发一条零速
+  再彻底停发」——正是本文 §7.8 那个「跟随的零速永远压住 Nav2」的坑的收尾。
 
 > 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。
+> 固件（MCU 看门狗、LED PWM、急停按钮）的接口契约见 **[firmware_protocol.md](firmware_protocol.md)**。

@@ -89,6 +89,23 @@ def extract_funcs(path, names, ns=None):
     return found
 
 
+def extract_const(path, name):
+    """抽模块级常量（RULES / ALERT_HOLD_STATES 这种纯字面量）。
+
+    抽出来的函数体里如果引用了模块级常量，必须把它一起塞进 ns，
+    否则 exec 出来的函数会在调用时 NameError —— 而且是在被测逻辑**内部**
+    炸，报错位置离真正的原因很远。用这个函数取，别在测试里抄一份副本。
+    """
+    with open(path, encoding='utf-8') as f:
+        src = f.read()
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == name:
+                    return ast.literal_eval(node.value)
+    raise KeyError(f'{os.path.basename(path)} 里找不到模块常量 {name}')
+
+
 def extract_class(path, cls_name, ns=None):
     """整类抽取（用于 CmdVelSource 这种纯数据类）。"""
     with open(path, encoding='utf-8') as f:

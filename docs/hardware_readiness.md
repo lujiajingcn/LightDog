@@ -19,6 +19,11 @@
 | `p3_params.yaml` | `marker_length` | `0.084` | **用卡尺量黑框边长** | 距离按比例整体缩放。0.084 填成 0.10 会让距离多算 19%，表现为提前停或一直往桩里顶 |
 | `p3_params.yaml` | `max_undocking_time` | `30.0` | 桩前净空不同需实测 | 太短 → 返回 905 `FAILED_TO_CONTROL`；太长 → 卡住时干等 |
 | `p4_params.yaml` | `event_retain_days` / `max_event_mb` | `30` / `512` | 按存储卡容量 | 不设保留策略时 `events/` 会一直涨到写满分区，而告警录像恰恰在半夜写 |
+| `p2_params.yaml` | `backend` | `color` | **`yolo`**（装好依赖后） | `color` 只认「高饱和橙色上衣」，真人穿什么都有，见 §四.1 |
+| `p4_params.yaml` | `ssl_certfile` / `ssl_keyfile` | `''` | 自签或真证书路径 | 留空 = 全明文。局域网可用，但只要经过公共 WiFi 就必须开。**证书读失败时服务会拒绝启动而不是退回明文**（这是刻意的） |
+| `p4_params.yaml` | `faststart` | `false` | `true`（需 ffmpeg） | 视频的 `moov` 在文件尾，手机端边下边播要等整段下完。真机上 ffmpeg 一般都有，开了只是多一次 `-c copy` 重封装 |
+| `system_params.yaml` | `dock_pose_x/y/yaw` | `-0.50/0.00/0.00` | **按现场测** | 低电回充的导航目标是「桩前 1m」，桩位填错会导航到墙上。填错不会崩，只会永远差那么一点 |
+| `system_params.yaml` | `patrol_waypoints` | `''` | `"x,y,yaw; x,y,yaw"` | 空 = 不巡游。格式必须用分号分隔、逗号分字段，坏数据会被**计数并跳过**而不是猜一个默认值 |
 | `p1` 灯组 | 见 `docs/P1_led_battery.md` | — | — | LED 真机由固件驱动，`lightdog_led` 要停掉 |
 
 ## 二、真机上不要启动的节点
@@ -28,6 +33,13 @@
 | `lightdog_led` | 它把亮度翻译成 **Gazebo 材质自发光**。真机 LED 由固件订阅 `/led/brightness` 驱动，这个节点只会往一个没人转发的话题发消息，现象是「灯不亮也没有任何报错」。代码里检测到 `use_sim_time=false` 会打印一条 error 提醒 |
 | `lightdog_person_sim` | 它用 `gz service set_pose` 让仿真里的「人」走起来 |
 | `lightdog_server` 的静态页 | 页面本身不用鉴权（否则手机第一次打开就是空白），但 `/api/*` 全部要 token。见下表 |
+
+反过来，真机上**必须多起**两个仿真里可选、真机里关键的东西：
+
+| 节点/机制 | 为什么真机必须有 |
+|---|---|
+| `lightdog_mission` | 仿真里可以只跑 P2/P3 手动验证，真机上没人负责「跟随器别压死 Nav2」「低电自己回桩」。**没有它，跟随和回充会互相抢方向盘** |
+| MCU 侧 300ms 断 PWM 看门狗 | 只有它能保证「上位机进程死了车也会停」。ROS 侧再怎么努力都做不到这一点，见 `docs/firmware_protocol.md` §二 |
 
 ## 三、传感器/上游失效时的行为（fail-safe 方向）
 
@@ -48,15 +60,28 @@
 | 跟随节点崩了 | 指令时效 | `follow_hold` (0.30s) / `follow_timeout` (0.6s) | twist_mux 输出零速，状态标 `follow(stale)` | — |
 | 停到位但没充上电 | 电量涨幅 | `verify_charging` / `charge_check_timeout` (30s) | 只报 error，**不自动离桩**（BMS 上报会滞后） | `没有上涨` |
 | 相机断流（P3 对准） | 墙钟无新帧 | `frame_timeout` (1.0s) | 主动把 `/dock/marker_visible` 置 false，让对准逻辑去扫描而不是原地微调 | — |
+| 调度层崩了 | `/follow/enable` 断流 | `follow_enable_timeout` (5.0s) | **跟随器自动关门**并停发（带超时的门，不是「一次 OOM 永久关闭」） | `放行信号已 …s 没更新` |
+| 调度层崩了 | `/mission/hold_motion` 断流 | `hold_timeout` (3.0s) | `twist_mux` 的「按住」自行过期。**急停不会过期** —— 两者的区别是刻意的 | — |
+| 告警节点崩了 | `/alert/state` 断流 | `alert_timeout` (5.0s) | 不再按住轮子（回到跟随/待命），但急停仍然独立生效 | — |
+| 语音节点崩了 | `/voice/command` 无人订阅 | — | 物理按扭、手机端、CLI 三条通道照常工作；反过来语音也必须能独立工作（它不经过调度层发急停） | — |
+| TTS 引擎缺失 | `/voice/say` 没人订阅 | — | 只损失「说话」，告警录像、手机推送、日志全部不受影响 | — |
+| Nav2 不可用 | action server 未就绪 | — | 低电回充降级为「直接让 `dock_manager` 停靠」；巡游功能跳过而不报错 | `Nav2 不可用` |
+| 手机端断连（SSE） | 客户端断开 | `sse_interval` (1.0s) | 服务端线程自行退出，不影响其它接口；重连即恢复（事件列表接口仍然可用） | — |
+| 急停后调度层重启 | 启动时握手 | `SAFETY_QOS` | 通过 `TRANSIENT_LOCAL` **继承**「已经急停」，不会从 `IDLE` 开始猜。实测重启后 0.8s 内进入 ESTOP | `收到急停闭锁` |
 
 ## 四、真机上会变得不一样的三件事
 
-1. **`lightdog_person_detector` 的颜色判据不能上真机。**
+1. **`lightdog_person_detector` 的 `color` 后端不能上真机。**
    它认的是「高饱和橙色上衣」（`h_min/h_max/s_min`）。仿真里的「人」是我们自己造的
-   几何体，颜色可控；真人穿什么都有。这一层是**闭环验证用的占位实现**，接口
-   （`/person/present` + `/person/position`，frame=base_link）才是产品契约。
-   换模型时只需要替换 `_detect()`，下游不用改 —— 但务必保持 `frame_id` 语义，
-   否则 `expected_frame` 会拦住它（这是设计好的保护）。
+   几何体，颜色可控；真人穿什么都有。
+
+   现在它已经是**可插拔**的：把 `p2_params.yaml` 的 `backend` 改成 `yolo`，
+   并装好 `ultralytics` 即可（`yolo_model` / `yolo_conf` / `yolo_person_class`）。
+   装不上时节点会打印一条 error 并**回退到 color**，不会崩 —— 但那条 error
+   意味着它正在用占位实现，别当成正常。
+
+   两个后端共用同一套「深度 → base_link」几何换算，所以换后端不会改变
+   `/person/position` 的语义（`frame_id=base_link`）。这也是下游不用改的原因。
 
 2. **相机安装假设 rpy = 0。**
    `lightdog_person_detector` 和 `lightdog_aruco_dock` 都只补偿了平移
@@ -94,16 +119,27 @@ P2/P5 都订阅 `/camera/depth/image_rect_raw` 并假设它和彩色图**逐像�
 ## 七、验证手段
 
 ```bash
-# 1) 离线逻辑回归（宿主机，不需要 ROS/容器）：53 项
+# 1) 离线逻辑回归（宿主机，不需要 ROS/容器）：96 项
 cd lightdog/tests && python run.py
 
-# 2) 现场探针：只订阅、只统计，不改任何状态
+# 2) 系统层验收（容器里，mission + voice 全链路）
+bash sim/system.sh start
+bash sim/system.sh status                 # mode / 跟随放行 / 急停 / 仲裁源 / 亮度
+bash sim/p2.sh spawn && bash sim/p2.sh start
+bash sim/system.sh status                 # 人出现后应为 mode=FOLLOW, follow=true
+bash sim/system.sh listen 把灯打开          # 语音 → 灯（/led/brightness 0 → 0.85）
+bash sim/system.sh listen 不要再跟着我了     # 语义正确性：必须停、不能朝人开
+bash sim/system.sh listen 急停              # 语音急停：mission=ESTOP + mux=estop
+bash sim/system.sh listen 解除急停           # 解锁不能被理解成加锁
+bash sim/system.sh estop / clear_estop     # CLI 闭环确认（两边都到位才报成功）
+
+# 3) 现场探针：只订阅、只统计，不改任何状态
 #    （容器里 ros2 topic echo 不可靠，验收用这个而不是 CLI）
 docker cp sim/probe.py sim:/tmp/probe.py
 docker exec sim bash -lc "source /opt/ros/jazzy/setup.bash; \
   source /home/ros/linorobot2_ws/install/setup.bash; python3 /tmp/probe.py 20"
 
-# 3) 相机断流（验证 fail-safe 真的会触发）
+# 4) 相机断流（验证 fail-safe 真的会触发）
 docker exec sim bash -lc "source /opt/ros/jazzy/setup.bash; \
   source /home/ros/linorobot2_ws/install/setup.bash; \
   ros2 topic hz /camera/color/image_raw"     # 先记下正常频率，再把相机进程 SIGSTOP
@@ -111,3 +147,10 @@ docker exec sim bash -lc "source /opt/ros/jazzy/setup.bash; \
 
 > 注意：`ros2 topic echo` 在本容器里不稳定（订阅不到，而直接写 rclpy 的探针能收到），
 > 验收时用探针而不是 CLI。
+>
+> 更要紧的一条：**`ros2 topic pub` 的短突发会丢，而且丢包是按订阅者发生的**。
+> 实测 `-r 10 -t 6`（0.6s）连发 5 轮，`/safety/estop` 只到了 1 轮；更糟的是出现过
+> `twist_mux` 收到了、`lightdog_mission` 没收到 —— 一个锁上、一个还自以为能动。
+> 根因是 CLI 发布进程发完就退，RELIABLE 的样本还没被所有订阅者 ACK 就析构了。
+> 所以：**脚本里的每条命令都要「发 → 读回 → 不行再发」**，`sim/system.sh` 已经
+> 按这个原则改过；生产路径上的急停必须由常驻节点发（语音 / server / 固件桥接）。

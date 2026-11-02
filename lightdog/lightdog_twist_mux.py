@@ -60,7 +60,7 @@ Nav2 的运动节点整个 kill 掉，代价是**丢了碰撞保护**。车装�
 真机 RTF≈1 时 k×周期小于配置值，行为与固定窗口完全一致。
 
 这仍然只是软件兜底。真正的刹车必须由 MCU 固件做：300ms 收不到速度指令
-就断 PWM。参见 P6 的「真机安全」一节。
+就断 PWM。参见 `docs/firmware_protocol.md`。
 
 超时用**墙钟**（`time.monotonic()`）而不是 ROS 时钟：这个窗口回答的是
 「上游还在不在发包」，与仿真跑多快无关。本机软件渲染实时因子只有 0.22x，
@@ -68,8 +68,28 @@ Nav2 的运动节点整个 kill 掉，代价是**丢了碰撞保护**。车装�
 反过来 Nav2 空闲时 20Hz 的发包在墙上也只有约 4Hz，0.6s 窗口照样容得下。
 
 优先级高 ≠ 永久占用：跟随节点在人丢了以后仍在发零速，但 `*_timeout` 到点后
-（节点被停掉的情况下）它会掉出活跃集，Nav2 自然接管。要在回充时让出场，
-把跟随节点停掉（`enable_follow:=false`）或改优先级即可。
+（节点被停掉的情况下）它会掉出活跃集，Nav2 自然接管。要让它在回充/告警期间
+真正让出场，由 `lightdog_mission` 发 `/follow/enable=false`，跟随器会停发。
+
+## 安全闸：谁都不能在急停时动车
+
+仲裁之上还有两道硬闸（都在本节点里，因为它们必须作用在**唯一的**收口处）：
+
+- `/safety/estop`（Bool，**闭锁**）：人工急停。语音喊「急停」、手机端点按钮、
+  或者遥控器上的物理按钮（由固件上报）都往这里发 true。收到 true 后一直发零速，
+  直到显式收到 false —— 不做任何自动解除。
+- `/mission/hold_motion`（Bool，**跟随**）：调度层在跌倒告警确认/报警期间按住轮子。
+  它不是闭锁的：调度层每 1Hz 刷新，一旦它不再发（进程崩了），本节点就按
+  「没有这个闸」处理，不会把机器人永久冻住。
+
+两者分开是为了避免「两个写者互相清对方的状态」：人工急停只有人能解，
+告警按住只有调度层能解，各管一条话题。
+
+## 心跳
+
+`/safety/heartbeat` 每个仲裁周期发一次。固件侧该做的是：**300ms 收不到
+`/cmd_vel` 就断 PWM**。心跳用来区分「上位机还活着、只是故意发零速」和
+「上位机死了」—— 没有这个区分，一次 panic 就会让车带着最后一次速度冲出去。
 
 ## 为什么不用 twist_mux
 
@@ -90,8 +110,11 @@ ROS 生态里有现成的 `twist_mux`，但这个镜像里没装，而容器内 
     订阅  /cmd_vel_smoothed  geometry_msgs/Twist   Nav2（velocity_smoother 的输出）
     订阅  /cmd_vel_follow    geometry_msgs/Twist   跟随控制器
     订阅  /cmd_vel_dock      geometry_msgs/Twist   回充控制器
+    订阅  /safety/estop      std_msgs/Bool         人工急停（闭锁）
+    订阅  /mission/hold_motion std_msgs/Bool       调度层按住（告警期间）
     发布  /cmd_vel_muxed     geometry_msgs/Twist   仲裁结果（接 collision_monitor）
-    发布  /cmd_vel_mux_state std_msgs/String       当前生效的源名，用于观测
+    发布  /cmd_vel_mux_state std_msgs/String       当前生效的源名 / estop / hold
+    发布  /safety/heartbeat  std_msgs/Bool         给固件看门狗
 """
 
 import sys
@@ -100,8 +123,10 @@ import time
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from geometry_msgs.msg import Twist
+
+from lightdog_qos import SAFETY_QOS
 
 
 def clamp_speed(value, limit):
@@ -208,6 +233,11 @@ class TwistMux(Node):
         self.declare_parameter('out_topic', '/cmd_vel_muxed')
         self.declare_parameter('publish_rate', 20.0)
         self.declare_parameter('zero_on_idle', True)
+        # 安全闸（见文件头）。两条话题分开是为了让「人工急停」和「告警按住」
+        # 各有唯一写者，不会互相清状态。
+        self.declare_parameter('estop_topic', '/safety/estop')
+        self.declare_parameter('hold_topic', '/mission/hold_motion')
+        self.declare_parameter('heartbeat_topic', '/safety/heartbeat')
         # 平台物理上限，作用在**输出**上：任何上游（跟随 P 控制、Nav2、
         # docking_server）算错了，最终发给底层的速度都不会超过这里。
         # 0 表示不限制。真机上按电机实际能力设（本项目底盘建议 0.30 / 1.0）。
@@ -238,6 +268,17 @@ class TwistMux(Node):
 
         self.pub = self.create_publisher(Twist, str(p('out_topic').value), 10)
         self.pub_state = self.create_publisher(String, '/cmd_vel_mux_state', 10)
+        self.pub_beat = self.create_publisher(
+            Bool, str(p('heartbeat_topic').value), 10)
+
+        self.estop = False            # 闭锁：只有显式的 false 能解
+        self.hold = False             # 调度层按住：它停发就自动放开（见 _hold_stale）
+        self._hold_stamp = 0.0
+        self.hold_timeout = 3.0       # 必须 > 调度层 1Hz 的刷新周期
+        self.create_subscription(
+            Bool, str(p('estop_topic').value), self._on_estop, SAFETY_QOS)
+        self.create_subscription(
+            Bool, str(p('hold_topic').value), self._on_hold, 10)
 
         self.active_name = None       # 上一个周期的赢家，用来只打切换日志
         self._stale = False           # 上一个周期是否是「源活着但指令失效」
@@ -260,6 +301,44 @@ class TwistMux(Node):
     def _on_twist(self, msg: Twist, src: CmdVelSource):
         src.touch(time.monotonic(), msg)
 
+    def _on_estop(self, msg: Bool):
+        v = bool(msg.data)
+        if v != self.estop:
+            if v:
+                self.get_logger().warn(
+                    '急停闭锁（/safety/estop=true）-> 输出零速，直到显式解除')
+            else:
+                self.get_logger().info('急停已解除')
+        self.estop = v
+
+    def _on_hold(self, msg: Bool):
+        v = bool(msg.data)
+        if v != self.hold:
+            self.get_logger().info(
+                '调度层按住轮子（告警中）' if v else '调度层放开轮子')
+        self.hold = v
+        self._hold_stamp = time.monotonic()
+
+    def _gate(self, now):
+        """返回当前生效的安全闸名；没有闸返回 None。
+
+        hold 会过期：调度层崩了不会留下一个永久冻结的机器人。而 estop 不过期，
+        因为它是人按下去的 —— 只有人能取消。
+        """
+        if self.estop:
+            return 'estop'
+        if self.hold:
+            if self._hold_stamp > 0.0 and \
+                    (now - self._hold_stamp) > self.hold_timeout:
+                self.hold = False
+                self._hold_stamp = 0.0
+                self.get_logger().error(
+                    f'{self.hold_timeout:.1f}s 没收到 /mission/hold_motion，'
+                    f'判定调度层已退出，解除按住（请检查 lightdog_mission）')
+                return None
+            return 'hold'
+        return None
+
     # ---------- 仲裁 ----------
 
     def _pick(self):
@@ -274,6 +353,22 @@ class TwistMux(Node):
 
     def _tick(self):
         now = time.monotonic()
+
+        # 心跳：给固件看门狗区分「上位机活着、故意零速」和「上位机死了」。
+        # 每拍都发（20Hz），MCU 侧 300ms 收不到就断 PWM。
+        self.pub_beat.publish(Bool(data=True))
+
+        gate = self._gate(now)
+        if gate is not None:
+            # 安全闸优先于一切源，且**必须**发零速（不受 zero_on_idle 影响）。
+            if self.active_name != gate:
+                self.get_logger().warn(f'安全闸 {gate} 生效 -> 输出零速')
+                self.active_name = gate
+                self._stale = False
+            self.pub_state.publish(String(data=gate))
+            self.pub.publish(Twist())
+            return
+
         best = self._pick()
         name = best.name if best is not None else 'idle'
 

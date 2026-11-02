@@ -478,4 +478,18 @@ bash sim/p5.sh probe                  # 告警 HTTP 接口自检
 bash sim/p5.sh log                    # 状态机日志
 ```
 
+## 与系统层的衔接（后补）
+
+P5 原来只发 `/alert/state` 和 `/alert/voice` 两个话题，**没有任何人消费**：
+Car 该做什么、该说什么，都不归它管。现在接上了：
+
+| 话题 | 消费者 | 行为 |
+|---|---|---|
+| `/alert/state` | `lightdog_mission` | `CONFIRMING / ALARM / ACKED` 期间 → `mode=ALERT_HOLD`：收回跟随、**按住轮子**、取消导航目标（人可能正躺在这条路径上）。5s 收不到状态就自动放开，避免告警节点崩了把车锁死 |
+| `/alert/voice` | `lightdog_voice` | 转发到 `/voice/say`；`tts_command` 非空时直接起 TTS 子进程。1.5s 内同一句不重复播（告警状态机 1Hz 刷新，否则会念 20 遍） |
+
+注意「按住」和「急停」是两条通道：按住会过期（3s），急停不会。
+告警属于「按一下等确认」，不属于「人按了刹车」，所以用前者 ——
+具体取舍见 [P6_system_layer.md](P6_system_layer.md) §五。
+
 > 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。

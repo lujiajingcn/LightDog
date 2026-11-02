@@ -1,0 +1,62 @@
+# LightDog 系统层参数（任务调度 + 语音链路）
+#
+# 这两个节点不负责具体功能，只负责「谁来控制车」和「人说的话怎么变成动作」。
+# 它们必须在 P2/P3/P5 之前或同时起来：调度层不在时，跟随和导航会互相压着。
+
+/lightdog_mission:
+  ros__parameters:
+    # 决策周期。2Hz 足够：所有输入都是 1~10Hz 的状态量，再快只是空转。
+    tick_hz: 2.0
+    # 三个「输入是否还新鲜」的窗口（全部墙钟，与 use_sim_time 无关）。
+    # 缺了它们，上游一死，最后的 true/DOCKED 会永久粘住。
+    person_timeout: 2.0
+    dock_state_timeout: 5.0
+    alert_timeout: 5.0
+
+    auto_mode: true
+    follow_enabled: true
+
+    # 巡游默认关（场景 3）。打开后按 map 坐标循环走，有人出现立刻中断去跟随。
+    # 路点写成一条字符串："x,y,yaw; x,y,yaw"（yaw 可省）。
+    # 不用字符串数组参数，是因为空数组在 ROS 2 里推不出类型，节点会起不来。
+    patrol_enabled: false
+    patrol_waypoints: ''          # 例：'1.0,0.5,0.0; -1.0,0.5,3.14'
+    patrol_dwell: 5.0             # 每个点停留几秒
+
+    # ---- 低电回桩接近 ----
+    # 这个阈值**必须**大于 p3_params.yaml 的 low_ratio(0.25)：本节点只负责
+    # 「把车送到桩前」，最后 3 米的对准与停靠仍归 dock_manager（P3 已验证）。
+    # 两者同时命中时 dock_manager 赢，本节点立刻取消导航让出。
+    dock_approach: true
+    approach_ratio: 0.35
+    clear_ratio: 0.45             # 回到这个值以上才解除，避免在阈值上抖
+    approach_confirm: 5.0         # 持续低电这么久才动（滤掉瞬时压降）
+    approach_retry_cooldown: 60.0
+    approach_timeout: 180.0
+
+    # 桩在 **map** 系下的位姿。仿真值 = 世界系 (-2.3, 0.5) 减去出生点 (-1.8, 0.5)。
+    # 真机上从建好的地图里量（或让 dock_manager 报一次 /detected_dock_pose 反算）。
+    # 填错的后果：导航到错的地方，然后 ArUco 找不到 marker -> 停靠失败重试。
+    dock_pose_x: -0.5
+    dock_pose_y: 0.0
+    dock_pose_yaw: 0.0
+    staging_distance: 1.0         # 停在桩前多远（marker 在这个距离上约 28px）
+    map_frame: map
+
+    follow_enable_topic: /follow/enable
+    hold_topic: /mission/hold_motion
+    nav_action: /navigate_to_pose
+
+/lightdog_voice:
+  ros__parameters:
+    command_topic: /voice/command     # 外部 ASR 把文本/JSON 发到这里
+    say_topic: /voice/say             # 外部 TTS 订阅这里
+    alert_voice_topic: /alert/voice   # P5 已经发出来的「要机器人说的话」
+    # 非空时直接起子进程合成；{text} 会被替换。例：
+    #   tts_command: espeak-ng -v zh "{text}"
+    # 留空 = 只发 /voice/say 话题 + 记日志（仿真默认，也便于换成云 TTS）。
+    tts_command: ''
+    tts_dedupe: 1.5        # 同一句话多久内不重复播（告警状态机 1Hz 刷新）
+    tts_max_len: 200
+    tts_timeout: 10.0
+    estop_topic: /safety/estop

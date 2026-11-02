@@ -21,6 +21,16 @@ install(PROGRAMS
   lightdog_server.py
   lightdog_fall_detector.py
   lightdog_alert_manager.py
+  lightdog_mission.py
+  lightdog_voice.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# 共享的最简模块（不是可执行节点）。装在同一个目录下，各节点用
+# `from lightdog_qos import SAFETY_QOS` 就能拿到 —— 脚本自身的目录本来
+# 就在 sys.path[0]，不需要额外的 package 结构。
+install(FILES
+  lightdog_qos.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

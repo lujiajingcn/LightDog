@@ -265,13 +265,15 @@ def make_light():
     d._warned_stall = False
     d.level = d.idle_level
     d.target = d.idle_level
+    d.override = None
     d.pub = Pub()
     d.log = Log()
     d.wall = wall
     d.get_logger = lambda: d.log
     bind(d, extract_methods(
-        LIGHT, 'LightAuto', {'_tick', '_on_present'},
-        ns={'time': wall, 'math': math, 'Bool': Msg, 'Float32': Msg}))
+        LIGHT, 'LightAuto', {'_tick', '_on_present', '_on_mode'},
+        ns={'time': wall, 'math': math, 'Bool': Msg, 'Float32': Msg,
+            'String': Msg}))
     return d
 
 

@@ -86,14 +86,21 @@ def make_mux():
     m._warned_clamp = False
     m.pub = Pub()
     m.pub_state = Pub()
+    m.pub_beat = Pub()
     m.active_name = None
     m._stale = False
+    m.estop = False
+    m.hold = False
+    m._hold_stamp = 0.0
+    m.hold_timeout = 3.0
     m.log = Log()
     m.get_logger = lambda: m.log
     clamp = extract_funcs(MUX, {'clamp_speed'})['clamp_speed']
     bind(m, extract_methods(MUX, 'TwistMux',
-                            {'_tick', '_pick', '_on_twist'},
+                            {'_tick', '_pick', '_on_twist', '_gate',
+                             '_on_estop', '_on_hold'},
                             ns={'time': time, 'Twist': Twist, 'String': String,
+                                'Bool': Bool,
                                 'CmdVelSource': Src, 'clamp_speed': clamp}))
     return m
 
@@ -111,6 +118,12 @@ def make_follower():
     f.expected_frame = 'base_link'
     f._warned_frame = ''
     f._warned_pos = False
+    # 调度层放行开关：None = 没收到过，按自身 enabled 工作
+    f.enable_cmd = None
+    f.enable_stamp = 0.0
+    f.enable_timeout = 5.0
+    f._warned_enable = False
+    f._silent = False
     f.timeout = 1.5
     f.target = 1.20
     f.tol = 0.15
@@ -127,7 +140,8 @@ def make_follower():
     f.get_logger = lambda: f.log
     bind(f, extract_methods(FOLLOWER, 'PersonFollower',
                             {'_tick', '_person_lost', '_check_frame',
-                             '_on_present', '_on_pos', '_on_inhibit'},
+                             '_follow_gate', '_on_present', '_on_pos',
+                             '_on_inhibit', '_on_enable'},
                             ns={'time': time, 'math': __import__('math'),
                                 'Twist': Twist, 'Bool': Bool,
                                 'PointStamped': PointStamped}))

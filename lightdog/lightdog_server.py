@@ -28,6 +28,9 @@ aiohttp 一个都装不上，`http.server` 是唯一选择。这不是妥协 —
     GET  /api/v1/events/<id>            事件元数据
     GET  /api/v1/events/<id>/video      事件视频（支持 Range）
     GET  /api/v1/events/<id>/thumb.jpg  事件缩略图
+    GET  /api/v1/alarms                告警历史 + 当前
+    GET  /api/v1/events/stream          SSE 事件流（替代轮询 /status）
+    POST /api/v1/estop                  急停 {on: true|false}
     GET  /api/v1/clips                  环形分段列表
     GET  /api/v1/clips/<name>           分段视频（支持 Range）
     GET  /api/v1/snapshots              快照列表
@@ -70,6 +73,8 @@ from ament_index_python.packages import get_package_share_directory
 
 from sensor_msgs.msg import BatteryState, Image
 from std_msgs.msg import Bool, Float32, String
+
+from lightdog_qos import SAFETY_QOS
 
 
 MIME = {
@@ -232,9 +237,18 @@ class LightDogServer(Node):
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('battery_topic', '/battery_state')
         self.declare_parameter('alert_topic', '/alert/state')
+        self.declare_parameter('estop_topic', '/safety/estop')
         self.declare_parameter('jpeg_quality', 75)
         self.declare_parameter('stream_fps', 10.0)      # 推流上限（不是相机帧率）
         self.declare_parameter('device_name', 'LightDog')
+        # 可选 HTTPS。两个都填才生效；局域网里手机第一次访问会提示证书
+        # 不受信任 —— 这是自签名的必然，不是配置错误。
+        # 真机出公网必须走这个（或前面挂反向代理），明文 HTTP 只适合家里。
+        self.declare_parameter('ssl_certfile', '')
+        self.declare_parameter('ssl_keyfile', '')
+        # SSE 事件流的推送周期（秒）。它替代手机端 1Hz 轮询 /status，
+        # 没有新数据时只发心跳注释，省电也省日志。
+        self.declare_parameter('sse_interval', 1.0)
 
         p = self.get_parameter
         self.host = str(p('http_host').value)
@@ -245,6 +259,9 @@ class LightDogServer(Node):
         self.quality = int(p('jpeg_quality').value)
         self.stream_fps = max(0.5, float(p('stream_fps').value))
         self.device_name = str(p('device_name').value)
+        self.ssl_certfile = str(p('ssl_certfile').value).strip()
+        self.ssl_keyfile = str(p('ssl_keyfile').value).strip()
+        self.sse_interval = max(0.2, float(p('sse_interval').value))
 
         web = str(p('web_dir').value)
         if not web:
@@ -272,6 +289,7 @@ class LightDogServer(Node):
         self.person_present = False
         self.mux_source = ''
         self.alert = {}              # /alert/state（P5 告警状态机）
+        self.mission = {}            # /mission/state（调度层模式）
         self._alert_logged = ''      # 已经落盘过的最新 (alarm_id, state)
 
         sensor_qos = QoSProfile(depth=1,
@@ -286,9 +304,15 @@ class LightDogServer(Node):
         self.create_subscription(Bool, '/person/present', self._on_person, 5)
         self.create_subscription(String, '/cmd_vel_mux_state', self._on_mux, 5)
         self.create_subscription(String, str(p('alert_topic').value), self._on_alert, 10)
+        self.create_subscription(String, '/mission/state', self._on_mission, 5)
 
         self.pub_event = self.create_publisher(String, '/recorder/event', 10)
         self.pub_alert_cmd = self.create_publisher(String, '/alert/command', 10)
+        # 急停只有两个写者：手机端按钮和语音。它必须能独立于告警链路工作
+        # （告警节点挂了也不能影响人工刹车）。用 SAFETY_QOS 是因为急停是
+        # 闭锁状态而不是事件：节点重启后也必须能拿回「已经急停」这个事实。
+        self.pub_estop = self.create_publisher(
+            Bool, str(p('estop_topic').value), SAFETY_QOS)
 
         self.get_logger().info(
             f'LightDog server: http://{self._lan_ip()}:{self.port}/ '
@@ -328,6 +352,14 @@ class LightDogServer(Node):
 
     def _on_person(self, msg: Bool):
         self.person_present = bool(msg.data)
+
+    def _on_mission(self, msg: String):
+        try:
+            st = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if isinstance(st, dict):
+            self.mission = st
 
     def _on_mux(self, msg: String):
         self.mux_source = msg.data.strip('"')
@@ -457,6 +489,7 @@ class LightDogServer(Node):
             'dock': {'state': self.dock.get('state', '')},
             'person': {'present': self.person_present},
             'motion': {'source': self.mux_source},
+            'mission': self.mission,
             'recorder': self.recorder,
             'storage': dict(self._disk(), clips=len(self._clips())),
             'contacts': len(cs),
@@ -851,6 +884,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'alarms': self.node.alarms(),
                                'current': self.node.current_alert()})
 
+        if path == '/api/v1/events/stream':
+            # 必须放在 /api/v1/events/<id> 之前，否则 'stream' 会被当成事件 id。
+            return self._stream_events()
+
         if path == '/api/v1/clips':
             return self._json({'clips': self.node._clips()})
 
@@ -945,6 +982,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/v1/events' and method == 'POST':
                 return self._post_event(raw)
 
+            if path == '/api/v1/estop' and method == 'POST':
+                return self._post_estop(raw)
+
             if path.startswith('/api/v1/alarms/') and method == 'POST':
                 return self._post_alarm_cmd(path[len('/api/v1/alarms/'):].strip('/'))
 
@@ -992,6 +1032,75 @@ class Handler(BaseHTTPRequestHandler):
         self.node.pub_event.publish(msg)
         self.node.get_logger().info(f'HTTP 触发事件：{msg.data}')
         return self._json({'ok': True, 'queued': req}, 202)
+
+    def _post_estop(self, raw):
+        """手机端急停。默认值是 true —— 空 body 的 POST 必须是「刹车」。
+
+        这条接口刻意不经过调度层：告警节点或调度层自己挂了的时候，
+        人还是得能把车停下来。
+        """
+        try:
+            req = json.loads(raw or b'{}')
+        except Exception:
+            req = {}
+        if not isinstance(req, dict):
+            req = {}
+        on = req.get('on', True)
+        if isinstance(on, str):
+            on = on.strip().lower() not in ('0', 'false', 'off', 'no', '')
+        else:
+            on = bool(on)
+        self.node.pub_estop.publish(Bool(data=on))
+        self.node.get_logger().warn(
+            f'HTTP 急停：{"闭锁（轮子已锁）" if on else "解除"}')
+        return self._json({'ok': True, 'estop': on})
+
+    def _stream_events(self):
+        """Server-Sent Events：只在新数据变化时推，否则每周期发一行注释心跳。
+
+        为什么用 SSE 而不是 WebSocket：标准库没有 ws（这个镜像也装不了），
+        而 SSE 就是「长连接 + text/event-stream」，`http.server` 一行就够。
+        手机端用 `new EventSource(url?token=...)` 直接消费，断线自己重连。
+
+        注意 `EventSource` **不能带自定义 header**，所以 token 只能走 query ——
+        这与 `_authed()` 支持的三种方式里的第一种正好对上。
+        """
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'close')
+        # 前面若挂了 nginx，不加这个会把流缓冲成一坨，手机上表现为「不动」
+        self.send_header('X-Accel-Buffering', 'no')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        try:
+            self.wfile.write(b'retry: 3000\n\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        last = None
+        try:
+            while True:
+                payload = {
+                    'status': self.node.status(),
+                    'current': self.node.current_alert(),
+                    'motion': self.node.mux_source,
+                    'mission': self.node.mission,
+                }
+                body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                if body != last:
+                    # 一行 data: 里不能有裸换行，json.dumps 已经保证这点
+                    self.wfile.write(f'data: {body}\n\n'.encode('utf-8'))
+                    last = body
+                else:
+                    self.wfile.write(b': keep-alive\n\n')
+                self.wfile.flush()
+                time.sleep(self.node.sse_interval)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def _post_alarm_cmd(self, action):
         """手机端对告警的三个动作：确认已知晓 / 测试 / 复位。
@@ -1092,17 +1201,36 @@ def main(args=None):
     httpd.daemon_threads = True
     httpd.node = node
 
+    # 可选 TLS。证书有问题时**直接不启动**：宁可没有画面，也不要悄悄退化成
+    # 明文（那等于把「以为已经加密」这个错觉卖给用户）。
+    if node.ssl_certfile and node.ssl_keyfile:
+        import ssl
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(node.ssl_certfile, node.ssl_keyfile)
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            node.get_logger().info('已启用 HTTPS（自签名证书，手机会提示不受信任）')
+        except Exception as e:
+            httpd.server_close()
+            node.get_logger().fatal(f'HTTPS 启用失败，拒绝以明文启动：{e}')
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+            return 2
+
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
     node.get_logger().info(f'监听 {node.host}:{node.port}')
+    scheme = 'https' if (node.ssl_certfile and node.ssl_keyfile) else 'http'
     if node.token:
         node.get_logger().info(
-            f'手机访问：http://{node._lan_ip()}:{node.port}/?token={node.token}')
+            f'手机访问：{scheme}://{node._lan_ip()}:{node.port}/?token={node.token}')
     else:
         node.get_logger().warn(
             f'未设置 auth_token —— 同一网络下任何人都能看画面。'
-            f'仿真无妨，真机务必设置。手机访问：http://{node._lan_ip()}:{node.port}/')
+            f'仿真无妨，真机务必设置。手机访问：{scheme}://{node._lan_ip()}:{node.port}/')
 
     try:
         httpd.serve_forever()

@@ -40,6 +40,11 @@ command_timeout 一群发布者，跟随指令会被它们的空闲零速淹没�
 4. 坐标的 frame_id 必须是 expected_frame（默认 base_link）。检测器换实现
    （比如换 YOLO 后改成发 camera_link）时宁可停住，也不能把别的坐标系下的
    点当成 base_link 的 x/y 去算速度 —— 那是一脚油门直奔墙。
+5. 调度层说「现在不该你说话」时，**先发一条零速、然后彻底停发**。
+   停发不是省事，是让 twist_mux 的 follow 源在超时后掉出活跃集，Nav2 才接得上
+   （P2 §7.8：跟随节点一直发零速会永久压住导航）。而停发前那条零速也不能省：
+   否则 mux 会把缓存里最后一条非零指令继续转发最多 `follow_hold` 秒。
+   这个门是**带超时**的 —— 调度层崩了，5 秒后回落到本节点自己的 `enabled`。
 """
 
 import math
@@ -76,6 +81,10 @@ class PersonFollower(Node):
         # true 会永远留在跟随器里 —— 表现为「跟随彻底不工作，日志里什么都没有」。
         # 超过这个墙钟时间没再收到 inhibit 就视为回充已结束（并打一条 error）。
         self.declare_parameter('inhibit_timeout', 5.0)
+        # 调度层的放行开关。它崩了以后必须能自己回到「按 enabled 工作」，
+        # 否则一次 OOM 就把跟随永久关掉，而日志里什么都不会有。
+        self.declare_parameter('enable_topic', '/follow/enable')
+        self.declare_parameter('follow_enable_timeout', 5.0)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel_follow')
         self.declare_parameter('enabled', True)
 
@@ -92,6 +101,7 @@ class PersonFollower(Node):
         self.timeout = float(p('person_timeout').value)
         self.expected_frame = str(p('expected_frame').value).lstrip('/')
         self.inhibit_timeout = float(p('inhibit_timeout').value)
+        self.enable_timeout = float(p('follow_enable_timeout').value)
         self.enabled = bool(p('enabled').value)
 
         self.person = None            # 最新一次人位置
@@ -111,10 +121,17 @@ class PersonFollower(Node):
         self.inhibit_stamp = 0.0      # 最后一条 /dock/inhibit 的墙钟时刻
         self._warned_frame = ''       # 已报过的 frame_id（避免每拍刷日志）
         self._warned_pos = False
+        # 调度层放行开关：None = 从没收到过（按自身 enabled 工作）
+        self.enable_cmd = None
+        self.enable_stamp = 0.0
+        self._warned_enable = False
+        self._silent = False          # 已经停发（只用来保证「零速只发一次」）
 
         self.create_subscription(PointStamped, '/person/position', self._on_pos, 10)
         self.create_subscription(Bool, '/person/present', self._on_present, 10)
         self.create_subscription(Bool, '/dock/inhibit', self._on_inhibit, 10)
+        self.create_subscription(
+            Bool, str(p('enable_topic').value), self._on_enable, 10)
         self.cmd_topic = str(p('cmd_vel_topic').value)
         self.pub = self.create_publisher(Twist, self.cmd_topic, 10)
 
@@ -143,6 +160,14 @@ class PersonFollower(Node):
                 '回充占用中，跟随让位' if msg.data else '回充结束，跟随恢复')
         self.inhibited = bool(msg.data)
         self.inhibit_stamp = time.monotonic()
+
+    def _on_enable(self, msg: Bool):
+        v = bool(msg.data)
+        if v != self.enable_cmd:
+            self.get_logger().info(
+                '调度层放行：恢复跟随' if v else '调度层收回控制权：停止跟随')
+        self.enable_cmd = v
+        self.enable_stamp = time.monotonic()
 
     # ---------- 控制 ----------
 
@@ -200,8 +225,44 @@ class PersonFollower(Node):
                 f'或让检测器在发布前先变换到 {want}）')
         return False
 
+    def _follow_gate(self) -> bool:
+        """调度层是否允许本节点控制底盘。
+
+        没收到过 `/follow/enable` 时按自己的 `enabled` 参数工作 —— 这样单独跑
+        跟随（不带调度层）时行为与以前完全一致，不至于一升级就「车不动了」。
+        """
+        if not self.enabled:
+            return False
+        if self.enable_cmd is None:
+            return True
+        if self.enable_cmd:
+            return True
+        silent = time.monotonic() - self.enable_stamp
+        if silent <= self.enable_timeout:
+            return False
+        # 调度层不再刷新了：宁可恢复跟随，也不能因为一个上游节点死掉就永久
+        # 失去跟随能力。安全由 mux 的零速兜底，不靠这里「一直关着」。
+        if not self._warned_enable:
+            self._warned_enable = True
+            self.get_logger().error(
+                f'{silent:.1f}s 没收到 /follow/enable，判定调度层已退出，'
+                f'回落到本节点的 enabled={self.enabled}（请检查 lightdog_mission）')
+        self.enable_cmd = None
+        self.enable_stamp = 0.0
+        return True
+
     def _tick(self):
         cmd = Twist()
+
+        if not self._follow_gate():
+            # 先发一条零速，然后彻底停发。理由见文件头第 5 条：
+            # 不停发 -> mux 的 follow 源永远活跃 -> Nav2 永远拿不到方向盘。
+            if not self._silent:
+                self.pub.publish(cmd)
+                self._silent = True
+            return
+        self._silent = False
+        self._warned_enable = False
 
         inhibited = self.inhibited
         if inhibited and self.inhibit_stamp > 0.0:

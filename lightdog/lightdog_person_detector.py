@@ -132,6 +132,16 @@ class PersonDetector(Node):
         # ---- 相机安装偏移（base_link 下的 x,y,z），见文件头注释 ----
         self.declare_parameter('camera_offset', [-0.065, 0.0, 0.255])
 
+        # ---- 检测后端 ----
+        # color = 仿真占位实现（认橙色上衣）；yolo = 真机用的人体检测。
+        # 换后端**不改**输出契约：仍然是 /person/present + /person/position
+        # （frame=base_link）。几何换算两边共用，见 _bbox_to_point。
+        self.declare_parameter('backend', 'color')
+        self.declare_parameter('yolo_model', 'yolov8n.pt')
+        self.declare_parameter('yolo_conf', 0.35)
+        # COCO 里 person = 0。设 -1 表示不限类别（换自训练模型时用）。
+        self.declare_parameter('yolo_person_class', 0)
+
         # ---- 颜色判据（HSV 归一化 0~1；橙色上衣实测 H≈0.052）----
         self.declare_parameter('h_min', 0.012)
         self.declare_parameter('h_max', 0.090)
@@ -166,6 +176,21 @@ class PersonDetector(Node):
 
         p = self.get_parameter
         self.cam_off = list(p('camera_offset').value)
+        self.backend = (str(p('backend').value).strip().lower() or 'color')
+        self.yolo_conf = float(p('yolo_conf').value)
+        self.yolo_person_class = int(p('yolo_person_class').value)
+        self._yolo_model = None
+        self._warned_yolo = False
+        if self.backend == 'yolo':
+            self._yolo_model = self._load_yolo(str(p('yolo_model').value))
+            if self._yolo_model is None:
+                # 回退而不是崩：仿真环境里没有 torch，假装成 yolo 只会让
+                # 整个 P2 链路「启动成功但永远无人」。
+                self.backend = 'color'
+        elif self.backend != 'color':
+            self.get_logger().error(
+                f'未知 backend={self.backend!r}（只认 color / yolo），按 color 运行')
+            self.backend = 'color'
         self.h_min, self.h_max = p('h_min').value, p('h_max').value
         self.s_min = float(p('s_min').value)
         self.v_min = float(p('v_min').value)
@@ -219,10 +244,38 @@ class PersonDetector(Node):
 
         self.get_logger().info(
             'LightDog person detector ready: '
+            f'backend={self.backend} '
             f'H=[{self.h_min:.3f},{self.h_max:.3f}] S>{self.s_min} V>{self.v_min} '
             f'range=[{self.rng_min},{self.rng_max}]m '
             f'aspect_min={self.aspect_min} min_h={self.min_h}px '
             f'frame_timeout={self.frame_timeout:.1f}s')
+
+    # ---------- 后端加载 ----------
+
+    def _load_yolo(self, path):
+        """加载 YOLO 模型；任何失败都返回 None，由调用方回退到 color。
+
+        这里刻意把 import 放在函数里：仿真镜像没装 ultralytics/torch，
+        模块级 import 会让整个节点起不来，连「回退到颜色」的机会都没有。
+        """
+        try:
+            from ultralytics import YOLO
+        except ImportError as e:
+            self.get_logger().error(
+                f'backend=yolo 但无法 import ultralytics（{e}）。'
+                f'已回退到 color —— 注意颜色判据认的是橙色上衣，'
+                f'真机上必须 pip install ultralytics 并准备好模型')
+            return None
+        try:
+            model = YOLO(path)
+        except Exception as e:
+            self.get_logger().error(
+                f'加载 YOLO 模型 {path!r} 失败（{e}），已回退到 color')
+            return None
+        self.get_logger().info(
+            f'检测后端 = YOLO({path}) conf={self.yolo_conf} '
+            f'class={self.yolo_person_class}')
+        return model
 
     # ---------- 回调 ----------
 
@@ -318,23 +371,40 @@ class PersonDetector(Node):
         self.pub_present.publish(Bool(data=present))
 
     def _detect(self):
-        """返回 (x_fwd, y_left, z_height, bbox) 或 None。bbox=(u0,v0,u1,v1)。"""
+        """返回 (x_fwd, y_left, z_height, bbox) 或 None。bbox=(u0,v0,u1,v1)。
+
+        后端只负责「人的外接框」；从框到 3D 点的几何换算（深度 / 内参 /
+        相机到 base_link 的平移）两侧共用。换检测模型时不需要重做那一半，
+        也就不会顺手把 frame 语义改错 —— 那是最难查的一类回归。
+        """
         rgb = image_to_rgb(self.rgb)
         if rgb is None:
             return None
-        h, w, _ = rgb.shape
+        if self.backend == 'yolo':
+            bbox, mask = self._bbox_yolo(rgb), None
+        else:
+            bbox, mask = self._bbox_color(rgb)
+        if bbox is None:
+            return None
+        return self._bbox_to_point(rgb, bbox, mask)
 
+    def _bbox_color(self, rgb):
+        """颜色判据：返回 (bbox, mask) 或 (None, None)。
+
+        这是**仿真占位实现**（认高饱和橙色上衣），真机请把 backend 设成 yolo。
+        接口契约不在这里，而在「发布 base_link 下的人位置」这件事上。
+        """
         hh, ss, vv = rgb_to_hsv(rgb)
         mask = ((hh >= self.h_min) & (hh <= self.h_max) &
                 (ss >= self.s_min) & (vv >= self.v_min))
         if not mask.any():
-            return None
+            return None, None
 
         # 列投影找纵向条带（允许小空隙，人身上可能有阴影/遮挡断开）
         col = mask.sum(axis=0)
         cols = np.where(col > 0)[0]
         if cols.size == 0:
-            return None
+            return None, None
 
         segments = []
         start = cols[0]
@@ -356,12 +426,12 @@ class PersonDetector(Node):
             if px > best_px:
                 best_px, best = px, (u0, u1)
         if best is None or best_px < self.min_blob:
-            return None
+            return None, None
 
         u0, u1 = best
         rows = np.where(mask[:, u0:u1 + 1].any(axis=1))[0]
         if rows.size == 0:
-            return None
+            return None, None
         v0, v1 = int(rows[0]), int(rows[-1])
 
         # 形状约束：站立的人是竖长条。这一条把「球形头」「地上一块橙色杂物」
@@ -372,7 +442,65 @@ class PersonDetector(Node):
         if bh < self.min_h or bh < self.aspect_min * bw:
             if self.publish_debug:
                 self._publish_debug(rgb, (u0, v0, u1, v1), False)
+            return None, None
+
+        return (u0, v0, u1, v1), mask
+
+    def _bbox_yolo(self, rgb):
+        """YOLO 后端：返回人的外接框或 None。
+
+        依赖缺失时**不会**在上电后才发现：__init__ 里已经回退到 color 并打了
+        error。这里再判一次是为了防御模型加载后被卸载/推理库半死的情况。
+        多个框时取面积最大的（与颜色后端「取最大条带」的行为一致）。
+        """
+        if self._yolo_model is None:
             return None
+        h, w = rgb.shape[:2]
+        try:
+            # ultralytics 吃 BGR；rgb[:, :, ::-1] 是视图，转成连续内存再进推理，
+            # 否则某些版本会在内部拷贝时抛 not contiguous。
+            frame = np.ascontiguousarray(rgb[:, :, ::-1])
+            res = self._yolo_model.predict(
+                frame, conf=self.yolo_conf, verbose=False)
+        except Exception as e:                       # 推理库内部异常不该打挂节点
+            if not self._warned_yolo:
+                self._warned_yolo = True
+                self.get_logger().error(f'YOLO 推理失败（{e}），本帧按无人处理')
+            return None
+
+        best, best_area = None, 0.0
+        for r in (res or []):
+            boxes = getattr(r, 'boxes', None)
+            if boxes is None:
+                continue
+            for b in boxes:
+                try:
+                    cls = int(b.cls[0])
+                    x1, y1, x2, y2 = [float(v) for v in b.xyxy[0]]
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    continue
+                if self.yolo_person_class >= 0 and cls != self.yolo_person_class:
+                    continue
+                area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                if area <= best_area:
+                    continue
+                best_area = area
+                best = (int(max(0, min(w - 1, x1))), int(max(0, min(h - 1, y1))),
+                        int(max(0, min(w - 1, x2))), int(max(0, min(h - 1, y2))))
+
+        if best is None:
+            return None
+        u0, v0, u1, v1 = best
+        # 形状/尺寸下限与颜色后端保持一致：贴脸（只剩一条横带）时别把
+        # 「一截腿」当成完整的人。min_h 是像素高度下限，两个后端共用。
+        if (u1 - u0 + 1) < 2 or (v1 - v0 + 1) < self.min_h:
+            return None
+        return best
+
+    def _bbox_to_point(self, rgb, bbox, mask):
+        """外接框 + 深度 -> base_link 下的 3D 点。两个后端共用这一段。"""
+        h, w, _ = rgb.shape
+        u0, v0, u1, v1 = bbox
 
         # 距离：掩码像素上的深度中位数（避开背景深度把目标拉远）
         z = None
@@ -383,9 +511,13 @@ class PersonDetector(Node):
                 and (time.monotonic() - self.depth_wall) <= self.depth_timeout):
             d = image_to_depth(dmsg)
             if d is not None and d.shape == (h, w):
-                sub_mask = mask[v0:v1 + 1, u0:u1 + 1]
                 sub_d = d[v0:v1 + 1, u0:u1 + 1]
-                vals = sub_d[sub_mask]
+                if mask is not None:
+                    # 颜色后端：只统计「人身上」的像素，避开框内的背景深度
+                    vals = sub_d[mask[v0:v1 + 1, u0:u1 + 1]]
+                else:
+                    # 模型后端没有掩膜：用整框（框比人略大，中位数仍然稳）
+                    vals = sub_d.reshape(-1)
                 vals = vals[np.isfinite(vals) & (vals > 0.05)]
                 if vals.size >= 20:
                     z = float(np.median(vals))

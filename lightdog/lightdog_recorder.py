@@ -48,6 +48,8 @@ SD 卡掉电、进程被杀、卡写满，都只毁掉当前正在写的这一�
 import json
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -127,6 +129,43 @@ def clamp_sec(value, low=0.0, high=300.0, default=10.0) -> float:
     return max(low, min(high, v))
 
 
+def faststart_remux(path, log=None):
+    """把 moov 原子挪到文件头（需要 ffmpeg）。成功返回 True。
+
+    只做 `-c copy`：不重编码，画质零损失，几毫秒到几十毫秒。
+    没有 ffmpeg、超时、或者输出异常一律返回 False —— 原文件保持不动，
+    因为「起播慢一点」远好过「为了优化把录像搞坏」。
+    """
+    exe = shutil.which('ffmpeg')
+    if not exe:
+        if log is not None:
+            log.warn('faststart 已开启但镜像里没有 ffmpeg，跳过重封装')
+        return False
+    tmp = path + '.fs.mp4'
+    ok = False
+    try:
+        r = subprocess.run(
+            [exe, '-hide_banner', '-loglevel', 'error', '-y',
+             '-i', path, '-c', 'copy', '-movflags', '+faststart', tmp],
+            capture_output=True, timeout=60.0)
+        if r.returncode == 0 and os.path.getsize(tmp) > 1024:
+            os.replace(tmp, path)
+            ok = True
+        elif log is not None:
+            err = (r.stderr or b'').decode('utf-8', 'replace').strip()
+            log.warn(f'faststart 重封装失败（保留原文件）：{err[:160]}')
+    except (OSError, subprocess.SubprocessError) as e:
+        if log is not None:
+            log.warn(f'faststart 重封装异常（保留原文件）：{e}')
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+    return ok
+
+
 class Recorder(Node):
 
     def __init__(self):
@@ -157,6 +196,12 @@ class Recorder(Node):
         self.declare_parameter('min_events', 20)      # 至少留这么多条，供最近的取证
         self.declare_parameter('max_snapshots', 200)  # 快照目录同样要封顶
         self.declare_parameter('codec', 'avc1')
+        # 事件视频的 moov 在文件尾（cv2 的写入顺序），iOS/Safari 起播要多一次
+        # 往返。打开这个开关会在合成后用 ffmpeg 做一次 `-c copy` 重封装，
+        # 把 moov 挪到文件头。**需要镜像里有 ffmpeg**；没有就静默跳过。
+        # 默认关：OpenCV 用 avc1 标签写 MPEG-4 Part 2 是常见怪癖，重封装后
+        # 仍要看播放器怎么解释，真机开之前先用手机实播一遍。
+        self.declare_parameter('faststart', False)
         self.declare_parameter('jpeg_quality', 80)
         # 环形缓冲的中间编码质量。这里**不是**最终画质（写盘时会重编一次），
         # 只是为了把常驻内存从 900KB/帧 压到 40KB/帧。给 92 留出二次编码余量。
@@ -179,6 +224,7 @@ class Recorder(Node):
         self.min_events = int(p('min_events').value)
         self.max_snapshots = int(p('max_snapshots').value)
         self.codec = str(p('codec').value)
+        self.faststart = bool(p('faststart').value)
         self.jpeg_quality = int(p('jpeg_quality').value)
         self.buffer_quality = int(p('buffer_jpeg_quality').value)
         self.recording = bool(p('recording').value)
@@ -652,6 +698,10 @@ class Recorder(Node):
 
         writer.release()
         os.replace(tmp, path)
+
+        if self.faststart:
+            if faststart_remux(path, self.get_logger()):
+                self.get_logger().info(f'{eid}: 已重封装为 faststart（moov 前置）')
 
         # 缩略图取最接近事发时刻的那一帧
         if thumb is not None:

@@ -48,6 +48,10 @@
 
     # avc1 = H.264。手机（尤其 iOS）只认这个；打不开会自动降级 mp4v 并报错日志。
     codec: avc1
+    # 事件视频重封装为 faststart（moov 前置），需要镜像里有 ffmpeg。
+    # 默认关：OpenCV 用 avc1 标签写 MPEG-4 Part 2 是常见怪癖，真机开之前
+    # 先用手机实播一遍确认没被重封装搞坏。
+    faststart: false
     jpeg_quality: 80
     # 环形缓冲里每帧 JPEG 的质量。这个值直接决定常驻内存：
     # 640x480、q=80 约 40KB/帧，720 帧上限 ≈ 28MB；调到 95 会翻倍以上，
@@ -79,3 +83,17 @@
     # 所以取 10 是为了真机 30Hz 场景留余量。
     stream_fps: 10.0
     device_name: LightDog
+
+    # 可选 HTTPS。两个都填才生效；证书有问题时**拒绝以明文启动**（宁可没画面，
+    # 也不要让用户以为已经加密）。自签证书手机会提示不受信任，这是必然的。
+    # 例：openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    #       -keyout key.pem -out cert.pem -subj "/CN=lightdog"
+    ssl_certfile: ''
+    ssl_keyfile: ''
+
+    # SSE 事件流（GET /api/v1/events/stream）的推送周期。手机端用它替代 1Hz
+    # 轮询 /status：只有数据变化才发 body，否则发一行注释心跳。
+    sse_interval: 1.0
+
+    # 急停话题。手机端 POST /api/v1/estop 往这里发，twist_mux 闭锁到显式解除。
+    estop_topic: /safety/estop

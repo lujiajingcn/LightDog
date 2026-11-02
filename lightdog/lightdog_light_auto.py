@@ -39,7 +39,7 @@ import time
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 
 
 class LightAuto(Node):
@@ -55,6 +55,10 @@ class LightAuto(Node):
         # 多久收不到 /person/present 就当作「检测器已经死了」（墙钟秒）。
         # 检测器正常时以 rate Hz 持续发（真机 10Hz、仿真 10Hz），3s 是 30 个周期。
         self.declare_parameter('present_timeout', 3.0)
+        # 语音/手机端的手动覆盖：auto | on | off。留空/auto = 回到自动逻辑。
+        # 这里是**覆盖**而不是另开一条亮度话题，是为了避免两个发布者同时往
+        # /led/brightness 灌值，最后谁生效取决于时序。
+        self.declare_parameter('mode_topic', '/light/mode')
         self.declare_parameter('enabled', True)
 
         p = self.get_parameter
@@ -73,8 +77,11 @@ class LightAuto(Node):
         self._warned_stall = False
         self.level = self.idle_level          # 当前实际下发值
         self.target = self.idle_level
+        self.override = None                  # None/auto | on | off
 
         self.create_subscription(Bool, '/person/present', self._on_present, 10)
+        self.create_subscription(
+            String, str(p('mode_topic').value), self._on_mode, 10)
         self.pub = self.create_publisher(Float32, '/led/brightness', 10)
 
         self.create_timer(1.0 / hz, self._tick)
@@ -89,6 +96,17 @@ class LightAuto(Node):
         self.msg_wall = time.monotonic()
         if self.present:
             self.last_seen = self.msg_wall
+
+    def _on_mode(self, msg: String):
+        m = str(msg.data).strip().lower()
+        if m in ('auto', ''):
+            self.override = None
+            self.get_logger().info('灯光：回到自动（跟随人体检测）')
+        elif m in ('on', 'off'):
+            self.override = m
+            self.get_logger().info(f'灯光：手动 {m.upper()}')
+        else:
+            self.get_logger().warn(f'未知灯光模式 {m!r}（只认 auto / on / off）')
 
     def _tick(self):
         if not self.enabled:
@@ -123,7 +141,11 @@ class LightAuto(Node):
             present = self.present
 
         # --- 目标亮度决策 ---
-        if present:
+        if self.override == 'on':
+            self.target = self.on_level
+        elif self.override == 'off':
+            self.target = 0.0
+        elif present:
             self.target = self.on_level
         elif self.last_seen is None:
             self.target = self.idle_level

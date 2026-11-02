@@ -115,6 +115,23 @@ if [ "${ENABLE_P5:-1}" = "1" ]; then
   echo "  P5 PID $P5_PID (log /tmp/p5.log)"
 fi
 
+# 6.7) 系统层：任务调度 + 语音链路
+#
+#      mission 决定「现在该谁说话」：有人 -> 跟随；低电 -> 先导航到桩前再回充；
+#      告警 -> 按住轮子。它不产生速度，但没它的话跟随会一直压着 Nav2
+#      （P2 §7.8），而且「从远处自己走回桩」根本没人负责（P3 边界之外）。
+#
+#      放在最后起：它一起来就会发 /follow/enable，而 P2 的跟随节点如果还没起，
+#      这条消息只是没人收 —— 反正跟随节点没收到过时按自己的 enabled 工作。
+SYS_PID=""
+if [ "${ENABLE_SYSTEM:-1}" = "1" ]; then
+  echo "=== Starting system layer (mission + voice) ==="
+  nohup ros2 launch lightdog lightdog_system.launch.py \
+      > /tmp/system.log 2>&1 &
+  SYS_PID=$!
+  echo "  system PID $SYS_PID (log /tmp/system.log)"
+fi
+
 
 # 7) Gazebo GUI（默认开）。两件事决定了这段必须放在 SLAM 之后：
 #    - 容器里 gz 只跑服务端，不拉 GUI 的话浏览器里只有 RViz，看不到车身和 LED
@@ -150,11 +167,12 @@ echo "  SLAM:   PID $SLAM_PID"
 echo "  Mux:    PID $MUX_PID (log /tmp/twist_mux.log)"
 echo "  P4:     PID ${P4_PID:-未启动} (log /tmp/p4.log)"
 echo "  P5:     PID ${P5_PID:-未启动} (log /tmp/p5.log)"
+echo "  System: PID ${SYS_PID:-未启动} (log /tmp/system.log)"
 
 echo "  LED log: /tmp/lightdog_led.log (via ros2 launch)"
 echo ""
 
 wait -n $SIM_PID $SLAM_PID
 echo "A process exited, shutting down..."
-kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} ${P4_PID:-} ${P5_PID:-} 2>/dev/null || true
+kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} ${P4_PID:-} ${P5_PID:-} ${SYS_PID:-} 2>/dev/null || true
 exit 0

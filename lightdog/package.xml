@@ -19,6 +19,9 @@
   <!-- dock_manager 用 nav2_msgs/DockRobot 与 UndockRobot。之前漏了这条，
        rosdep 装依赖时不会带上，真机上 docking 动作直接 import 失败。 -->
   <exec_depend>nav2_msgs</exec_depend>
+  <!-- mission 用 action_msgs/GoalStatus 判导航结果（SUCCEEDED/CANCELED），
+       它不随 nav2_msgs 一起被带上。 -->
+  <exec_depend>action_msgs</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>

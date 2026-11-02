@@ -13,6 +13,15 @@
     depth_topic: /camera/depth/image_rect_raw
     info_topic: /camera/color/camera_info
 
+    # 检测后端：color（仿真占位，认橙色上衣）/ yolo（真机）。
+    # 换后端不改输出契约（/person/present + /person/position，frame=base_link）。
+    # 真机用法：pip install ultralytics，放好模型，改 backend: yolo。
+    # 缺依赖时节点会报一条 error 并**自动回退到 color**，不会起不来。
+    backend: color
+    yolo_model: yolov8n.pt
+    yolo_conf: 0.35
+    yolo_person_class: 0     # COCO person=0；自训练模型给 -1 表示不限类别
+
     # 4wd 车型 depth_sensor_pose = xyz "-0.065 0 0.255" rpy "0 0 0"
     # 见 linorobot2_description/urdf/4wd_properties.urdf.xacro
     camera_offset: [-0.065, 0.0, 0.255]
@@ -61,6 +70,9 @@
     # 多久收不到 /person/present 就认为检测器已经死了（墙钟秒）。没有这个判据时
     # 检测器一崩，最后那条 present=True 会永久粘住，灯整夜亮着且无任何日志。
     present_timeout: 3.0
+    # 语音/手机端的手动覆盖（auto | on | off）。on/off 会压过人体检测，
+    # 直到收到 auto 才回到自动逻辑。
+    mode_topic: /light/mode
     enabled: true
 
 /lightdog_follower:
@@ -83,6 +95,11 @@
     # dock_manager 以 10Hz 发 /dock/inhibit；它挂了以后最后那条 true 会一直
     # 留在跟随器里，表现为「跟随彻底不工作」。超过这个时间没新消息就解除。
     inhibit_timeout: 5.0
+    # 调度层（lightdog_mission）的放行开关。收到 false 时先发一条零速再彻底停发，
+    # 这样 twist_mux 的 follow 源会超时掉出活跃集，Nav2 才接得上（P2 §7.8）。
+    # 调度层挂掉不再刷新时，超过 follow_enable_timeout 回落到本节点自己的 enabled。
+    enable_topic: /follow/enable
+    follow_enable_timeout: 5.0
     # 不直接发 /cmd_vel：交给 twist_mux 仲裁，再由 collision_monitor 兜碰撞
     cmd_vel_topic: /cmd_vel_follow
     enabled: true
@@ -120,6 +137,14 @@
     # （本项目底盘建议 0.30 / 1.0）。超速时会打一条 warn 并钳制。
     max_linear: 0.50
     max_angular: 1.50
+    # 安全闸（见 lightdog_twist_mux.py 文件头）。
+    # estop 是闭锁的：只有显式的 false 能解，语音/网页/物理按钮都往这里发。
+    # hold 是调度层的告警按住，它停发 3s 后自动放开（不会永久冻住车）。
+    estop_topic: /safety/estop
+    hold_topic: /mission/hold_motion
+    # 给固件看门狗的心跳。MCU 侧 300ms 收不到 /cmd_vel 就断 PWM，
+    # 心跳用来区分「上位机活着但故意零速」和「上位机死了」。
+    heartbeat_topic: /safety/heartbeat
 
 /lightdog_person_sim:
   ros__parameters:

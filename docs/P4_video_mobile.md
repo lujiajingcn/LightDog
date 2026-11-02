@@ -418,4 +418,19 @@ docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash; \
   换句话说，P5 要做的事是「判断 + 决定打给谁」，取画面和取证据这一步
   在 P4 已经闭环了。
 
+## 八、移动端体验与传输安全（后补）
+
+阶段验收之后又补了三处，都是「手机上真的用起来」才会暴露的问题：
+
+| 补的东西 | 解决什么 | 怎么用 |
+|---|---|---|
+| `GET /api/v1/events/stream`（SSE） | 手机端原来 1Hz 轮询事件列表，锁屏回来要等一轮才刷新，且轮询在弱网下会堆积请求 | `new EventSource('/api/v1/events/stream?token=...')`。**SSE 的 `EventSource` 不能自定义 header**，所以 token 只能走 query —— 这是规范限制，不是设计选择 |
+| 可选 HTTPS（`ssl_certfile` / `ssl_keyfile`） | WiFi 明文下同网段任何人都能看摄像头 | 配了证书就 `https://`。**证书读失败时服务直接退出（`return 2`）而不是退回明文** —— 静默降级比不加密更危险 |
+| `POST /api/v1/estop` | 手机上要能一键刹车，且不能因为告警节点挂了而失效 | 直接发 `/safety/estop`，**不经过调度层**。语义是闭锁，见 [P6_system_layer.md](P6_system_layer.md) §五 |
+| `faststart`（ffmpeg `-c copy -movflags +faststart`） | 录像的 `moov` 在文件尾，手机端边下边播要等整段下完 | 设为 `true` 即可，没装 ffmpeg 时**保留原文件**并记一条 warn，不影响录像本身 |
+
+SSE 的几个实现细节：响应头带 `X-Accel-Buffering: no`（否则反代会把流缓冲住），
+每条消息用 `data: {...}\n\n`，空闲时发 `: keep-alive` 注释行保活（有些代理
+60s 无数据就断）。`sse_interval` 默认 1.0s。
+
 > 上真机前请先过一遍 **[hardware_readiness.md](hardware_readiness.md)**（参数清单 / 失效矩阵 / 真机上不能跑的节点）。

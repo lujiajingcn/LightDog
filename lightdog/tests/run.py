@@ -26,6 +26,7 @@ GROUPS = [
     ('test_p2', 'P2 检测 / 跟随 / 仲裁'),
     ('test_p3', 'P3 回充状态机'),
     ('test_robustness', '真机健壮性：外部输入 / 传感器失效 / 充电确认'),
+    ('test_system', '系统层：模式仲裁 / 语音语义 / 急停闸'),
     ('test_consistency', '参数与版本一致性'),
 ]
 
