@@ -256,7 +256,7 @@ $ bash sim/system.sh listen 解除急停
 | 急停继承 | kill mission 后重启 | 0.8s 内 `收到急停闭锁` → `ESTOP` ✅ |
 | 语音解锁 | `system.sh listen 解除急停` | `mode=FOLLOW` ✅（没被理解成再加锁） |
 | CLI 闭环急停 | `system.sh estop` × 5 轮 | 5/5 确认（部分轮次需要重发 1~2 次）✅ |
-| 离线回归 | `python lightdog/tests/run.py` | 132 项全通过 |
+| 离线回归 | `python lightdog/tests/run.py` | 0 失败（项数以脚本末尾打印为准；宿主机上会跳过需要 `/proc`、gcc、`firmware/` 的几组） |
 
 ## 八、已知限制
 

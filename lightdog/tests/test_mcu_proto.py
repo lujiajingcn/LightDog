@@ -11,7 +11,11 @@
 """
 
 import os
+import random
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -238,6 +242,126 @@ class TestTypeTable(unittest.TestCase):
         self.assertEqual(frame[:4], P.SYNC + b'\x00\x03')
         self.assertEqual(len(frame), 6)
         self.assertEqual(P.Parser().feed(frame)[0].payload, b'')
+
+
+CROSS = os.path.join(REPO_ROOT, 'firmware', 'test', 'cross_stream.c')
+CORE = os.path.join(REPO_ROOT, 'firmware', 'core', 'lightdog_proto.c')
+GCC = shutil.which('gcc') or shutil.which('cc')
+
+
+def _mixed_stream():
+    """固定种子的混合流：合法帧 / 噪声 / CRC 错 / 截断，按 6 种循环。
+
+    噪声里刻意保留 0xAA（但让 0x55 跟上的概率很低），因为「数据里出现半个
+    SYNC」正是解析器最容易写错的地方；全避开 0xAA 的噪声太温柔。
+    """
+    rnd = random.Random(20261102)
+    parts = []
+    good = []
+    for i in range(120):
+        k = i % 6
+        if k == 0:
+            fr = P.encode_cmd_vel(round(rnd.uniform(-0.3, 0.3), 3),
+                                  round(rnd.uniform(-0.8, 0.8), 3))
+            parts.append(fr)
+            good.append(fr)
+        elif k == 1:
+            fr = P.encode_battery(round(rnd.random(), 3), 24.0, 1.5)
+            parts.append(fr)
+            good.append(fr)
+        elif k == 2:
+            b = bytearray()
+            n = rnd.randrange(1, 45)
+            while len(b) < n:
+                x = rnd.randrange(256)
+                if x == 0xAA and rnd.random() < 0.5:
+                    x = 0xA9
+                b.append(x)
+            parts.append(bytes(b))
+        elif k == 3:
+            fr = bytearray(P.encode_led(0.5))
+            fr[-1] ^= 0xFF                       # CRC 错
+            parts.append(bytes(fr))
+        elif k == 4:
+            fr = P.encode_odom(1.0, 2.0, 0.5, 0.1, 0.2)
+            parts.append(fr[:len(fr) // 2])      # 截断，后半永远不来
+        else:
+            fr = P.encode_heartbeat()
+            parts.append(fr)
+            good.append(fr)
+    return b''.join(parts), good
+
+
+def _blocks(n):
+    """不规则块大小（质数步长）。SYNC、LEN、CRC 都会被切在两次 push 之间。"""
+    i = 0
+    while i < n:
+        blk = (i * 37 + 13) % 17 + 1
+        yield i, min(blk, n - i)
+        i += blk
+
+
+def _parse_chunked(stream):
+    parser = P.Parser()
+    out = []
+    for off, ln in _blocks(len(stream)):
+        for f in parser.feed(stream[off:off + ln]):
+            out.append((f.type, f.payload.hex()))
+    return out, parser.stats()
+
+
+class TestCrossImplementation(unittest.TestCase):
+    """一长段「什么都混在一起」的字节流，两侧必须给出同样的帧序列。
+
+    黄金向量覆盖的是「每种边界单独构造一次」；这里覆盖真实串口的形态：噪声、
+    截断、CRC 错、粘连按随机顺序出现。两侧一旦在丢弃策略上分叉，症状是
+    「偶尔丢一条速度指令」——和「电机抽一下」一样难查。
+    """
+
+    def test_chunking_does_not_change_result(self):
+        """帧序列与「怎么切块」无关。解析器是有状态的，这条并不自动成立。"""
+        stream, _ = _mixed_stream()
+        one = [(f.type, f.payload.hex()) for f in P.Parser().feed(stream)]
+        chunked, _stats = _parse_chunked(stream)
+        self.assertEqual(one, chunked)
+
+    def test_all_but_at_most_one_good_frame_survives(self):
+        """被截断的帧会吞掉紧随其后的那一帧 —— 这是无序号协议固有的代价。
+
+        它没有序号、没有转义，所以「LEN 说还有 20 字节没到」时只能等，等来的
+        是下一帧的字节 → CRC 失败 → 从 SYNC 处重扫，那一帧已经没了。
+        所以断言「最多损失一个」，而不是「必须一个不少」：写成后者会逼着实现
+        去猜，而半截的速度指令比丢一帧危险得多。
+        """
+        stream, good = _mixed_stream()
+        frames, stats = _parse_chunked(stream)
+        self.assertGreaterEqual(len(frames), len(good) - 1,
+                                '合法帧丢了不止一个：%s' % stats)
+        self.assertEqual(stats['len_errors'], 0, 'LEN 全是合法值，不该报长度错')
+        self.assertGreater(stats['crc_errors'], 0, 'CRC 错的帧没有被统计')
+
+    @unittest.skipUnless(GCC and os.path.isfile(CROSS),
+                         '需要 gcc 与 firmware/（容器里通常只有包目录）')
+    def test_c_and_python_agree_frame_by_frame(self):
+        """同一段流、同一种切块，C 与 Python 必须逐帧一致。"""
+        stream, _ = _mixed_stream()
+        py_frames, _ = _parse_chunked(stream)
+        py_text = ''.join('%02x %s\n' % (t, ph) for t, ph in py_frames)
+
+        tmp = tempfile.mkdtemp()
+        spath = os.path.join(tmp, 'stream.bin')
+        with open(spath, 'wb') as f:
+            f.write(stream)
+        exe = os.path.join(tmp, 'cross_stream')
+        subprocess.run(
+            [GCC, '-std=c99', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
+             '-I' + os.path.join(REPO_ROOT, 'firmware', 'core'),
+             CORE, CROSS, '-o', exe],
+            check=True, capture_output=True)
+        r = subprocess.run([exe, spath], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, py_text,
+                         'C 与 Python 的帧序列不一致（固件侧实现分叉了）')
 
 
 if __name__ == '__main__':

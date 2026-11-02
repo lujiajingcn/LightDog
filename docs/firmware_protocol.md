@@ -277,9 +277,10 @@ linorobot2 四驱 skid steer 的里程计 **yaw 高估约 35%**（仿真里就�
 ```bash
 # PC 上（不需要 STM32；容器里有 gcc）
 make -C firmware test        # 94 项：CRC / 黄金向量 / 解析边界 / 看门狗时序
+make -C firmware cross       # 交叉验证程序；与 Python 侧逐帧比对（见下）
 
 # 宿主机上的 Python 侧
-python3 lightdog/tests/run.py    # 含 test_mcu_proto（28 项）
+python3 lightdog/tests/run.py    # 含 test_mcu_proto（编解码 / 解析边界 / 与 C 逐帧比对）
 ```
 
 `firmware/core/lightdog_proto.c` 与 `lightdog_mcu_proto.py` 是同一套字节规则的两份

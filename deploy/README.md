@@ -243,11 +243,16 @@ python3 deploy/acceptance.py --auto-only    # 无人值守：人工项记为「�
 
 ```bash
 # 跑 2 小时（真机）
-sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv --watch-dir /var/lib/lightdog
+sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv --watch-dir /data
 
 # 采样结束后会自动出报告。也可以事后重跑分析，不用重新采：
 python3 deploy/soak.py report /tmp/soak.csv
 ```
+
+`--watch-dir` 要指 `p4_params.yaml` 里的 `data_dir`（默认 `/data`），**不是**
+`/var/lib/lightdog` —— 后者是 systemd 的 StateDirectory，里面只有急停状态文件，
+拿它当监视目标会得到一条永远平直的曲线：报告写「数据目录 +0.0M（0 个文件）」，
+而真正会被录像写满的那个分区一次都没看过。
 
 它只读 `/proc`，**不 import rclpy、不开线程、不连网络**。这一点是刻意的：
 如果采样器和被采样的节点共命运，那么节点卡死/OOM 的那一刻正是曲线断掉的那一刻，

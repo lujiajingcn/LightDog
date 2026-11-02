@@ -144,7 +144,8 @@ P2/P5 都订阅 `/camera/depth/image_rect_raw` 并假设它和彩色图**逐像�
 ## 七、验证手段
 
 ```bash
-# 1) 离线逻辑回归（宿主机，不需要 ROS/容器）：132 项
+# 1) 离线逻辑回归（宿主机，不需要 ROS/容器）
+#    判据是「0 失败」；项数以 run.py 末尾打印的为准，别把它抄进文档
 cd lightdog/tests && python run.py
 
 # 2) 系统层验收（容器里，mission + voice 全链路）
@@ -325,7 +326,7 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 
 ```bash
 sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv \
-     --watch-dir /var/lib/lightdog
+     --watch-dir /data
 ```
 
 在树莓派上有四件事必须同时看，缺一条就可能是「曲线很漂亮但机器快挂了」：
