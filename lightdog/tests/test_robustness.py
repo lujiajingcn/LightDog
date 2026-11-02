@@ -716,5 +716,86 @@ class TestAlertCommands(unittest.TestCase):
                          '语音承诺「正在联系家人」，但 ACKED 之后一个电话都不打')
 
 
+class TestEstopPersistence(unittest.TestCase):
+    """急停闭锁落盘：`Restart=always` 之后，自动重启不能等于自动解除急停。
+
+    这是部署层引入的新前提 —— 节点进程会自己回来，而闭锁原本只在内存里。
+    没有这层，`systemd` 越是「可靠」，按着急停的车越容易自己动起来。
+    """
+
+    def make(self, path):
+        src = source_of('lightdog_twist_mux.py')
+        t = type('TwistMux', (), {})()
+        t.estop_path = path
+        t.logs = []
+
+        class L:
+            def error(_s, m):
+                t.logs.append(('error', m))
+
+            def warn(_s, m):
+                t.logs.append(('warn', m))
+
+            def info(_s, m):
+                t.logs.append(('info', m))
+
+        t.get_logger = lambda: L()
+        bind(t, extract_methods(src, 'TwistMux',
+                                {'_load_estop', '_persist_estop'},
+                                ns={'os': os}))
+        return t
+
+    def test_lock_survives_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'sub', 'estop')      # 目录还不存在
+            t = self.make(p)
+            self.assertFalse(t._load_estop(), '没有状态文件时不该是锁着')
+            t._persist_estop(True)
+            self.assertTrue(os.path.isfile(p), '急停没落盘')
+            # 模拟进程重启：全新实例
+            t2 = self.make(p)
+            self.assertTrue(t2._load_estop(),
+                            'restart 之后急停丢失 -> 按着急停的车又能动了')
+
+    def test_release_removes_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'estop')
+            t = self.make(p)
+            t._persist_estop(True)
+            t._persist_estop(False)
+            self.assertFalse(os.path.exists(p),
+                             '解除急停后还留着状态文件，下次重启会被重新锁上')
+            self.assertFalse(self.make(p)._load_estop())
+
+    def test_garbage_is_treated_as_locked(self):
+        """读不懂就锁着 —— 反方向的错误是「以为锁着其实能动」。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'estop')
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('YES-please\n')
+            t = self.make(p)
+            self.assertTrue(t._load_estop(), '状态文件内容异常却被当成未锁')
+            self.assertTrue(any(k == 'error' for k, _ in t.logs),
+                            '按已急停处理时必须打 error，否则没人知道车为什么不动')
+
+    def test_atomic_write_leaves_no_tmp(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'estop')
+            self.make(p)._persist_estop(True)
+            self.assertFalse(os.path.exists(p + '.tmp'),
+                             '留下了临时文件，掉电场景下会被误读成锁着')
+
+    def test_empty_path_is_noop(self):
+        """仿真默认：不落盘，也不因为读盘失败而锁死。"""
+        t = self.make('')
+        self.assertFalse(t._load_estop())
+        t._persist_estop(True)              # 不该抛异常
+        self.assertEqual(t.logs, [], '空路径不该产生任何日志')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

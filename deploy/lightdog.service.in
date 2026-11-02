@@ -1,0 +1,72 @@
+# LightDog 节点单元 —— 由 install.sh 按 deploy/nodes.conf 生成。
+# 要改行为请改 nodes.conf 或本模板后重装，不要直接编辑 /etc/systemd/system 下的副本。
+#
+# 几个不是随手写的取值，改之前请看注释：
+#
+#   KillSignal=SIGINT    ROS 2 的优雅停机信号。rclpy 给它装了 handler，会走
+#                        destroy_node() —— recorder 的写盘队列就是靠这一步排空的。
+#                        换成 SIGTERM 也能退出，但写盘线程可能没跑完就被收尸。
+#
+#   TimeoutStopSec      必须 > 节点自己的停机预算（recorder 是 join(5s)）。
+#                        给不够 = 每录完一段就被 SIGKILL，留下 .part.mp4。
+#
+#   Restart=always      对 launch 那种「起完就走」的进程无意义；这里是常驻节点，
+#                        所以 always 才对。但要配合「急停落盘」才安全 —— 见
+#                        nodes.conf 里 safety-mux 的 estop_state_path。
+#
+#   RestartPreventExitStatus=78
+#                        source 失败时我们 exit 78（EX_CONFIG）。配置错重启一万次
+#                        还是错，继续重试只会把 journal 刷满，让真正的错更难看见。
+#
+#   StateDirectory       systemd 自动创建 /var/lib/lightdog 并 chown 给 User，
+#                        比在脚本里 mkdir + chown 可靠（后者漏了会被 OSError 咬）。
+#
+#   RCUTILS_COLORIZED_OUTPUT=0
+#                        journal 里不需要 ANSI 颜色，留着只是让日志多几百个转义字节。
+
+[Unit]
+Description=@DESC@
+Documentation=file://@WS@/src/lightdog/docs/
+After=network-online.target@AFTER@
+Wants=network-online.target
+PartOf=lightdog.target
+
+[Service]
+Type=simple
+User=@RUN_USER@
+Group=@RUN_USER@
+WorkingDirectory=@WS@
+StateDirectory=lightdog
+EnvironmentFile=-/etc/lightdog/env
+Environment="RCUTILS_COLORIZED_OUTPUT=0"
+Environment="RCUTILS_LOGGING_BUFFERED_STREAM=1"
+Environment="PYTHONUNBUFFERED=1"
+Environment="ROS_HOME=/var/lib/lightdog/ros"
+Environment="ROS_LOG_DIR=/var/lib/lightdog/ros/log"
+Environment="HOME=/var/lib/lightdog"
+Environment="LC_ALL=C.UTF-8"
+Environment="LANG=C.UTF-8"
+
+# 用 `exec` 让 ros2 成为本单元的主进程：不加的话 PID 1 是 bash，
+# systemd 看到的是「bash 退出了」，拿不到节点的真实退出码，Restart 判据会失真。
+ExecStart=/bin/bash -c 'source /opt/ros/@DISTRO@/setup.bash || exit 78; source @WS@/install/setup.bash || exit 78; exec ros2 run lightdog @EXE@ --ros-args --params-file @WS@/install/lightdog/share/lightdog/config/@PARAMS@ -p use_sim_time:=false @EXTRA@'
+
+Restart=@RESTART@
+RestartSec=2
+RestartPreventExitStatus=78
+SuccessExitStatus=SIGINT SIGTERM
+
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=@STOP_TIMEOUT@
+SendSIGKILL=yes
+
+# 一个卡死循环的节点不该把 journal 写爆（32GB 卡上这是最常见的「磁盘满」来源）
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=2000
+SyslogIdentifier=lightdog-@NAME@
+
+UMask=0027
+
+[Install]
+WantedBy=lightdog.target

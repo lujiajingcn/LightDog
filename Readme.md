@@ -67,5 +67,17 @@ bash sim/system.sh listen 不要再跟着我了
 python lightdog/tests/run.py
 ```
 
+真机上由 systemd 托管（开机自启 + 崩溃重启 + 日志有界），不是手动敲上面那些脚本：
+
+```bash
+sudo ./deploy/install.sh --dry-run     # 先看会生成什么 unit
+sudo ./deploy/install.sh
+sudo ./deploy/verify.sh                # unit / 路径 / 进程 / 话题
+sudo systemctl start lightdog.target
+lightdog-estop                         # 急停状态（set / clear --yes）
+```
+
+见 `deploy/README.md`。
+
 节点/话题/参数的细节见 `docs/` 下的阶段文档，硬件相关的坑见
 `docs/hardware_readiness.md`。

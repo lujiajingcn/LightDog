@@ -142,6 +142,11 @@
     # hold 是调度层的告警按住，它停发 3s 后自动放开（不会永久冻住车）。
     estop_topic: /safety/estop
     hold_topic: /mission/hold_motion
+    # 急停闭锁落盘路径。空 = 不落盘（仿真默认）。
+    # 真机由 deploy/install.sh 生成的 unit 覆盖成 /var/lib/lightdog/estop ——
+    # 因为那个 unit 是 Restart=always，进程崩了会自己回来，而闭锁只在内存里时
+    # 「重启」就等于「自动解除急停」。改这里没用，改 deploy/nodes.conf。
+    estop_state_path: ''
     # 给固件看门狗的心跳。MCU 侧 300ms 收不到 /cmd_vel 就断 PWM，
     # 心跳用来区分「上位机活着但故意零速」和「上位机死了」。
     heartbeat_topic: /safety/heartbeat

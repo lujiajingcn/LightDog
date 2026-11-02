@@ -1,0 +1,13 @@
+[Unit]
+Description=LightDog 机器人服务组（一键起停全部常驻节点）
+Documentation=file://@WS@/src/lightdog/docs/
+# 这个 target 只是「分组」，本身不干活。用它的好处是：
+#   systemctl status lightdog.target   -> 一眼看到谁没起来
+#   systemctl stop   lightdog.target   -> 按依赖顺序全停，不用记 12 个单元名
+#
+# Wants 而不是 Requires：任何一个节点起不来都不该连累其它节点
+# （尤其不能因为 media-http 端口被占，就让 safety-mux 也起不来）。
+Wants=@WANTS@
+
+[Install]
+WantedBy=multi-user.target

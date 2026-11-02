@@ -117,6 +117,7 @@ ROS 生态里有现成的 `twist_mux`，但这个镜像里没装，而容器内 
     发布  /safety/heartbeat  std_msgs/Bool         给固件看门狗
 """
 
+import os
 import sys
 import time
 
@@ -238,6 +239,13 @@ class TwistMux(Node):
         self.declare_parameter('estop_topic', '/safety/estop')
         self.declare_parameter('hold_topic', '/mission/hold_motion')
         self.declare_parameter('heartbeat_topic', '/safety/heartbeat')
+        # 急停闭锁的落盘路径。空 = 不落盘（仿真默认：容器一重启所有状态本来就没了）。
+        #
+        # 真机必须设成 /var/lib/lightdog/estop —— 因为部署层给本节点配的是
+        # `Restart=always`：进程崩了会自动拉起，而闭锁只存在内存里，
+        # 重启后 self.estop=False，**一辆按着急停的车就又能动了**。
+        # 这不是理论风险，正是「自动重启」和「急停不过期」这两条语义的正面冲突。
+        self.declare_parameter('estop_state_path', '')
         # 平台物理上限，作用在**输出**上：任何上游（跟随 P 控制、Nav2、
         # docking_server）算错了，最终发给底层的速度都不会超过这里。
         # 0 表示不限制。真机上按电机实际能力设（本项目底盘建议 0.30 / 1.0）。
@@ -275,6 +283,18 @@ class TwistMux(Node):
         self.hold = False             # 调度层按住：它停发就自动放开（见 _hold_stale）
         self._hold_stamp = 0.0
         self.hold_timeout = 3.0       # 必须 > 调度层 1Hz 的刷新周期
+
+        # 从磁盘恢复闭锁。**必须早于任何订阅建立**，否则启动那一刻会先按
+        # estop=False 放行几拍，车会动一下 —— 这正是「明明按了急停它却动」。
+        self.estop_path = str(p('estop_state_path').value or '').strip()
+        self._estop_republish = False
+        if self.estop_path:
+            self.estop = self._load_estop()
+            if self.estop:
+                self._estop_republish = True      # 见 _tick：等发现完成再回发锁存
+                self.get_logger().error(
+                    f'从 {self.estop_path} 恢复了急停闭锁 —— 本节点重启过，'
+                    f'车仍然是锁住的。确认现场安全后再显式解除')
 
         # 急停状态的**长期持有者**。
         #
@@ -323,12 +343,71 @@ class TwistMux(Node):
         else:
             self.get_logger().info('急停已解除')
         self.estop = v
+        self._persist_estop(v)
         # 回发一份（同一话题、同一 QoS）。上面已经 `v == self.estop` 早退，
         # 所以自己收到自己的消息不会再发，不会形成循环。
         try:
             self.pub_estop.publish(Bool(data=v))
         except Exception:                      # 发布失败不该影响刹车本身
             pass
+
+    # ---------- 闭锁落盘 ----------
+
+    def _load_estop(self):
+        """读回上次的闭锁状态。
+
+        读不懂就当**锁着**：这个方向的错误是「车不动、日志让你去删文件」，
+        反方向是「以为锁着其实能动」。安全件只接受前一种。
+        """
+        try:
+            with open(self.estop_path, 'r', encoding='utf-8') as f:
+                raw = f.read().strip().lower()
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            self.get_logger().error(
+                f'读不了急停状态文件 {self.estop_path}（{e}），按「已急停」处理。'
+                f'确认安全后删掉该文件，或用 estop=false 显式解除')
+            return True
+        if raw in ('0', 'false', 'no', 'off'):
+            return False
+        if raw in ('1', 'true', 'yes', 'on'):
+            return True
+        self.get_logger().error(
+            f'急停状态文件 {self.estop_path} 内容无法识别（{raw[:20]!r}），'
+            f'按「已急停」处理。删掉该文件即可清除')
+        return True
+
+    def _persist_estop(self, on):
+        """把闭锁状态原子地落盘。
+
+        写盘失败**不回滚**内存状态：刹车已经生效了，这时回头改成「没锁」才是
+        真正的危险。只 warn，让运维知道下次重启会丢这个状态。
+        """
+        if not self.estop_path:
+            return
+        try:
+            if on:
+                d = os.path.dirname(self.estop_path)
+                if d:
+                    os.makedirs(d, exist_ok=True)
+                tmp = self.estop_path + '.tmp'
+                # 先写临时文件再 rename：掉电/被 kill 时不会留下半截内容被
+                # _load_estop 误判成 True（那会让车永远起不来）。
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    f.write('1')
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.estop_path)
+            else:
+                try:
+                    os.unlink(self.estop_path)
+                except FileNotFoundError:
+                    pass
+        except OSError as e:
+            self.get_logger().warn(
+                f'急停状态落盘失败（{e}）：当前闭锁仍然有效，'
+                f'但本节点一旦重启就会忘记它。检查 {self.estop_path} 的权限')
 
     def _on_hold(self, msg: Bool):
         v = bool(msg.data)
@@ -376,6 +455,16 @@ class TwistMux(Node):
         # 心跳：给固件看门狗区分「上位机活着、故意零速」和「上位机死了」。
         # 每拍都发（20Hz），MCU 侧 300ms 收不到就断 PWM。
         self.pub_beat.publish(Bool(data=True))
+
+        # 从磁盘恢复的闭锁：__init__ 里发的那一次很可能还在 DDS 发现之前，
+        # 锁存样本没有接收者。等第一拍 timer（约 50ms 后，发现基本完成）补发一次，
+        # 让后起的 mission / server 能继承「已经急停」。
+        if self._estop_republish:
+            self._estop_republish = False
+            try:
+                self.pub_estop.publish(Bool(data=True))
+            except Exception:
+                self._estop_republish = True   # 下拍再试，别把锁丢掉
 
         gate = self._gate(now)
         if gate is not None:

@@ -89,19 +89,22 @@ def make_mux():
     m.pub_beat = Pub()
     m.pub_estop = Pub()
     m.active_name = None
-    m._stale = False
     m.estop = False
     m.hold = False
     m._hold_stamp = 0.0
     m.hold_timeout = 3.0
+    # 闭锁落盘相关：夹具默认不落盘（等同仿真），落盘行为由
+    # test_robustness.TestEstopPersistence 单独覆盖。
+    m.estop_path = ''
+    m._estop_republish = False
     m.log = Log()
     m.get_logger = lambda: m.log
     clamp = extract_funcs(MUX, {'clamp_speed'})['clamp_speed']
     bind(m, extract_methods(MUX, 'TwistMux',
                             {'_tick', '_pick', '_on_twist', '_gate',
-                             '_on_estop', '_on_hold'},
+                             '_on_estop', '_on_hold', '_persist_estop'},
                             ns={'time': time, 'Twist': Twist, 'String': String,
-                                'Bool': Bool,
+                                'Bool': Bool, 'os': os,
                                 'CmdVelSource': Src, 'clamp_speed': clamp}))
     return m
 

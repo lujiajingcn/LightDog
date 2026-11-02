@@ -608,8 +608,11 @@ def make_mux():
     m.pub, m.pub_state, m.pub_beat = Pub(), Pub(), Pub()
     m.pub_estop = Pub()
     m.active_name = None
-    m._stale = False
     m.estop = False
+    # 闭锁落盘：夹具不落盘（等同仿真）。重启后能否保住锁由
+    # test_robustness.TestEstopPersistence 覆盖。
+    m.estop_path = ''
+    m._estop_republish = False
     m.hold = False
     m._hold_stamp = 0.0
     m.hold_timeout = 3.0
@@ -619,9 +622,10 @@ def make_mux():
     clamp = extract_funcs(MUX, {'clamp_speed'})['clamp_speed']
     bind(m, extract_methods(MUX, 'TwistMux',
                             {'_tick', '_pick', '_on_twist', '_gate',
-                             '_on_estop', '_on_hold'},
+                             '_on_estop', '_on_hold', '_persist_estop'},
                             ns={'time': m.wall, 'String': String,
                                 'Bool': Bool, 'Twist': Twist,
+                                'os': os,
                                 'CmdVelSource': Src,
                                 'clamp_speed': clamp}))
     m.Twist = Twist

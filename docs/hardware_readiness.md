@@ -68,6 +68,7 @@
 | Nav2 不可用 | action server 未就绪 | — | 低电回充降级为「直接让 `dock_manager` 停靠」；巡游功能跳过而不报错 | `Nav2 不可用` |
 | 手机端断连（SSE） | 客户端断开 | `sse_interval` (1.0s) | 服务端线程自行退出，不影响其它接口；重连即恢复（事件列表接口仍然可用） | — |
 | 急停后调度层重启 | 启动时握手 | `SAFETY_QOS` | 通过 `TRANSIENT_LOCAL` **继承**「已经急停」，不会从 `IDLE` 开始猜。实测重启后 0.8s 内进入 ESTOP | `收到急停闭锁` |
+| **`twist_mux` 自己重启**（systemd `Restart=always`） | `/var/lib/lightdog/estop` 落盘 | `estop_state_path` | 启动时**先读回闭锁再建订阅**，车仍是锁住的；状态文件读不懂时按「已急停」处理。没有这条，自动重启就等于自动解除急停 | `恢复了急停闭锁` |
 
 ## 四、真机上会变得不一样的三件事
 
@@ -119,7 +120,7 @@ P2/P5 都订阅 `/camera/depth/image_rect_raw` 并假设它和彩色图**逐像�
 ## 七、验证手段
 
 ```bash
-# 1) 离线逻辑回归（宿主机，不需要 ROS/容器）：96 项
+# 1) 离线逻辑回归（宿主机，不需要 ROS/容器）：132 项
 cd lightdog/tests && python run.py
 
 # 2) 系统层验收（容器里，mission + voice 全链路）
@@ -144,6 +145,30 @@ docker exec sim bash -lc "source /opt/ros/jazzy/setup.bash; \
   source /home/ros/linorobot2_ws/install/setup.bash; \
   ros2 topic hz /camera/color/image_raw"     # 先记下正常频率，再把相机进程 SIGSTOP
 ```
+
+### 5) 真机服务化（systemd）
+
+上面 1~4 都是手动拉起节点做的验证。真车上节点由 systemd 托管，
+所以**还要单独验一次「自己起来」和「崩了自己回来」**：
+
+```bash
+sudo ./deploy/install.sh --dry-run     # 先看会生成什么
+sudo ./deploy/install.sh
+sudo ./deploy/verify.sh                # unit 语法 / 路径 / 进程 / 话题
+
+# 崩溃重启真的会回来，且不会丢急停
+sudo lightdog-estop set
+sudo systemctl kill -s KILL lightdog-safety-mux
+sleep 5
+sudo lightdog-estop status             # 必须仍是「已闭锁」
+sudo lightdog-estop clear --yes
+
+# 反复重启是最难查的故障：active 但每 2 秒换个 PID
+systemctl show -p NRestarts --value lightdog-mission
+```
+
+细节见 `deploy/README.md`。**注意这套只给真机**：它检测 `/opt/ros` 和
+workspace 的 `install/`，仿真容器里没有 systemd，继续用 `sim/*.sh`。
 
 > 注意：`ros2 topic echo` 在本容器里不稳定（订阅不到，而直接写 rclpy 的探针能收到），
 > 验收时用探针而不是 CLI。
