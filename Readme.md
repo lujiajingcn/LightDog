@@ -75,6 +75,9 @@ sudo ./deploy/install.sh
 sudo ./deploy/verify.sh                # unit / 路径 / 进程 / 话题
 sudo systemctl start lightdog.target
 lightdog-estop                         # 急停状态（set / clear --yes）
+
+# 连跑 2 小时的浸泡（泄漏 / 线程 / fd / 存储增长），跑完自动出报告
+sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv
 ```
 
 见 `deploy/README.md`。

@@ -317,3 +317,32 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 
 > 分工没变：Pi 决定「该走多快」，STM32 决定「一旦上位机失联立刻自己停」。
 > ROS 侧的 `twist_mux` 只是软件兜底，`kill -9` 掉它之后唯一还能刹住车的是固件。
+
+### 8.9 连续运行：2 小时只是下限
+
+验收脚本（`deploy/acceptance.py`）证明的是「此刻各项都对」，证明不了
+「连跑一夜之后还对」。这台机器最终的形态是 24 小时开机、一周才有人想起来看一眼。
+
+```bash
+sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv \
+     --watch-dir /var/lib/lightdog
+```
+
+在树莓派上有四件事必须同时看，缺一条就可能是「曲线很漂亮但机器快挂了」：
+
+| 检查 | 判据 | 不满足说明什么 |
+|---|---|---|
+| `vcgencmd get_throttled` | 跑完之后仍是 `0x0` | 非 0 = 这 2 小时里发生过欠压或过温降频。曲线会因此**变得更好看**（CPU 被限速、吞吐下降），是最容易误判成「优化有效」的假象 |
+| `vcgencmd measure_temp` | 稳态 < 70°C | 封闭外壳里持续录像写卡是最坏组合，见 §8.2 |
+| 可用内存 | 末值 > 起始值的 70% | 掉得比进程 RSS 总和多 = 有进程没被 `--match` 采到（gz/浏览器），或者内核 page cache 被顶掉 |
+| fd 地板 | 2 小时后没有抬高 | 抬高 = 连接线程没退。**峰值不重要**，地板上移才是泄漏 |
+
+另外两条 Pi 专属的：
+
+- **日志也要有界**。`journalctl --disk-usage` 应低于 `SystemMaxUse`；节点每 10 秒
+  报一次的串口错误在 8 小时里就是 2880 行。`deploy/lightdog.service.in` 里设了
+  `SyslogIdentifier`，按节点过滤很容易，但**总量**要单独限制。
+- **`/tmp` 在树莓派上是 tmpfs**（内存）。`soak.csv` 2 小时约 1.5MB，不碍事；
+  但不要指望把事件录像写到 `/tmp` 来「省 SD 卡」——那是拿内存换存储。
+
+判据的取值和「为什么涨了不等于泄漏」写在 `deploy/README.md` 的「长时间浸泡」一节。

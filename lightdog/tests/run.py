@@ -30,6 +30,7 @@ GROUPS = [
     ('test_call', '外呼通道：AMI 协议 / 结果语义 / ack 挂断'),
     ('test_mcu_proto', '下位机协议：帧编解码 / 解析边界 / 黄金向量'),
     ('test_mcu_bridge', '下位机桥接：钳位 / 急停闸 / 速度保持窗口'),
+    ('test_soak', '浸泡采样：泄漏判定 / 重启检测 / 退出码语义'),
     ('test_consistency', '参数与版本一致性'),
 ]
 
