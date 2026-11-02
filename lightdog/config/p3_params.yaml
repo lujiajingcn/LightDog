@@ -60,6 +60,9 @@
     max_staging_time: 120.0
     max_retries: 2
     retry_cooldown: 20.0
+    # 手动 cancel 后的静默期。低电状态没变，不冷却的话取消完 3s 就又去充电，
+    # 手机端「取消回充」等于没有。
+    cancel_cooldown: 120.0
     auto_dock: true
 
     # 视觉对准：docking_server 进 INITIAL_PERCEPTION 后只会等、不会转，所以

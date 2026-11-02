@@ -110,9 +110,20 @@ class Recorder(Node):
         self.declare_parameter('max_disk_mb', 512.0)     # 磁盘配额（只算 clips/）
         self.declare_parameter('pre_sec', 10.0)          # 事件默认前置
         self.declare_parameter('post_sec', 10.0)         # 事件默认后置
-        self.declare_parameter('max_event_frames', 900)  # 单个事件视频最多几帧
+        # 单个事件视频最多几帧。真机 30fps 时 300 帧 = 10s；
+        # 原来给的 900 帧意味着事件合成时一次把 900 张 640x480x3 解进 list，
+        # 约 830MB，直接在 ARM 板上 OOM。
+        # 事件视频的帧数上限。**必须 >= (pre+post) × 相机帧率**，否则
+        # _assemble_event 是从窗口头部往后写的，撞上限后丢的是窗口尾巴 ——
+        # 对跌倒告警来说正好丢掉「倒下之后」那段，留下的是人还站着的前半段。
+        # P5 的窗口是 25+10=35s，真机 30Hz 相机要 1050 帧，取 1200 留余量。
+        # 流式写盘只占一帧内存，所以放宽上限不会再回到当初 OOM 的老路。
+        self.declare_parameter('max_event_frames', 1200)
         self.declare_parameter('codec', 'avc1')
         self.declare_parameter('jpeg_quality', 80)
+        # 环形缓冲的中间编码质量。这里**不是**最终画质（写盘时会重编一次），
+        # 只是为了把常驻内存从 900KB/帧 压到 40KB/帧。给 92 留出二次编码余量。
+        self.declare_parameter('buffer_jpeg_quality', 92)
         self.declare_parameter('recording', True)
         self.declare_parameter('state_topic', '/recorder/state')
 
@@ -128,6 +139,7 @@ class Recorder(Node):
         self.max_event_frames = int(p('max_event_frames').value)
         self.codec = str(p('codec').value)
         self.jpeg_quality = int(p('jpeg_quality').value)
+        self.buffer_quality = int(p('buffer_jpeg_quality').value)
         self.recording = bool(p('recording').value)
 
         self.clips_dir = os.path.join(self.data_dir, 'clips')
@@ -159,7 +171,12 @@ class Recorder(Node):
         self._flush_thread.start()
 
         self._lock = threading.Lock()
-        self.cur = []                # [(ros_t, bgr), ...] 当前段的帧
+        # [(ros_t, jpeg_bytes), ...] 当前段的帧。
+        #
+        # 刻意存**编码后的 JPEG** 而不是原始 BGR：640x480x3 = 900KB/帧，
+        # 真机 30fps × 10s = 270MB，写盘线程一堆积就翻倍 —— 而仿真相机只有
+        # 1.5Hz，这个数字完全看不出来。JPEG 约 40KB/帧，同样一段约 12MB。
+        self.cur = []
         self.cur_t0 = None
         self.cur_t1 = None
         self.latest = None           # 最近一帧（给快照用）
@@ -207,6 +224,12 @@ class Recorder(Node):
                             continue        # 半行（写到一半断电）直接丢
                         if not os.path.exists(os.path.join(self.clips_dir, rec.get('file', ''))):
                             continue
+                        # 旧版本写下的索引可能缺字段（bytes 是后加的）。
+                        # 不补齐的话 _gc 里 sum(c['bytes']) 直接 KeyError，
+                        # 清理线程一崩，卡就一直写满到 ENOSPC。
+                        rec = self._normalize_clip(rec)
+                        if rec is None:
+                            continue
                         self.clips.append(rec)
                         self.seq = max(self.seq, int(rec.get('seq', -1)) + 1)
             except Exception as e:
@@ -227,6 +250,32 @@ class Recorder(Node):
         if self.clips:
             self.get_logger().info(
                 f'已恢复 {len(self.clips)} 个历史分段，下一个 seq={self.seq}')
+
+    def _normalize_clip(self, rec):
+        """补齐旧索引缺的字段；结构不可用（没有 t0/t1/file）返回 None。
+
+        `bytes` 缺失时用文件实际大小补，不写 0：写 0 会让磁盘配额统计永久偏小，
+        配额就永远触发不了，卡慢慢写满。
+        """
+        if not isinstance(rec, dict) or not rec.get('file'):
+            return None
+        for k in ('t0', 't1'):
+            if k not in rec:
+                return None
+        try:
+            rec['t0'] = float(rec['t0'])
+            rec['t1'] = float(rec['t1'])
+        except (TypeError, ValueError):
+            return None
+        if 'bytes' not in rec or not isinstance(rec.get('bytes'), int):
+            try:
+                rec['bytes'] = os.path.getsize(self._clip_path(rec))
+            except OSError:
+                rec['bytes'] = 0
+        rec.setdefault('frames', 0)
+        rec.setdefault('fps', 0.0)
+        rec.setdefault('session', -1)
+        return rec
 
     def _append_index(self, rec):
         self.clips.append(rec)
@@ -250,17 +299,25 @@ class Recorder(Node):
         if img is None:
             return
         t = self._stamp_sec(msg)
-        self.latest = img
+        self.latest = img            # 单帧，给快照用，不参与环形缓冲
         self.latest_t = t
         self.n_frames += 1
 
         if not self.recording:
             return
 
+        # 收到就编码：代价是一次 imencode（640x480 约几毫秒），换来的是
+        # 环形缓冲的常驻内存降一个数量级。写盘线程再解码一次是值得的。
+        ok, buf = cv2.imencode(
+            '.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), self.buffer_quality])
+        if not ok:
+            return
+        jpeg = buf.tobytes()
+
         with self._lock:
             if self.cur_t0 is None:
                 self.cur_t0 = t
-            self.cur.append((t, img))
+            self.cur.append((t, jpeg))
             self.cur_t1 = t
             ready = (t - self.cur_t0) >= self.segment_sec
 
@@ -312,8 +369,11 @@ class Recorder(Node):
         fps = n / dur if dur > 0 else 1.0
         fps = max(0.5, min(60.0, fps))
 
-        h = even(int(frames[0][1].shape[0]))
-        w = even(int(frames[0][1].shape[1]))
+        first = self._decode(frames[0][1])
+        if first is None:
+            return
+        h = even(int(first.shape[0]))
+        w = even(int(first.shape[1]))
         if h < 2 or w < 2:
             return
 
@@ -327,20 +387,40 @@ class Recorder(Node):
         writer, used = self._open_writer(tmp, fps, (w, h))
         if writer is None:
             return
-        for _, f in frames:
+        written = 0
+        for _, buf in frames:
+            f = self._decode(buf)
+            if f is None:
+                continue
             writer.write(self._fit(f, w, h))
+            written += 1
         writer.release()
+        if written == 0:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return
 
         os.replace(tmp, path)
         size = os.path.getsize(path)
         rec = {'file': name, 'seq': seq,
                't0': round(t0, 3), 't1': round(t1, 3),
                'wall': round(job['wall'], 3),
-               'frames': n, 'fps': round(fps, 3), 'bytes': size,
+               'frames': written, 'fps': round(fps, 3), 'bytes': size,
                'codec': used, 'session': self.session}
         self._append_index(rec)
         self.get_logger().debug(
-            f'{name}: {n} 帧 / {dur:.1f}s / {fps:.2f}fps / {size/1024:.0f}KB ({used})')
+            f'{name}: {written} 帧 / {dur:.1f}s / {fps:.2f}fps / {size/1024:.0f}KB ({used})')
+
+    @staticmethod
+    def _decode(buf):
+        """JPEG bytes -> BGR；坏帧返回 None（不因为一帧报废整段）。"""
+        try:
+            a = np.frombuffer(buf, dtype=np.uint8)
+            return cv2.imdecode(a, cv2.IMREAD_COLOR)
+        except Exception:
+            return None
 
     def _open_writer(self, path, fps, size):
         """优先 H.264；不可用则降级 mp4v（并只警告一次）。"""
@@ -435,6 +515,11 @@ class Recorder(Node):
 
         不在事件当下就合成，是因为后置窗口的帧还没产生；等到 t_to 之后再动手，
         用的是「已落盘的完整分段」，不需要额外在内存里留一份长缓冲。
+
+        **流式写**：读一帧写一帧，峰值只多占一帧（900KB）+ 缩略图那一帧。
+        早先的写法是先把窗口内所有帧解进 list 再编码，300 帧就是 270MB，
+        在 ARM 板上直接 OOM。fps 因此必须提前算出来 —— 用段落元数据估，
+        不需要真的读完。
         """
         # 等写盘队列排空（后置窗口刚 flush 的那段可能还在编码）
         self._flush_q.join()
@@ -445,16 +530,8 @@ class Recorder(Node):
         # （见 __init__ 里 session 的注释）。
         hits = [c for c in clips
                 if c.get('session') == self.session
-                and c['t1'] >= ctx['t_from'] and c['t0'] <= ctx['t_to']]
-        hits.sort(key=lambda c: c['seq'])
-
-        frames = []
-        for c in hits:
-            frames.extend(self._read_clip_frames(c, ctx['t_from'], ctx['t_to']))
-            if len(frames) >= self.max_event_frames:
-                break
-        if len(frames) > self.max_event_frames:
-            frames = frames[:self.max_event_frames]
+                and c.get('t1', 0.0) >= ctx['t_from'] and c.get('t0', 0.0) <= ctx['t_to']]
+        hits.sort(key=lambda c: c.get('seq', 0))
 
         # 事件 id 用墙钟时间戳，人能一眼看出「几点几分」；同秒多条时加序号
         base = time.strftime('%Y%m%d_%H%M%S', time.localtime(ctx['wall']))
@@ -463,90 +540,155 @@ class Recorder(Node):
         while os.path.exists(os.path.join(self.events_dir, eid)):
             eid = 'evt_%s_%s_%d' % (base, ctx['type'], k)
             k += 1
-        self.n_events += 1
         out_dir = os.path.join(self.events_dir, eid)
         os.makedirs(out_dir, exist_ok=True)
+        self.n_events += 1
 
         meta = {
             'id': eid, 'type': ctx['type'], 'label': ctx['label'],
             'note': ctx['note'], 'wall': ctx['wall'],
             't_ev': round(ctx['t_ev'], 3),
             't_from': round(ctx['t_from'], 3), 't_to': round(ctx['t_to'], 3),
+            # 显式记下**实际生效**的窗口：请求里可能覆盖默认 pre/post
+            # （P5 告警就用 25/10 覆盖了 P4 的 10/10），手机端要按它显示
+            # 「事发前 25 秒」；只给 t_from/t_to 的话前端还得自己减。
+            'pre_sec': round(ctx['pre'], 2),
+            'post_sec': round(ctx['post'], 2),
+            'duration': round(ctx['t_to'] - ctx['t_from'], 2),
             'clips': [c['file'] for c in hits],
-            'frames': len(frames), 'has_video': False,
+            'frames': 0, 'has_video': False,
         }
 
-        if not frames:
+        if not hits:
             self.get_logger().warn(
-                f'{eid}: 窗口内没有可用帧（分段可能已被环形清理）')
+                f'{eid}: 窗口内没有可用分段（可能已被环形清理）')
             meta['error'] = 'no_frames'
             self._write_meta(out_dir, meta)
             return
 
-        # 事件视频的 fps：窗口内总帧数 / 窗口实际跨度的帧引用数
-        span = max(1e-3, frames[-1][0] - frames[0][0])
-        fps = len(frames) / span if span > 0.5 else 1.0
-        fps = max(0.5, min(60.0, fps))
-
-        h = even(int(frames[0][1].shape[0]))
-        w = even(int(frames[0][1].shape[1]))
+        fps = self._estimate_event_fps(hits, ctx)
         path = os.path.join(out_dir, 'video.mp4')
         tmp = os.path.join(out_dir, 'video.part.mp4')   # 扩展名见 _write_segment 的注释
-        writer, used = self._open_writer(tmp, fps, (w, h))
+
+        writer = None
+        used = None
+        written = 0
+        thumb_d = float('inf')
+        thumb = None
+        for c in hits:
+            for t, img in self._iter_clip_frames(c, ctx['t_from'], ctx['t_to']):
+                if writer is None:
+                    h = even(int(img.shape[0]))
+                    w = even(int(img.shape[1]))
+                    writer, used = self._open_writer(tmp, fps, (w, h))
+                    if writer is None:
+                        meta['error'] = 'encoder_unavailable'
+                        self._write_meta(out_dir, meta)
+                        return
+                d = abs(t - ctx['t_ev'])
+                if d < thumb_d:
+                    thumb_d, thumb = d, img.copy()
+                writer.write(self._fit(img, w, h))
+                written += 1
+                if written >= self.max_event_frames:
+                    break
+            if written >= self.max_event_frames:
+                break
+
         if writer is None:
-            meta['error'] = 'encoder_unavailable'
+            self.get_logger().warn(f'{eid}: 窗口内没有可用帧')
+            meta['error'] = 'no_frames'
             self._write_meta(out_dir, meta)
             return
-        for _, f in frames:
-            writer.write(self._fit(f, w, h))
+
         writer.release()
         os.replace(tmp, path)
 
         # 缩略图取最接近事发时刻的那一帧
-        thumb = min(frames, key=lambda it: abs(it[0] - ctx['t_ev']))[1]
-        ok, buf = cv2.imencode('.jpg', thumb,
-                               [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
-        if ok:
-            with open(os.path.join(out_dir, 'thumb.jpg'), 'wb') as f:
-                f.write(buf.tobytes())
+        if thumb is not None:
+            ok, buf = cv2.imencode('.jpg', thumb,
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if ok:
+                with open(os.path.join(out_dir, 'thumb.jpg'), 'wb') as f:
+                    f.write(buf.tobytes())
 
-        meta.update({'has_video': True, 'fps': round(fps, 3),
+        meta.update({'has_video': True, 'fps': round(fps, 3), 'frames': written,
                      'bytes': os.path.getsize(path), 'codec': used})
         self._write_meta(out_dir, meta)
         self.get_logger().info(
-            f'{eid}: {len(frames)} 帧 / {fps:.2f}fps / '
+            f'{eid}: {written} 帧 / {fps:.2f}fps / '
             f'{os.path.getsize(path)/1024:.0f}KB，来源 {len(hits)} 段'
             f'（{ctx["label"]}）')
 
-    def _read_clip_frames(self, clip, t_from, t_to):
-        """读一个分段，按线性插值给每帧估时间戳并裁窗口。
+    def _estimate_event_fps(self, hits, ctx):
+        """不读帧、只按段落元数据估算窗口内的 fps。
+
+        每个段落的帧是等间隔写入的，所以 (t1-t0)/(frames-1) 就是帧间隔；
+        把每段与窗口的重叠时长折算成帧数，再除以窗口跨度，就是播放帧率。
+        这样不必先把帧读进内存就能给 VideoWriter 一个正确的 fps。
+        """
+        est = 0
+        lo = None
+        hi = None
+        for c in hits:
+            f0 = max(float(c.get('t0', 0.0)), ctx['t_from'])
+            f1 = min(float(c.get('t1', 0.0)), ctx['t_to'])
+            if f1 < f0:
+                continue
+            lo = f0 if lo is None else min(lo, f0)
+            hi = f1 if hi is None else max(hi, f1)
+            n = int(c.get('frames') or 0)
+            if n <= 1:
+                est += 1
+                continue
+            dt = (float(c['t1']) - float(c['t0'])) / (n - 1)
+            est += int((f1 - f0) / dt) + 1 if dt > 1e-6 else n
+        if lo is None or hi is None:
+            return 10.0
+        # 注意：这里**不能**按 max_event_frames 截断 est。截断只会让视频变短
+        # （丢掉窗口尾部的帧），不应该改变播放速度；拿截断后的帧数除以整窗
+        # 时长会把 10fps 算成 7fps，回放就是慢动作。
+        est = max(1, est)
+        span = max(1e-3, hi - lo)
+        fps = est / span if span > 0.5 else 1.0
+        return max(0.5, min(60.0, fps))
+
+    def _iter_clip_frames(self, clip, t_from, t_to):
+        """逐帧读一个分段，按线性插值给每帧估时间戳并裁窗口（生成器）。
 
         mp4 里没有逐帧时间戳（至少 cv2 读不到），但一段内的帧是等间隔写进去的，
         用 (t1-t0)/N 插值足够定位「事发前 N 秒」这个精度。
+
+        做成生成器是为了让 _assemble_event 能边读边写：调用方不攒帧，
+        内存峰值就只有当前这一帧。
         """
         path = self._clip_path(clip)
         if not os.path.exists(path):
-            return []
+            return
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            return []
-        n = int(clip.get('frames') or 0)
-        t0, t1 = clip['t0'], clip['t1']
-        dt = (t1 - t0) / max(1, n - 1) if n > 1 else 0.0
-        out = []
-        i = 0
-        while True:
-            ok, img = cap.read()
-            if not ok:
-                break
-            t = t0 + i * dt if dt > 0 else t0
-            if t_from <= t <= t_to:
-                out.append((t, img))
-            i += 1
-            if t > t_to:
-                break
-        cap.release()
-        return out
+            return
+        try:
+            n = int(clip.get('frames') or 0)
+            t0, t1 = float(clip['t0']), float(clip['t1'])
+            dt = (t1 - t0) / max(1, n - 1) if n > 1 else 0.0
+            i = 0
+            while True:
+                ok, img = cap.read()
+                if not ok:
+                    return
+                t = t0 + i * dt if dt > 0 else t0
+                if t > t_to:
+                    return
+                if t >= t_from:
+                    yield t, img
+                i += 1
+        finally:
+            cap.release()
+
+    def _read_clip_frames(self, clip, t_from, t_to):
+        """兼容旧调用：把生成器收成 list（会把整段读进内存，事件合成不用它）。"""
+        return list(self._iter_clip_frames(clip, t_from, t_to))
 
     def _write_meta(self, out_dir, meta):
         tmp = os.path.join(out_dir, 'meta.json.part')
@@ -583,10 +725,10 @@ class Recorder(Node):
         self.clips = keep
 
         # 2) 容量维度
-        total = sum(c['bytes'] for c in self.clips)
+        total = sum(c.get('bytes', 0) for c in self.clips)
         while total > self.max_disk_mb * 1024 * 1024 and len(self.clips) > 1:
             c = self.clips.pop(0)
-            total -= c['bytes']
+            total -= c.get('bytes', 0)
             self._drop_clip(c)
             removed += 1
 
@@ -623,8 +765,8 @@ class Recorder(Node):
             cur_n = len(self.cur)
             cur_t0 = self.cur_t0
         clips = list(self.clips)
-        total = sum(c['bytes'] for c in clips)
-        last_fps = clips[-1]['fps'] if clips else 0.0
+        total = sum(c.get('bytes', 0) for c in clips)
+        last_fps = clips[-1].get('fps', 0.0) if clips else 0.0
         age = (now - self.latest_t) if self.latest_t is not None else -1.0
 
         st = {

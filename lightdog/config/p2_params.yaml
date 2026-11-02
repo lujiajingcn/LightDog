@@ -28,16 +28,23 @@
     range_max: 8.00
 
     # 形状约束：只用来滤掉极端横向的色块，不能卡太紧。
-    # 实测：1.4m 处站立躯干 bbox 高/宽 ≈ 1.45，但相机只有 0.275m 高，
-    # 人贴近到 0.8m 时躯干在画面里只剩一条横带（140x56px，比值 0.4），
-    # 卡 1.20 会把中近距离的人一起滤掉。头部误检靠"深色头发"从颜色上解决，
-    # 这里的形状约束只兜底（0.55 仍能挡掉纯地砖/墙面那种扁色块）。
+    # 实测：1.4m 处站立躯干 bbox 高/宽 ≈ 1.45，但相机装高只有 0.3745m
+    # （0.255 偏移 + 0.1195 base_link），人贴近到 0.8m 时躯干在画面里只剩
+    # 一条横带（140x56px，比值 0.4），卡 1.20 会把中近距离的人一起滤掉。
+    # 头部误检靠"深色头发"从颜色上解决，这里的形状约束只兜底
+    # （0.55 仍能挡掉纯地砖/墙面那种扁色块）。
     aspect_min: 0.55
     min_height_px: 30
 
     publish_debug: true
     rate: 10.0             # 软件渲染下别给太高，10Hz 够跟随用
     lost_timeout: 1.0
+    # 帧新鲜度（墙钟秒）。回答的是「相机管线还在不在出帧」，与仿真跑多快无关。
+    # 必须大于相机周期的几倍：仿真相机 1.5Hz（0.67s/帧）、真机 30Hz。
+    # 超过这个时间没有新帧就报"无人"并停止发位置 —— 否则相机冻帧/掉线后
+    # 会拿最后一帧反复判"有人"，跟随器朝着画面里的幽灵一直开。
+    frame_timeout: 1.5
+    depth_timeout: 1.0     # 深度单独判；超时退回"躯干高度/像素高度"粗估
 
 /lightdog_light_auto:
   ros__parameters:
@@ -62,14 +69,21 @@
     angle_tol: 0.06
     side_turn_only: 0.9
     person_timeout: 1.5
+    # dock_manager 以 10Hz 发 /dock/inhibit；它挂了以后最后那条 true 会一直
+    # 留在跟随器里，表现为「跟随彻底不工作」。超过这个时间没新消息就解除。
+    inhibit_timeout: 5.0
     # 不直接发 /cmd_vel：交给 twist_mux 仲裁，再由 collision_monitor 兜碰撞
     cmd_vel_topic: /cmd_vel_follow
     enabled: true
 
 # /cmd_vel 多源仲裁。优先级：回充 30 > 跟随 20 > Nav2 10。
-# 超时窗口要比发布周期宽一截：跟跟随节点 10Hz 发（0.1s/条），给 0.6s
-# 是容忍软件渲染下丢帧；Nav2 空闲时 velocity_smoother 也会以 20Hz 发零速，
-# 所以 nav 源几乎总是「活跃」，靠优先级压制而不是靠超时。
+# 每个源有两个窗口：
+#   *_timeout  源窗口：上游还在发包吗（决定谁赢仲裁）
+#   *_hold     指令窗口：最后一条指令还新鲜吗（决定能不能照抄）
+# 只用一个窗口是有害的 —— 上游被 kill 后，最后一条 Twist 会在剩余窗口内被
+# 原样转发，0.25m/s × 1s = 25cm 足够撞翻茶几。超过 hold 就输出零速，
+# 状态里标成 follow(stale)。
+# hold 要显著大于上游发布周期（跟随 10Hz → 0.1s/条），并小于 timeout。
 /lightdog_twist_mux:
   ros__parameters:
     # 故意不用 sim time：超时窗口回答的是「上游还在不在发包」，
@@ -78,12 +92,15 @@
     nav_topic: /cmd_vel_smoothed
     nav_priority: 10
     nav_timeout: 0.6
+    nav_hold: 0.30
     follow_topic: /cmd_vel_follow
     follow_priority: 20
     follow_timeout: 0.6
+    follow_hold: 0.30
     dock_topic: /cmd_vel_dock
     dock_priority: 30
     dock_timeout: 1.0
+    dock_hold: 0.50       # docking_server 状态切换时会停顿，给宽一点
     out_topic: /cmd_vel_muxed
     publish_rate: 20.0
     zero_on_idle: true

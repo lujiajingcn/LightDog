@@ -48,6 +48,7 @@ tf2 查询。
 
 import math
 import sys
+import time
 
 import numpy as np
 
@@ -155,12 +156,18 @@ def image_to_gray(msg: Image):
 def rgb_image(msg: Image):
     """sensor_msgs/Image -> (H, W, 3) uint8 RGB，仅调试画框用。"""
     h, w = msg.height, msg.width
+    if h <= 0 or w <= 0:
+        return None
     enc = msg.encoding.lower()
     buf = np.frombuffer(msg.data, dtype=np.uint8)
     if enc in ('rgb8', 'bgr8'):
+        if buf.size < h * w * 3:
+            return None
         a = buf[:h * w * 3].reshape(h, w, 3)
         return a[:, :, ::-1].copy() if enc == 'bgr8' else a.copy()
     if enc in ('rgba8', 'bgra8'):
+        if buf.size < h * w * 4:
+            return None
         a = buf[:h * w * 4].reshape(h, w, 4)[:, :, :3]
         return a[:, :, ::-1].copy() if enc == 'bgra8' else a.copy()
     return None
@@ -239,6 +246,19 @@ class ArucoDockDetector(Node):
         self.dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
         self.detector_params = cv2.aruco.DetectorParameters_create() \
             if hasattr(cv2.aruco, 'DetectorParameters_create') else cv2.aruco.DetectorParameters()
+        # OpenCV >= 4.7 推荐 ArucoDetector 对象；老的 detectMarkers(gray, dict,
+        # parameters=...) 在新版本里签名已经变了（apt 一升级就静默失效）。
+        # 有 ArucoDetector 就用它，没有才退回老接口 —— 两条路返回值都是
+        # (corners, ids, rejected)。
+        self._aruco = None
+        if hasattr(cv2.aruco, 'ArucoDetector'):
+            try:
+                self._aruco = cv2.aruco.ArucoDetector(self.dictionary, self.detector_params)
+            except Exception:
+                self._aruco = None
+        if self._aruco is None:
+            self.get_logger().warn(
+                '当前 opencv 没有 ArucoDetector（<4.7），退回 detectMarkers 老接口')
 
         half = self.marker_length / 2.0
         self.obj_points = np.array([
@@ -253,16 +273,26 @@ class ArucoDockDetector(Node):
         self.n_seen = 0
         self.n_frames = 0
 
+        # 最新一帧 + 处理状态。检测放在定时器里跑（rate Hz），不在图像回调里跑：
+        # 回调里做 detectMarkers + solvePnP，30fps 下会吃满一个 ARM 核，
+        # 而且 `rate` 参数形同虚设。对准只需要 10Hz。
+        self.latest = None
+        self.latest_wall = 0.0
+        self._last_processed = None      # 上一帧的 header.stamp，避免重复检测
+        self.visible = False
+
         sensor_qos = QoSProfile(depth=1,
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST)
 
-        self.create_subscription(Image, str(p('image_topic').value), self.on_image, sensor_qos)
+        self.create_subscription(Image, str(p('image_topic').value), self._on_image, sensor_qos)
         self.create_subscription(CameraInfo, str(p('info_topic').value), self.on_info, sensor_qos)
 
         self.pose_pub = self.create_publisher(PoseStamped, '/detected_dock_pose', 5)
         self.vis_pub = self.create_publisher(Bool, '/dock/marker_visible', 5)
         self.dbg_pub = self.create_publisher(Image, '/dock/debug_image', 2) if self.publish_debug else None
+
+        self.create_timer(1.0 / max(1.0, self.rate), self._tick)
 
         self.get_logger().info(
             f'ArUco dock detector 就绪：{dict_name} id={self.marker_id} '
@@ -279,15 +309,48 @@ class ArucoDockDetector(Node):
         self.camera_matrix = k
         self.dist = d
 
-    def on_image(self, msg: Image):
-        if self.camera_matrix is None:
+    def _on_image(self, msg: Image):
+        """只收帧，不做检测（检测在 _tick 里按 rate 跑）。"""
+        self.latest = msg
+        self.latest_wall = time.monotonic()
+
+    def _detect_markers(self, gray):
+        if self._aruco is not None:
+            return self._aruco.detectMarkers(gray)
+        return cv2.aruco.detectMarkers(gray, self.dictionary,
+                                       parameters=self.detector_params)
+
+    def _tick(self):
+        # 定时器回调里抛异常会直接把 rclpy 的 spin 打断（节点假死）。
+        # 一帧坏数据不该让回充彻底失效，所以在这里兜一层。
+        try:
+            self._tick_impl()
+        except Exception as e:
+            self.get_logger().warn(f'ArUco 检测异常：{e}', throttle_duration_sec=10.0)
+
+    def _tick_impl(self):
+        msg = self.latest
+        if msg is None or self.camera_matrix is None:
             return
+        # 相机断流时不能让 marker_visible 一直停在 true：对准逻辑会以为
+        # 桩还在视野里，于是原地微调、永远不进入扫描。
+        if (time.monotonic() - self.latest_wall) > 1.0:
+            if self.visible:
+                self.visible = False
+                self.vis_pub.publish(Bool(data=False))
+            return
+
+        stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        if stamp == self._last_processed:
+            return                      # 没有新帧，别重复算
+        self._last_processed = stamp
+
         gray = image_to_gray(msg)
         if gray is None:
             return
 
         self.n_frames += 1
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary, parameters=self.detector_params)
+        corners, ids, _ = self._detect_markers(gray)
 
         visible = False
         if ids is not None and len(ids) > 0:
@@ -327,6 +390,7 @@ class ArucoDockDetector(Node):
                 break
 
         self.vis_pub.publish(Bool(data=visible))
+        self.visible = visible
 
         if self.dbg_pub is not None and self.n_frames % 3 == 0:
             rgb = rgb_image(msg)

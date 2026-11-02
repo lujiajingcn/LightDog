@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>lightdog</name>
-  <version>0.1.0</version>
+  <version>0.4.0</version>
   <description>
     LightDog 桌面陪伴机器人：LED 亮度控制、电池状态可视化，以及在 linorobot2 之上
     的 URDF / launch 覆盖层（不修改上游源码）。

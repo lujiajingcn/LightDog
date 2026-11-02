@@ -109,10 +109,18 @@ def image_to_bgr(msg: Image):
 
 
 class FrameHub:
-    """相机帧的单一存放点：ROS 回调写，HTTP 线程读。"""
+    """相机帧的单一存放点：ROS 回调投递，编码线程做 JPEG，HTTP 线程读。
+
+    为什么编码不放在 ROS 回调里：`_on_image` 跑在 executor 线程上，
+    30fps 下每帧 imencode（640x480 在 ARM 上几毫秒）会把 executor 占满，
+    `/status`、`/api/v1/...` 这些同进程的 HTTP 请求跟着抖。
+    这里用**单槽信箱**：编码跟不上时丢最旧的一帧，而不是无限排队
+    （排队会把延迟越拉越大，手机端看到的是几十秒前的画面）。
+    """
 
     def __init__(self, quality=75):
-        self._cv = threading.Condition()
+        self._cv = threading.Condition()      # 保护 _jpeg/_seq
+        self._mbox = threading.Condition()    # 保护待编码信箱
         self._jpeg = None
         self._seq = 0
         self._t = None
@@ -120,28 +128,66 @@ class FrameHub:
         self._last = None
         self._quality = quality
         self._count = 0
+        self._dropped = 0
         self._width = 0
         self._height = 0
 
+        self._raw = None
+        self._raw_n = 0
+        self._stop = False
+        self._enc_thread = threading.Thread(
+            target=self._encode_worker, name='frame-encoder', daemon=True)
+        self._enc_thread.start()
+
     def put(self, bgr):
-        ok, buf = cv2.imencode('.jpg', bgr,
-                               [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
-        if not ok:
-            return
-        now = time.time()
-        with self._cv:
-            if self._last is not None:
-                dt = now - self._last
-                if dt > 1e-3:
-                    inst = 1.0 / dt
-                    self._fps = inst if self._fps <= 0 else (self._fps * 0.8 + inst * 0.2)
-            self._last = now
-            self._jpeg = buf.tobytes()
-            self._seq += 1
-            self._t = now
-            self._count += 1
-            self._height, self._width = bgr.shape[0], bgr.shape[1]
-            self._cv.notify_all()
+        """投递一帧。不编码、不阻塞，回调里调用是安全的。"""
+        with self._mbox:
+            if self._raw is not None:
+                # 编码线程还没取走上一帧 -> 直接覆盖，并记账
+                self._dropped += 1
+            self._raw = bgr
+            self._raw_n += 1
+            self._mbox.notify()
+
+    def _encode_worker(self):
+        while True:
+            with self._mbox:
+                while self._raw is None and not self._stop:
+                    self._mbox.wait(0.5)
+                if self._stop:
+                    return
+                bgr = self._raw
+                self._raw = None
+
+            try:
+                ok, buf = cv2.imencode(
+                    '.jpg', bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
+            except Exception:
+                ok, buf = False, None
+            if not ok:
+                continue
+            data = buf.tobytes()
+            now = time.time()
+
+            with self._cv:
+                if self._last is not None:
+                    dt = now - self._last
+                    if dt > 1e-3:
+                        inst = 1.0 / dt
+                        self._fps = inst if self._fps <= 0 else (self._fps * 0.8 + inst * 0.2)
+                self._last = now
+                self._jpeg = data
+                self._seq += 1
+                self._t = now
+                self._count += 1
+                self._height, self._width = bgr.shape[0], bgr.shape[1]
+                self._cv.notify_all()
+
+    def close(self):
+        with self._mbox:
+            self._stop = True
+            self._mbox.notify_all()
+        self._enc_thread.join(timeout=2.0)
 
     def get(self):
         with self._cv:
@@ -166,6 +212,7 @@ class FrameHub:
                 'fps': round(self._fps, 2),
                 'age': round(age, 2),
                 'frames': self._count,
+                'dropped': self._dropped,
                 'width': self._width,
                 'height': self._height,
             }
@@ -418,7 +465,44 @@ class LightDogServer(Node):
 
     # ---------- 文件索引 ----------
 
+    def _clip_index(self):
+        """把 recorder 写的 clips.jsonl 读成 {文件名: 记录}，按 (mtime,size) 缓存。
+
+        为什么 server 要读这个文件：`os.listdir` 只能给出文件大小和 mtime，
+        手机端就没法显示「这段多长、什么时候录的」。时段元数据本来就在索引里，
+        没必要在 HTTP 层再解一遍 mp4（容器里连 ffprobe 都没有）。
+
+        容错优先：索引缺失/半行/坏 JSON 一律跳过，退化成「只有大小」的旧行为，
+        绝不能让 /api/v1/clips 整个 500 —— 录像文件本身是好的。
+        """
+        p = os.path.join(self.data_dir, 'clips.jsonl')
+        try:
+            st = os.stat(p)
+        except OSError:
+            return {}
+        key = (st.st_mtime_ns, st.st_size)
+        if getattr(self, '_clip_idx_key', None) == key:
+            return self._clip_idx
+        idx = {}
+        try:
+            with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(r, dict) and r.get('file'):
+                        idx[r['file']] = r
+        except OSError:
+            idx = {}
+        self._clip_idx, self._clip_idx_key = idx, key
+        return idx
+
     def _clips(self):
+        meta = self._clip_index()
         out = []
         try:
             for name in os.listdir(self.clips_dir):
@@ -426,13 +510,22 @@ class LightDogServer(Node):
                     continue
                 try:
                     p = os.path.join(self.clips_dir, name)
-                    out.append({'file': name, 'bytes': os.path.getsize(p),
-                                'mtime': os.path.getmtime(p)})
+                    item = {'file': name, 'bytes': os.path.getsize(p),
+                            'mtime': os.path.getmtime(p)}
                 except OSError:
                     continue
+                m = meta.get(name)
+                if m:
+                    for k in ('seq', 't0', 't1', 'wall', 'frames', 'fps'):
+                        if k in m:
+                            item[k] = m[k]
+                    if 't0' in m and 't1' in m:
+                        item['duration'] = round(float(m['t1']) - float(m['t0']), 2)
+                out.append(item)
         except FileNotFoundError:
             pass
-        out.sort(key=lambda c: c['file'])
+        # 有 seq 就按 seq 排：分段轮转后文件名会绕回去，纯字典序会把新段排到最前
+        out.sort(key=lambda c: (c.get('seq', -1), c['file']))
         return out
 
     def _events(self):
@@ -451,6 +544,13 @@ class LightDogServer(Node):
             except Exception:
                 continue
             meta.setdefault('id', name)
+            # 旧版本录的事件 meta 里没有 pre_sec/post_sec/duration（那时候只有
+            # t_from/t_to）。这里就地补出来，免得手机端对着一堆老视频显示"—"。
+            if 'duration' not in meta and 't_from' in meta and 't_to' in meta:
+                try:
+                    meta['duration'] = round(float(meta['t_to']) - float(meta['t_from']), 2)
+                except (TypeError, ValueError):
+                    pass
             out.append(meta)
         out.sort(key=lambda m: m.get('wall', 0), reverse=True)
         return out
@@ -557,7 +657,9 @@ class LightDogServer(Node):
 # ======================================================================
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'LightDog/0.4'
+    # 与 package.xml 的 <version> 保持一致（曾出现 0.4 / 0.1.0 两个数，
+    # 排查线上问题时分不清跑的是哪个包）。
+    server_version = 'LightDog/0.4.0'
     protocol_version = 'HTTP/1.1'
 
     # ---- 基础设施 ----
@@ -850,6 +952,22 @@ class Handler(BaseHTTPRequestHandler):
             req = {}
         req.setdefault('type', 'manual')
         req.setdefault('label', '手动触发')
+        # 窗口字段兼容：recorder 只认 `pre` / `post`，而事件 meta 里暴露的是
+        # `pre_sec` / `post_sec`，客户端照着 meta 写就会传后者。以前直接原样转发，
+        # 结果是「202 受理成功、但按默认 10/10 切」—— 静默忽略，比报错还难查。
+        # 这里两个名字都收，统一成 recorder 认识的键，并把范围夹到 0~300s
+        # （防止一个手滑的 pre=1e9 把整个环存都扫一遍）。
+        for src, dst in (('pre_sec', 'pre'), ('post_sec', 'post')):
+            if src in req and dst not in req:
+                try:
+                    req[dst] = max(0.0, min(300.0, float(req[src])))
+                except (TypeError, ValueError):
+                    pass
+            elif dst in req:
+                try:
+                    req[dst] = max(0.0, min(300.0, float(req[dst])))
+                except (TypeError, ValueError):
+                    pass
         # 交给 recorder 去做实际切片：后端不碰视频，只当触发器
         msg = String()
         msg.data = json.dumps(req, ensure_ascii=False)
@@ -975,6 +1093,7 @@ def main(args=None):
     finally:
         httpd.shutdown()
         httpd.server_close()
+        node.hub.close()          # 停掉 JPEG 编码线程
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

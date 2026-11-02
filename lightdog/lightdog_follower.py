@@ -39,6 +39,7 @@ command_timeout 一群发布者，跟随指令会被它们的空闲零速淹没�
 
 import math
 import sys
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -62,6 +63,10 @@ class PersonFollower(Node):
         self.declare_parameter('angle_tol', 0.06)         # 角度死区
         self.declare_parameter('side_turn_only', 0.9)     # 超过此角度只转不走
         self.declare_parameter('person_timeout', 1.5)
+        # dock_manager 以 10Hz 发 /dock/inhibit。它要是崩了/被杀，最后那条
+        # true 会永远留在跟随器里 —— 表现为「跟随彻底不工作，日志里什么都没有」。
+        # 超过这个墙钟时间没再收到 inhibit 就视为回充已结束（并打一条 error）。
+        self.declare_parameter('inhibit_timeout', 5.0)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel_follow')
         self.declare_parameter('enabled', True)
 
@@ -76,16 +81,19 @@ class PersonFollower(Node):
         self.ang_tol = float(p('angle_tol').value)
         self.side_only = float(p('side_turn_only').value)
         self.timeout = float(p('person_timeout').value)
+        self.inhibit_timeout = float(p('inhibit_timeout').value)
         self.enabled = bool(p('enabled').value)
 
         self.person = None            # 最新一次人位置
         self.present = False
         self.last_present = None      # rclpy Time
-        # 回充期间让位。dock_manager 在 DOCKING/UNDOCKING 时把 /dock/inhibit 置 true。
+        # 回充期间让位。dock_manager 在 ALIGNING/DOCKING/DOCKED/UNDOCKING 时把
+        # /dock/inhibit 置 true（DOCKED 也置 true，否则充电时人一经过就会被开走）。
         # 只靠优先级其实也能压住（dock 30 > follow 20），但跟随节点会一直发
         # 非零速度去"抢"，docking 一结束人还在原地，机器人立刻掉头追人 ——
         # 这不是低电回充该有的行为。所以显式认这个标志。
         self.inhibited = False
+        self.inhibit_stamp = 0.0      # 最后一条 /dock/inhibit 的墙钟时刻
 
         self.create_subscription(PointStamped, '/person/position', self._on_pos, 10)
         self.create_subscription(Bool, '/person/present', self._on_present, 10)
@@ -116,6 +124,7 @@ class PersonFollower(Node):
             self.get_logger().info(
                 '回充占用中，跟随让位' if msg.data else '回充结束，跟随恢复')
         self.inhibited = bool(msg.data)
+        self.inhibit_stamp = time.monotonic()
 
     # ---------- 控制 ----------
 
@@ -128,7 +137,20 @@ class PersonFollower(Node):
     def _tick(self):
         cmd = Twist()
 
-        if not self.enabled or self.inhibited or self._person_lost() or self.person is None:
+        inhibited = self.inhibited
+        if inhibited and self.inhibit_stamp > 0.0:
+            silent = time.monotonic() - self.inhibit_stamp
+            if silent > self.inhibit_timeout:
+                # dock_manager 已经不再发 inhibit 了（崩了/被 kill），
+                # 不能再让这条陈旧的 true 把跟随永久锁死。
+                self.inhibited = False
+                self.inhibit_stamp = 0.0
+                inhibited = False
+                self.get_logger().error(
+                    f'{silent:.1f}s 没收到 /dock/inhibit，判定回充节点已退出，'
+                    f'跟随恢复（若回充仍在进行，请检查 dock_manager）')
+
+        if not self.enabled or inhibited or self._person_lost() or self.person is None:
             self.pub.publish(cmd)     # 持续发零速，防止底层保持上一条指令
             return
 

@@ -128,6 +128,9 @@ class AlertManager(Node):
         self.rounds = 0
         self.call_attempts = []
         self.last_call = None
+        # 联系人缓存：(mtime_ns, size) -> [{name, phone}]。见 _load_contacts。
+        self._contacts_key = object()     # 初始值不可能命中，第一次必读
+        self._contacts_cache = []
 
         self.create_subscription(String, str(p('fall_state_topic').value),
                                  self._on_fall, 10)
@@ -316,15 +319,40 @@ class AlertManager(Node):
         self._publish()
 
     def _load_contacts(self):
+        """读紧急联系人，按文件 mtime+size 缓存。
+
+        这个函数被 `_publish()` 以 1Hz 调用，而 `_publish` 在 STATE 状态上报里
+        也是 1Hz —— 不缓存就是永久每秒读一次 contacts.json（在 SD 卡上是一直
+        在磨损的写放大）。文件被手机端改过时 mtime 会变，缓存自然失效。
+        """
+        try:
+            st = os.stat(self.contacts_path)
+            key = (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            key = None
+        except OSError:
+            key = None
+
+        if key is not None and key == self._contacts_key:
+            return self._contacts_cache
+        # 文件不存在时也缓存，但仍然每次都 stat（一次 syscall，不读盘）
+
+        self._contacts_key = key
+        if key is None:
+            self._contacts_cache = []
+            return self._contacts_cache
+
         try:
             with open(self.contacts_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except FileNotFoundError:
-            return []
+            self._contacts_cache = []
+            return self._contacts_cache
         except Exception as e:
             self.get_logger().warn(f'读 {self.contacts_path} 失败：{e}',
                                    throttle_duration_sec=30.0)
-            return []
+            self._contacts_cache = []
+            return self._contacts_cache
         if isinstance(data, dict):
             data = data.get('contacts', [])
         out = []
@@ -332,6 +360,7 @@ class AlertManager(Node):
             if isinstance(c, dict) and str(c.get('phone', '')).strip():
                 out.append({'name': str(c.get('name', '紧急联系人')),
                             'phone': str(c.get('phone')).strip()})
+        self._contacts_cache = out
         return out
 
     def _maybe_call(self):

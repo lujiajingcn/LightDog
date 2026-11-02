@@ -37,6 +37,31 @@ Nav2 的运动节点整个 kill 掉，代价是**丢了碰撞保护**。车装�
 2. 活跃源里 `*_priority` 最大的那个独占输出；同优先级按 dock > follow > nav。
 3. 一个活跃源都没有 → 发零速（默认），避免底层保持上一条指令。
 
+## 两个窗口：源活着 ≠ 指令还能用
+
+只用一个超时窗口是有害的：上游进程猝死（被 kill、段错误、USB 掉线）以后，
+最后一条 Twist 还留在缓存里，在剩下的窗口内会被原样转发给底盘。
+0.25 m/s × 1.0s = 25cm —— 足够把茶几上的杯子撞下来。
+
+所以每个源有**两个**窗口：
+
+- `*_timeout`（源窗口，0.6~1.0s）：「这个源还活着吗」。决定谁赢得仲裁。
+- `*_hold`（指令窗口，0.3~0.5s）：「这条指令还新鲜吗」。超过就**输出零速**，
+  状态里标成 `follow(stale)`。
+
+`*_hold` 必须显著大于上游的正常发布周期（跟随 10Hz → 0.1s/条），
+又要小于 `*_timeout`。启动时会做一次钳制：`hold = min(hold, timeout)`。
+
+但**配置值不是最终生效值**：两个窗口都会按上游实测发布周期自适应放大
+（`CmdVelSource._window`，窗口 = max(配置值, k × 实测周期)，k 分别为 4 和 2）。
+这是被仿真打出来的教训：跟随节点按 ROS 时钟 10Hz 发，实时因子 0.21x 时墙钟上
+只有 4.8Hz、间隔最大 0.32s，固定 0.30s 的 hold 被正常发包反复触发，
+仲裁在 `follow` / `follow(stale)` 之间每 0.3s 抖一次，机器人几乎不给速度。
+真机 RTF≈1 时 k×周期小于配置值，行为与固定窗口完全一致。
+
+这仍然只是软件兜底。真正的刹车必须由 MCU 固件做：300ms 收不到速度指令
+就断 PWM。参见 P6 的「真机安全」一节。
+
 超时用**墙钟**（`time.monotonic()`）而不是 ROS 时钟：这个窗口回答的是
 「上游还在不在发包」，与仿真跑多快无关。本机软件渲染实时因子只有 0.22x，
 用 sim time 会把 0.6s 的窗口拖成 2.7s 墙钟，上游已经死了还在转发旧指令。
@@ -80,24 +105,70 @@ from geometry_msgs.msg import Twist
 
 
 class CmdVelSource:
-    """一个速度输入源：话题、优先级、超时窗口。"""
+    """一个速度输入源：话题、优先级、源窗口（timeout）、指令窗口（hold）。
 
-    __slots__ = ('name', 'topic', 'prio', 'timeout', 'msg', 'stamp', 'count')
+    两个窗口都是**墙钟**，但会按上游实测发布周期自适应放大（见 _window）。
+    原因：上游按 ROS 时钟定时（跟随节点 10Hz），仿真实时因子 0.21x 时墙钟上只有
+    4.8Hz、间隔最大 0.32s。固定 0.30s 的 hold 会被这种正常发包反复触发，
+    表现为仲裁在 follow / follow(stale) 之间抖、车走走停停（实测车完全不动）。
+    """
 
-    def __init__(self, name, topic, prio, timeout):
+    __slots__ = ('name', 'topic', 'prio', 'timeout', 'hold',
+                 'msg', 'stamp', 'count', 'period')
+
+    def __init__(self, name, topic, prio, timeout, hold):
         self.name = name
         self.topic = topic
         self.prio = prio
         self.timeout = timeout
+        # hold 不能超过 timeout，否则「源已经掉了」这条判断永远先命中，
+        # hold 形同虚设（配置写反时不至于静默失效）。
+        self.hold = max(0.05, min(float(hold), timeout))
         self.msg = None       # 最后一条消息
         self.stamp = None     # 收到时刻（time.monotonic）
         self.count = 0
+        self.period = 0.0     # 实测发布间隔（墙钟 EWMA），0 表示还没测出来
+
+    def touch(self, now, msg):
+        """记录一条新指令，顺便估计上游真实发布周期。"""
+        if self.stamp is not None:
+            dt = now - self.stamp
+            # 只采纳合理区间，避免暂停/恢复或重启后的第一个间隔把周期带偏
+            if 1e-3 < dt < 5.0:
+                self.period = dt if self.period <= 0.0 else (0.7 * self.period + 0.3 * dt)
+        self.stamp = now
+        self.msg = msg
+        self.count += 1
+
+    def _window(self, base, k):
+        """配置窗口与「k 个实测周期」取大者。
+
+        真机 RTF≈1 时 k*period 通常小于配置值，行为和原来完全一致；
+        仿真慢速时自动放宽，但**仍然有限**：上游一死，最多 k 个周期就判过期。
+        """
+        if self.period <= 0.0:
+            return base
+        return max(base, k * self.period)
+
+    def fresh_window(self):
+        """指令新鲜窗口（实际生效值）。"""
+        return self._window(self.hold, 2.0)
+
+    def alive_window(self):
+        """源存活窗口（实际生效值）。"""
+        return self._window(self.timeout, 4.0)
 
     def is_active(self, now):
-        """在超时窗口内收到过消息就算活跃。"""
+        """在源窗口内收到过消息就算活跃（决定谁能赢得仲裁）。"""
         if self.stamp is None:
             return False
-        return (now - self.stamp) <= self.timeout
+        return (now - self.stamp) <= self.alive_window()
+
+    def is_fresh(self, now):
+        """最后一条指令还够新吗？不够新就只能发零速，不能照抄。"""
+        if self.stamp is None:
+            return False
+        return (now - self.stamp) <= self.fresh_window()
 
 
 class TwistMux(Node):
@@ -108,14 +179,18 @@ class TwistMux(Node):
         self.declare_parameter('nav_topic', '/cmd_vel_smoothed')
         self.declare_parameter('nav_priority', 10)
         self.declare_parameter('nav_timeout', 0.6)
+        self.declare_parameter('nav_hold', 0.30)
 
         self.declare_parameter('follow_topic', '/cmd_vel_follow')
         self.declare_parameter('follow_priority', 20)
         self.declare_parameter('follow_timeout', 0.6)
+        self.declare_parameter('follow_hold', 0.30)
 
         self.declare_parameter('dock_topic', '/cmd_vel_dock')
         self.declare_parameter('dock_priority', 30)
         self.declare_parameter('dock_timeout', 1.0)
+        # docking_server 的指令周期比跟随慢（状态切换时会停顿），给宽一点
+        self.declare_parameter('dock_hold', 0.50)
 
         self.declare_parameter('out_topic', '/cmd_vel_muxed')
         self.declare_parameter('publish_rate', 20.0)
@@ -125,11 +200,17 @@ class TwistMux(Node):
         # 顺序即同优先级下的偏好：dock > follow > nav
         self.sources = [
             CmdVelSource('dock', str(p('dock_topic').value),
-                         int(p('dock_priority').value), float(p('dock_timeout').value)),
+                         int(p('dock_priority').value),
+                         float(p('dock_timeout').value),
+                         float(p('dock_hold').value)),
             CmdVelSource('follow', str(p('follow_topic').value),
-                         int(p('follow_priority').value), float(p('follow_timeout').value)),
+                         int(p('follow_priority').value),
+                         float(p('follow_timeout').value),
+                         float(p('follow_hold').value)),
             CmdVelSource('nav', str(p('nav_topic').value),
-                         int(p('nav_priority').value), float(p('nav_timeout').value)),
+                         int(p('nav_priority').value),
+                         float(p('nav_timeout').value),
+                         float(p('nav_hold').value)),
         ]
         self.zero_on_idle = bool(p('zero_on_idle').value)
         rate = max(1.0, float(p('publish_rate').value))
@@ -138,6 +219,7 @@ class TwistMux(Node):
         self.pub_state = self.create_publisher(String, '/cmd_vel_mux_state', 10)
 
         self.active_name = None       # 上一个周期的赢家，用来只打切换日志
+        self._stale = False           # 上一个周期是否是「源活着但指令失效」
         self.subs = []
         for src in self.sources:
             # 用默认参数绑定的 lambda 捕获当前 src，避免闭包陷阱
@@ -146,16 +228,16 @@ class TwistMux(Node):
 
         self.create_timer(1.0 / rate, self._tick)
 
-        desc = ', '.join(f'{s.name}={s.topic}(prio {s.prio}, {s.timeout:.1f}s)'
-                         for s in sorted(self.sources, key=lambda x: -x.prio))
+        desc = ', '.join(
+            f'{s.name}={s.topic}(prio {s.prio}, timeout {s.timeout:.1f}s, '
+            f'hold {s.hold:.2f}s)'
+            for s in sorted(self.sources, key=lambda x: -x.prio))
         self.get_logger().info(f'TwistMux ready: {desc} -> {p("out_topic").value}')
 
     # ---------- 回调 ----------
 
     def _on_twist(self, msg: Twist, src: CmdVelSource):
-        src.msg = msg
-        src.stamp = time.monotonic()
-        src.count += 1
+        src.touch(time.monotonic(), msg)
 
     # ---------- 仲裁 ----------
 
@@ -170,22 +252,36 @@ class TwistMux(Node):
         return best
 
     def _tick(self):
+        now = time.monotonic()
         best = self._pick()
         name = best.name if best is not None else 'idle'
+
+        # 源还在窗口内，但最后一条指令已经过期 —— 上游很可能猝死了。
+        # 这时**不能**把旧 Twist 继续转发，只能发零速，并在状态里标 stale，
+        # 让排查的人一眼看出「不是没人要动，是发指令的那个已经没了」。
+        stale = best is not None and not best.is_fresh(now)
+        if stale:
+            name = f'{best.name}(stale)'
 
         if name != self.active_name:
             if best is None:
                 self.get_logger().info('仲裁: 无活跃源 -> 输出零速')
+            elif stale:
+                self.get_logger().warn(
+                    f'仲裁: {best.name} 已 {now - best.stamp:.2f}s 没更新指令'
+                    f'（窗口 {best.fresh_window():.2f}s，配置 hold {best.hold:.2f}s）'
+                    f'-> 输出零速')
             else:
                 self.get_logger().info(
                     f'仲裁: 切到 {best.name}（{best.topic}, prio {best.prio}）')
             self.active_name = name
+        self._stale = stale
 
         # 状态周期发布（不是只在切换时发）：否则 `ros2 topic echo --once`
         # 得等到下次切换才有消息，排查"为什么车不动"时全是超时。
         self.pub_state.publish(String(data=name))
 
-        if best is None:
+        if best is None or stale:
             if self.zero_on_idle:
                 self.pub.publish(Twist())
             return

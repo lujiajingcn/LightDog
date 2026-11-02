@@ -29,7 +29,14 @@ services:
     environment:
       - IGN_IP=127.0.0.1
       - GZ_IP=127.0.0.1
-      - LIBGL_ALWAYS_SOFTWARE=1
+      # 千万不要加 LIBGL_ALWAYS_SOFTWARE=1。
+      # 本机 Mesa 25.2.8 + WSL 透传的 /dev/dri(card0/renderD128，d3d12) 下，
+      # 它会让 gz sim 的 Sensors 系统在 RenderUtil::Init() 里直接段错误：
+      #   libEGL warning: Not allowed to force software rendering when API
+      #   explicitly selects a hardware device.
+      #   → libgallium: driCreateNewScreen3 → Segmentation fault
+      # 空着不设时 Mesa 自己回落到 kms_swrast（仍是软件渲染，实测 40 步正常收尾）。
+      # 用最小相机场景 /tmp/probe.sdf 复现/验证过：有这条 rc=139，去掉 rc=0。
       - MESA_GL_VERSION_OVERRIDE=4.0
       - DISPLAY=:200
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}

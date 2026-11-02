@@ -43,6 +43,7 @@ linorobot2_description/urdf/4wd_properties.urdf.xacro）。rpy 为零意味着�
 
 import math
 import sys
+import time
 
 import numpy as np
 
@@ -142,33 +143,59 @@ class PersonDetector(Node):
         self.declare_parameter('col_gap', 6)          # 列方向允许的空隙像素
         self.declare_parameter('range_min', 0.30)
         self.declare_parameter('range_max', 8.00)
-        # 形状约束：站立的人轮廓是竖长条，而场景里最容易误检的是各种小球/小方块
-        # （仿真人的头部肤色在渲染后饱和度会被抬高，H 也落在橙色区间）。
-        # 实测 1.4m 处的躯干 bbox 高/宽 ≈ 1.45，球形头 ≈ 1.17，所以卡 1.20。
-        self.declare_parameter('aspect_min', 1.20)
-        self.declare_parameter('min_height_px', 36)   # 再小的块不给跟
+        # 形状约束：只用来滤掉极端横向的色块，不能卡太紧。
+        # 相机装高只有 0.3745m（0.255 偏移 + 0.1195 base_link），人贴近到
+        # 0.8m 时躯干在画面里只剩一条横带（140x56px，高/宽 = 0.4）。
+        # 所以默认值必须跟 p2_params.yaml 一致（0.55 / 30）—— 这里的默认值
+        # 曾经是 1.20 / 36，不带 params 启动就会复现 P2 §6.5 的「人贴近就丢检」。
+        self.declare_parameter('aspect_min', 0.55)
+        self.declare_parameter('min_height_px', 30)
 
         # ---- 输出 ----
         self.declare_parameter('publish_debug', True)
         self.declare_parameter('rate', 10.0)          # 处理频率，软件渲染下别给太高
         self.declare_parameter('lost_timeout', 1.0)   # 超过这么久没检测到就报没人
+        # 帧新鲜度（**墙钟**秒）：回答的是「相机管线还在不在出帧」，与仿真
+        # 跑多快无关，所以刻意不用 ROS 时钟。必须大于相机周期的若干倍：
+        # 仿真相机实测 1.5Hz（0.67s/帧），真机 30Hz。1.5s 在仿真下容忍 2 帧丢失，
+        # 在真机上 1.5s 还没新帧就说明管线已经死了。
+        self.declare_parameter('frame_timeout', 1.5)
+        # 深度图单独判：彩色在出帧、深度掉了，是最常见的半失效状态。
+        # 这时不要拿旧深度配新彩色，退回「躯干高度/像素高度」粗估。
+        self.declare_parameter('depth_timeout', 1.0)
 
         p = self.get_parameter
         self.cam_off = list(p('camera_offset').value)
         self.h_min, self.h_max = p('h_min').value, p('h_max').value
-        self.s_min, self.s_max_v = p('s_min').value, p('v_min').value
+        self.s_min = float(p('s_min').value)
+        self.v_min = float(p('v_min').value)
         self.min_blob = p('min_blob_px').value
         self.col_gap = p('col_gap').value
         self.rng_min, self.rng_max = p('range_min').value, p('range_max').value
         self.aspect_min = float(p('aspect_min').value)
         self.min_h = int(p('min_height_px').value)
         self.publish_debug = p('publish_debug').value
+        self.frame_timeout = float(p('frame_timeout').value)
+        self.depth_timeout = float(p('depth_timeout').value)
+        self.lost_timeout = float(p('lost_timeout').value)
 
         self.fx = self.cx = None
         self.cy = None
         self.rgb = None
         self.depth = None
         self.last_seen = None
+
+        # 帧序号 + 到达时刻：只对**新帧**做一次检测，并能在相机断流时报无人。
+        # 没有这两个量时，_tick 会以 10Hz 对同一张旧图反复 _detect()，永远成功 ——
+        # 相机冻帧/掉线后 /person/present 恒 true，跟随器会朝着画面里的「幽灵」
+        # 一直开下去，灯也不灭。这是上真机前必须堵掉的坑。
+        self.rgb_seq = 0
+        self._det_seq = -1
+        self.rgb_wall = 0.0
+        self.depth_wall = 0.0
+
+        self.present = False          # 上一次判定结果，供无新帧时重发
+        self._warned_rgb_stall = False
 
         sensor_qos = QoSProfile(
             depth=1,
@@ -191,8 +218,10 @@ class PersonDetector(Node):
 
         self.get_logger().info(
             'LightDog person detector ready: '
-            f'H=[{self.h_min:.3f},{self.h_max:.3f}] S>{self.s_min} V>{self.s_max_v} '
-            f'range=[{self.rng_min},{self.rng_max}]m')
+            f'H=[{self.h_min:.3f},{self.h_max:.3f}] S>{self.s_min} V>{self.v_min} '
+            f'range=[{self.rng_min},{self.rng_max}]m '
+            f'aspect_min={self.aspect_min} min_h={self.min_h}px '
+            f'frame_timeout={self.frame_timeout:.1f}s')
 
     # ---------- 回调 ----------
 
@@ -211,9 +240,15 @@ class PersonDetector(Node):
 
     def _on_rgb(self, msg: Image):
         self.rgb = msg
+        self.rgb_seq += 1
+        self.rgb_wall = time.monotonic()
+        if self._warned_rgb_stall:
+            self._warned_rgb_stall = False
+            self.get_logger().info('相机图像恢复')
 
     def _on_depth(self, msg: Image):
         self.depth = msg
+        self.depth_wall = time.monotonic()
 
     # ---------- 主循环 ----------
 
@@ -223,6 +258,27 @@ class PersonDetector(Node):
         if self.fx is None or self.fx <= 1.0:
             return
 
+        now_mono = time.monotonic()
+        if (now_mono - self.rgb_wall) > self.frame_timeout:
+            # 相机断流/冻帧：绝不能拿最后一帧反复判「有人」。否则跟随器会对着
+            # 画面里的幽灵一直走，而这正是最危险的一种失效（人早就走开了）。
+            if not self._warned_rgb_stall:
+                self._warned_rgb_stall = True
+                self.get_logger().warn(
+                    f'相机 {now_mono - self.rgb_wall:.1f}s 没有新帧，'
+                    f'判定为无人并停止发布位置（检查相机/线缆/USB 带宽）')
+            self.last_seen = None
+            self.present = False
+            self.pub_present.publish(Bool(data=False))
+            return
+
+        if self.rgb_seq == self._det_seq:
+            # 没有新帧就不重复检测，但仍然按 rate 重发判定结果，
+            # 让下游的超时逻辑（/person/present 是 Bool，没有时间戳）照常工作。
+            self.pub_present.publish(Bool(data=self.present))
+            return
+        self._det_seq = self.rgb_seq
+
         det = self._detect()
 
         now = self.get_clock().now()
@@ -230,12 +286,13 @@ class PersonDetector(Node):
             present = False
             if self.last_seen is not None:
                 age = (now - self.last_seen).nanoseconds / 1e9
-                present = age < float(self.get_parameter('lost_timeout').value)
+                present = age < self.lost_timeout
         else:
             present = True
             self.last_seen = now
             self._publish_position(*det)
 
+        self.present = present
         self.pub_present.publish(Bool(data=present))
 
     def _detect(self):
@@ -247,7 +304,7 @@ class PersonDetector(Node):
 
         hh, ss, vv = rgb_to_hsv(rgb)
         mask = ((hh >= self.h_min) & (hh <= self.h_max) &
-                (ss >= self.s_min) & (vv >= self.s_max_v))
+                (ss >= self.s_min) & (vv >= self.v_min))
         if not mask.any():
             return None
 
@@ -298,7 +355,10 @@ class PersonDetector(Node):
         # 距离：掩码像素上的深度中位数（避开背景深度把目标拉远）
         z = None
         dmsg = self.depth
-        if dmsg is not None:
+        # 深度也要判新鲜度：彩色在出帧、深度掉了的时候，拿旧深度配新彩色
+        # 会把人物的位置算到上一次的位置上（人走动时表现为「距离粘住」）。
+        if (dmsg is not None
+                and (time.monotonic() - self.depth_wall) <= self.depth_timeout):
             d = image_to_depth(dmsg)
             if d is not None and d.shape == (h, w):
                 sub_mask = mask[v0:v1 + 1, u0:u1 + 1]

@@ -61,10 +61,26 @@ P1 实测：`charge 4.969/5.0Ah`（99.4%）时 `LinearBatteryPlugin` 报
     订阅  /dock/command               std_msgs/String       dock|undock|cancel|auto_on|auto_off
     发布  /dock/state                 std_msgs/String       状态机当前状态
     发布  /dock/inhibit               std_msgs/Bool         true 时跟随节点应让位
+                                                           （ALIGNING/DOCKING/DOCKED/UNDOCKING
+                                                            + 取消后的 1.5s 抑制期）
     发布  /dock/battery_ratio         std_msgs/Float32      当前用于判定的电量比
     发布  /cmd_vel_dock               geometry_msgs/Twist   仅 ALIGNING 阶段（对准旋转）
     action client  /dock_robot        nav2_msgs/DockRobot
     action client  /undock_robot      nav2_msgs/UndockRobot
+
+## 关于 inhibit 包含 DOCKED
+
+`DOCKED` 必须抑制跟随。充电时人从桩前走过是很平常的事，但跟随节点只要看到
+`/person/present` 就会发速度，而它（prio 20）和 docking 已经停止发指令的空档
+正好能让车从桩上开走；状态机却仍停在 DOCKED，`sim_charging` 继续按时间积分，
+表现为「明明没插上电，电量却越充越多」。
+
+## 关于 cancel
+
+`DockRobot` 的 goal_handle 必须保存下来，`cancel()` 才能真正调用
+`cancel_goal_async()`。只把本地 `state` 置为 IDLE 是假取消：docking_server
+仍在跑、仍在发 `/cmd_vel_dock`（prio 30 会压过跟随），而 `/dock/inhibit`
+已经放开 —— 两个控制器同时抢底盘。
 """
 
 import math
@@ -114,6 +130,10 @@ class DockManager(Node):
         self.declare_parameter('max_staging_time', 120.0)
         self.declare_parameter('max_retries', 2)
         self.declare_parameter('retry_cooldown', 20.0)
+        # 用户手动 cancel 之后的静默期。不设的话，只要电量还低于阈值，
+        # 下一秒 tick 就会重新判低电、3s 后再次发起回充 —— 表现为「点了取消，
+        # 车掉头又去充电」，取消按钮形同虚设（仿真里实测 3.3s 就重新 DOCKED）。
+        self.declare_parameter('cancel_cooldown', 120.0)
         self.declare_parameter('auto_dock', True)
 
         # ---- 视觉对准（ALIGNING）----
@@ -148,6 +168,7 @@ class DockManager(Node):
         self.max_staging_time = float(p('max_staging_time').value)
         self.max_retries = int(p('max_retries').value)
         self.retry_cooldown = float(p('retry_cooldown').value)
+        self.cancel_cooldown = float(p('cancel_cooldown').value)
         self.auto_dock = bool(p('auto_dock').value)
 
         self.align_before_dock = bool(p('align_before_dock').value)
@@ -175,8 +196,21 @@ class DockManager(Node):
         self.busy = False             # action 在飞
         self._dock_future = None
         self._undock_future = None
+        # 真正取消回充需要 goal_handle，不是 send_goal 返回的 future。
+        # 之前这里只存了 future，cancel() 就没法调 cancel_goal_async，
+        # 结果是「本地状态回到 IDLE，docking_server 还在跑、还在发 /cmd_vel_dock」。
+        self._dock_goal_handle = None
+        self._undock_goal_handle = None
+        # 取消/失败后的一小段抑制期：docking_server 收到 cancel 到真正停下来
+        # 有几个周期的延迟，这期间如果立刻放开 inhibit，跟随会和回充抢方向盘。
+        self._inhibit_until = 0.0
         self._last_fb = None
-        self._last_tick = time.monotonic()
+        self._last_tick_ros = None
+        # 纪元计数（epoch）。每次发起 / 取消回充都 +1，回调里带上发起时的
+        # epoch，对不上就直接丢弃 —— 这样「取消之后迟到的 result」不会被当成
+        # 一次真正的停靠失败，也不会污染下一次回充的重试计数。
+        self._dock_epoch = 0
+        self._undock_epoch = 0
 
         # 视觉对准用的状态
         self.dock_pose = None          # 最近一次 /detected_dock_pose
@@ -251,12 +285,15 @@ class DockManager(Node):
         if self.sim_ratio is not None and (now - self.sim_ratio_stamp) <= self.sim_battery_timeout:
             return self.sim_ratio
 
-        if self.battery is None:
-            return None
-
-        # 仿真充电时用积分量，覆盖真实 charge
+        # 仿真充电的积分量必须在 battery is None 之前判：gz 的 BatteryState 桥接
+        # 要几分钟才出第一帧，而 DOCKED 往往在它之前就发生了。原来先 return None
+        # 的话，这段窗口里 charge_ah 再涨也没人读，表现为「停在桩上、电量不动、
+        # 也不离桩」。charge_ah 只在 sim_charging 下写入，真机路径不受影响。
         if self.charge_ah is not None:
             return max(0.0, min(1.0, self.charge_ah / self.capacity))
+
+        if self.battery is None:
+            return None
 
         ch, cap = float(self.battery.charge), float(self.battery.capacity)
         if not math.isnan(ch) and not math.isnan(cap) and cap > 0.0:
@@ -276,20 +313,36 @@ class DockManager(Node):
 
     def tick(self):
         now = time.monotonic()
-        dt = max(1e-3, now - getattr(self, '_last_tick', now))
-        self._last_tick = now
         ratio = self.battery_ratio()
 
-        # sim_charging：停靠期间给电量充电（只在 DOCKED 时按真实时间积分）
+        # sim_charging：停靠期间给电量充电（只在 DOCKED 时积分）
         if self.sim_charging and self.state == DOCKED and ratio is not None:
+            # 注意这里用 ROS 时钟而不是上面的墙钟 dt：sim_charge_rate 的单位是
+            # 「Ah/仿真秒」，用墙钟积分会让充电速度乘上 1/实时因子（本机 0.22x
+            # 时快 4.5 倍），P1/P3 记录的充电时长就对不上了。
+            ros_now = self.get_clock().now()
+            last_ros = getattr(self, '_last_tick_ros', None)
+            self._last_tick_ros = ros_now
+            if last_ros is None:
+                sim_dt = 0.0
+            else:
+                sim_dt = (ros_now - last_ros).nanoseconds * 1e-9
+            sim_dt = max(0.0, min(sim_dt, 5.0))
             base = self.charge_ah if self.charge_ah is not None else ratio * self.capacity
-            self.charge_ah = min(self.capacity, base + self.sim_charge_rate * dt)
+            self.charge_ah = min(self.capacity, base + self.sim_charge_rate * sim_dt)
             ratio = self.charge_ah / self.capacity
+        else:
+            self._last_tick_ros = None
 
         if ratio is not None:
             self.pub_ratio.publish(Float32(data=float(ratio)))
         self.pub_state.publish(String(data=self.state))
-        self.pub_inhibit.publish(Bool(data=self.state in (ALIGNING, DOCKING, UNDOCKING)))
+        # DOCKED 也必须在抑制期里。否则充电时人从旁边走过，跟随节点
+        # （prio 20）会把人从桩上开走，而状态机还停在 DOCKED、sim_charging
+        # 继续积分 —— 表现为「没插着电，电量却越充越多」。
+        inhibit = (self.state in (ALIGNING, DOCKING, DOCKED, UNDOCKING)
+                   or now < self._inhibit_until)
+        self.pub_inhibit.publish(Bool(data=inhibit))
 
         if self.state == ALIGNING:
             self._tick_aligning(now)
@@ -347,6 +400,7 @@ class DockManager(Node):
             self.busy = False
             self.state = IDLE
             self.retry_until = now + self.retry_cooldown
+            self._inhibit_until = now + 1.0
             return
 
         tw = Twist()
@@ -416,7 +470,10 @@ class DockManager(Node):
             f'发送 DockRobot：dock_id={self.dock_id} '
             f'navigate_to_staging={self.navigate_to_staging}')
         self._dock_future = self.dock_client.send_goal_async(goal, self.on_dock_feedback)
-        self._dock_future.add_done_callback(self.on_dock_goal_response)
+        self._dock_epoch += 1
+        epoch = self._dock_epoch
+        self._dock_future.add_done_callback(
+            lambda f: self.on_dock_goal_response(f, epoch))
 
     def on_dock_feedback(self, feedback_msg):
         fb = feedback_msg.feedback
@@ -427,15 +484,27 @@ class DockManager(Node):
             self._last_fb = name
             self.get_logger().info(f'回充进度: {name}')
 
-    def on_dock_goal_response(self, future):
+    def on_dock_goal_response(self, future, epoch):
         goal_handle = future.result()
+        if epoch != self._dock_epoch:
+            # 这次 goal 属于已经被取消/被新一轮取代的流程
+            if goal_handle is not None and goal_handle.accepted:
+                self.get_logger().info('过期 dock goal 已被接受，立即取消')
+                goal_handle.cancel_goal_async()
+            return
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().error('回充 goal 被拒绝')
             self.fail_docking('goal rejected')
             return
-        goal_handle.get_result_async().add_done_callback(self.on_dock_result)
+        self._dock_goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(
+            lambda f: self.on_dock_result(f, epoch))
 
-    def on_dock_result(self, future):
+    def on_dock_result(self, future, epoch):
+        if epoch != self._dock_epoch:
+            self.get_logger().info('已取消的回充 goal 返回了结果，忽略（不记失败）')
+            return
+        self._dock_goal_handle = None
         result = future.result().result
         if result.success:
             self.get_logger().info(
@@ -452,6 +521,7 @@ class DockManager(Node):
 
     def fail_docking(self, reason):
         self.last_error = reason
+        self._dock_goal_handle = None
         self.pub_vel.publish(Twist())
         self.busy = False
         self.retries += 1
@@ -460,6 +530,7 @@ class DockManager(Node):
             self.get_logger().error('重试耗尽，放弃自动回充，冷却后再说')
             self.retries = 0
         self.retry_until = time.monotonic() + self.retry_cooldown
+        self._inhibit_until = time.monotonic() + 1.0
         self.state = IDLE
 
     def start_undocking(self):
@@ -476,35 +547,97 @@ class DockManager(Node):
         self.busy = True
         self.state = UNDOCKING
         self.get_logger().info('发起离桩')
+        self._undock_epoch += 1
+        epoch = self._undock_epoch
         self._undock_future = self.undock_client.send_goal_async(goal)
-        self._undock_future.add_done_callback(self.on_undock_goal_response)
+        self._undock_future.add_done_callback(
+            lambda f: self.on_undock_goal_response(f, epoch))
 
-    def on_undock_goal_response(self, future):
+    def on_undock_goal_response(self, future, epoch):
         goal_handle = future.result()
+        if epoch != self._undock_epoch:
+            if goal_handle is not None and goal_handle.accepted:
+                self.get_logger().info('过期离桩 goal 已被接受，立即取消')
+                goal_handle.cancel_goal_async()
+            return
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().error('离桩 goal 被拒绝')
             self.busy = False
             self.state = IDLE
             return
-        goal_handle.get_result_async().add_done_callback(self.on_undock_result)
+        self._undock_goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(
+            lambda f: self.on_undock_result(f, epoch))
 
-    def on_undock_result(self, future):
+    def on_undock_result(self, future, epoch):
+        if epoch != self._undock_epoch:
+            self.get_logger().info('已取消的离桩 goal 返回了结果，忽略')
+            return
+        self._undock_goal_handle = None
         result = future.result().result
         self.busy = False
         self.state = IDLE
+        self._inhibit_until = time.monotonic() + 1.0
         if result.success:
             self.get_logger().info('离桩成功，回到 IDLE')
         else:
             self.get_logger().error(f'离桩失败：{result.error_code} {result.error_msg}')
 
     def cancel(self):
-        if self._dock_future is None and self._undock_future is None:
-            self.state = IDLE
-            return
-        self.get_logger().info('取消回充')
+        """取消当前回充/离桩流程。
+
+        关键是**真的把 goal 取消掉**：只把本地状态置 IDLE 是假取消，
+        docking_server 会继续跑并继续发 /cmd_vel_dock（prio 30，会压过跟随），
+        而 /dock/inhibit 已经放开 —— 车会一边被回充控制器开、一边被跟随抢。
+        """
+        now = time.monotonic()
+        # 先推进 epoch，让所有在飞的 goal 回调失效；再尽力取消 goal handle。
+        # 顺序很重要：如果先 cancel 再推 epoch，取消窗口里刚被接受的 goal
+        # 会把 handle 写回来，接着它的 result 又会被当成本轮的结果。
+        self._dock_epoch += 1
+        self._undock_epoch += 1
+
+        cancelled = []
+        for tag, handle in (('dock', self._dock_goal_handle),
+                            ('undock', self._undock_goal_handle)):
+            if handle is None:
+                continue
+            try:
+                fut = handle.cancel_goal_async()
+                fut.add_done_callback(
+                    lambda f, t=tag: self._log_cancel(t, f))
+                cancelled.append(tag)
+            except Exception as e:
+                self.get_logger().warn(f'取消 {tag} goal 失败：{e}')
+
+        self._dock_goal_handle = None
+        self._undock_goal_handle = None
         self.pub_vel.publish(Twist())    # 对准阶段可能有残留角速度
+        self._inhibit_until = now + 1.5  # 等 docking_server 真正停下来
+        # 清掉仿真充电积分量：不清的话 battery_ratio() 会一直返回这个冻结值，
+        # 取消后再也不会更新，低电判定就永远基于取消那一刻的数字。
+        self.charge_ah = None
         self.busy = False
         self.state = IDLE
+        self.align_done = False
+        # 手动取消要真的「停下来别动」。低电判定还在，不做冷却的话
+        # tick 会立刻重新走一遍 low → 确认 → 对准 → 停靠（实测 3.3s 就回到 DOCKED）。
+        self.low_since = None
+        self.cooldown_until = now + self.cancel_cooldown
+        if cancelled:
+            self.get_logger().info(
+                f'取消回充（已请求取消 {"/".join(cancelled)} goal），'
+                f'{self.cancel_cooldown:.0f}s 内不再自动回充')
+        else:
+            self.get_logger().info(
+                f'取消回充（当前没有在飞的 goal），'
+                f'{self.cancel_cooldown:.0f}s 内不再自动回充')
+
+    def _log_cancel(self, tag, future):
+        try:
+            self.get_logger().info(f'{tag} goal 取消结果：{future.result()}')
+        except Exception as e:
+            self.get_logger().warn(f'{tag} goal 取消回调异常：{e}')
 
 
 def main():

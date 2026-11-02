@@ -121,7 +121,20 @@ class PersonSim(Node):
     def _tick(self):
         if not self.enabled:
             return
-        dt = 1.0 / max(0.5, float(self.get_parameter('update_hz').value))
+        # 用**实际**经过的时间积分，而不是写死 1/update_hz。
+        # 定时器一旦被 set_pose 的子进程阻塞（每次 100~200ms），固定步长会让
+        # 人走得比设定速度慢；更糟的是本机实时因子只有 0.22x，用墙钟算的人
+        # 相对机器人会快 4.5 倍。这里取 ROS 时钟（use_sim_time: true），
+        # 让人和车处在同一个时间基准里。
+        now = self.get_clock().now()
+        last = getattr(self, '_last_move', None)
+        self._last_move = now
+        if last is None:
+            return
+        dt = (now - last).nanoseconds * 1e-9
+        if dt <= 0.0:
+            return
+        dt = min(dt, 1.0)       # 时钟跳变（重启 gazebo）时别让人瞬移
         self.dist += self.speed * dt
         x, y, yaw = self._pose_at(self.dist)
         self._set_pose(x, y, yaw)
