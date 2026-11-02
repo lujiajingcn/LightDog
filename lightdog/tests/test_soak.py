@@ -256,6 +256,19 @@ class TestReport(unittest.TestCase):
         self.assertEqual(rc, 1, buf.getvalue())
         self.assertIn('OOM', buf.getvalue())
 
+    def test_process_that_dies_midway_is_reported(self):
+        """中途退出、之后没再起来的节点，曲线只是「提前结束」。
+
+        judge 会拿它仅有的那一段算趋势，算出来是一条平线 —— 不加这一条，
+        「跑了一半就死了」在报告里和「稳定运行 33 分钟」长得一模一样。
+        """
+        rc, out = report_of(self.tmp, 400, [
+            node('lightdog_voice', pid=100, until=200),
+            node('lightdog_mission', pid=200),
+        ])
+        self.assertEqual(rc, 1, out)
+        self.assertIn('再没出现过', out)
+
     def test_restart_is_detected(self):
         """同名两次启动 = 被重启过。不靠 starttime 根本看不出来。"""
         rc, out = report_of(self.tmp, 400, [

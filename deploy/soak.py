@@ -511,6 +511,13 @@ def analyze(samples, ds, min_duration):
     t_first = samples[0][0]
     t_last = samples[-1][0]
     dur = t_last - t_first
+    # 名义采样间隔：用中位数而不是 1 拍，避免偶发的慢拍把「消失」判得过敏感。
+    if len(samples) > 1:
+        gaps = sorted(samples[i + 1][0] - samples[i][0]
+                      for i in range(len(samples) - 1))
+        dt_nom = gaps[len(gaps) // 2] or 1.0
+    else:
+        dt_nom = 1.0
 
     lines = {}                            # (name, pid) -> [(t, rec)]
     dup = {}                              # name -> 同一时刻出现过的最大实例数
@@ -542,6 +549,10 @@ def analyze(samples, ds, min_duration):
         cpu = last['cpu_s'] - first['cpu_s']
         procs.append({
             'name': name, 'pid': pid, 'n': len(pts),
+            # 中途消失：节点的序列只是**提前结束**，judge 会照样算出一条平线。
+            # 不单独判这一条，「跑了一半就死了」在报告里长得和「稳定运行」一样。
+            'last_t': pts[-1][0],
+            'gone': (t_last - pts[-1][0]) > 3.0 * dt_nom,
             'rss': judge(series['rss_mb'], 16.0, rel=0.10),
             'threads': judge(series['threads'], 3.0, want_disjoint=True),
             'fds': judge(series['fds'], 5.0, want_disjoint=True),
@@ -624,6 +635,14 @@ def report(path, min_duration):
                          % (p['name'], p['last']['fds'], lim))
 
     print('-' * 96)
+    restarted_names = set(r[0] for r in a['restarted'] if r[2] > 1)
+    for p in a['procs']:
+        if p['gone'] and p['name'] not in restarted_names:
+            leaks.append('%s 在第 %.0f 分钟之后再没出现过（只有 %d/%d 拍）：'
+                         '节点中途退出，而它的曲线看上去是平的'
+                         % (p['name'], p['last_t'] / 60.0, p['n'],
+                            a['n_samples']))
+
     for name, cnt, starts in a['restarted']:
         if starts > 1:
             leaks.append('%s 出现了 %d 次不同的启动（starttime 变化）→ 中途重启过'
