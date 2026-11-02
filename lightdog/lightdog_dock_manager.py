@@ -248,7 +248,6 @@ class DockManager(Node):
         self.dock_pose = None          # 最近一次 /detected_dock_pose
         self.marker_visible = False
         self.align_started = 0.0
-        self.align_done = False        # 本轮对准是否已完成（防止重复触发）
 
         sensor_qos = QoSProfile(depth=5,
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -464,13 +463,24 @@ class DockManager(Node):
     def _tick_aligning(self, now):
         """把车头转到正对桩。看不见就慢速扫描，看见了就 P 控制。"""
         if now - self.align_started > self.align_timeout:
-            self.get_logger().error(
-                f'对准超时（{self.align_timeout:.0f}s 内没把 marker 摆到中间），放弃本次回充')
             self.pub_vel.publish(Twist())
             self.busy = False
             self.state = IDLE
             self.retry_until = now + self.retry_cooldown
             self._inhibit_until = now + 1.0
+            # 对准超时**也是**一次失败，必须记进 retries —— 原来只设冷却不计数，
+            # 于是「marker 一直看不见」会每 retry_cooldown 秒重来一遍，
+            # max_retries 形同虚设，日志里还一直显示「第 0 次重试」。
+            self.retries += 1
+            if self.retries > self.max_retries:
+                self.get_logger().error(
+                    f'对准连续失败 {self.retries} 次，已达上限，'
+                    f'{self.retry_cooldown:.0f}s 后再试（检查桩供电/遮挡/marker 是否贴歪）')
+                self.retries = 0
+            else:
+                self.get_logger().error(
+                    f'对准超时（{self.align_timeout:.0f}s 内没把 marker 摆到中间），'
+                    f'放弃本次回充（第 {self.retries} 次）')
             return
 
         tw = Twist()
@@ -656,8 +666,16 @@ class DockManager(Node):
         self.state = IDLE
         self._inhibit_until = time.monotonic() + 1.0
         if result.success:
+            # 离桩后必须放掉仿真充电的积分量。`battery_ratio()` 里 charge_ah
+            # 的优先级高于真实电池，不清就是**永久冻结**在离桩那一刻的电量：
+            # 真机上不触发（sim_charging 被强制关掉），仿真里表现为
+            # 「手动离桩后电量再也不动、低电判定永远不触发」。
+            self.charge_ah = None
+            self._dock_ratio_at = None
+            self._charging_checked = False
             self.get_logger().info('离桩成功，回到 IDLE')
         else:
+            # 失败时车可能还停在桩上，积分量要继续保留，否则电量显示会跳变
             self.get_logger().error(f'离桩失败：{result.error_code} {result.error_msg}')
 
     def cancel(self):
@@ -696,7 +714,6 @@ class DockManager(Node):
         self.charge_ah = None
         self.busy = False
         self.state = IDLE
-        self.align_done = False
         self._dock_ratio_at = None
         self._charging_checked = False
         # 手动取消要真的「停下来别动」。低电判定还在，不做冷却的话

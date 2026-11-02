@@ -15,15 +15,21 @@
 运行方式与 test_p2/test_p3 相同（纯逻辑，不需要 ROS）。
 """
 
+import json
 import math
 import os
+import queue
+import socket
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness import (  # noqa: E402
-    Clock, Log, Msg, Pub, bind, extract_funcs, extract_methods, source_of,
+    Clock, Log, Msg, Pub, bind, extract_const, extract_funcs, extract_methods,
+    source_of,
 )
 
 REC = source_of('lightdog_recorder.py')
@@ -31,7 +37,7 @@ ALERT = source_of('lightdog_alert_manager.py')
 DOCK = source_of('lightdog_dock_manager.py')
 LIGHT = source_of('lightdog_light_auto.py')
 
-_safe = extract_funcs(REC, {'safe_token', 'clamp_sec'})
+_safe = extract_funcs(REC, {'safe_token', 'clamp_sec', 'even'})
 safe_token = _safe['safe_token']
 clamp_sec = _safe['clamp_sec']
 
@@ -441,6 +447,273 @@ class TestAlarmHistoryConsistency(unittest.TestCase):
         got = make_server(self.tmp, live).alarms()
         self.assertEqual(len(got[0]['call_attempts']), 2,
                          '已结束的告警被实时消息清空了呼叫记录')
+
+
+# ---------------------------------------------------------------- HTTP 层
+#
+# 这一层的坑都是「协议上合法、但没人写」的角落：
+#   * HEAD 被 do_HEAD 直接转调 do_GET，于是**所有** GET 分支都会跑一遍，
+#     包括两个 while True 的推流分支 —— curl -I 会挂到超时，而且真的写帧；
+#   * 目录也能通过 getsize()，随后 open() 抛 IsADirectoryError → 500 + traceback；
+#   * 相机不出帧时推流循环一个字节都不写，客户端断开永远触发不了 BrokenPipe。
+
+MIME = extract_const(SERVER, 'MIME')
+
+
+class _WFile:
+    def __init__(self):
+        self.data = b''
+
+    def write(self, b):
+        self.data += b
+
+    def flush(self):
+        pass
+
+
+class _Hub:
+    """数调用次数：HEAD 不该进推流循环，所以次数必须是 0。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def wait_newer(self, *a, **k):
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError('HEAD 请求进了推流循环')
+        return None, 0, 0
+
+
+def make_handler(command='GET', path='/x'):
+    h = type('Handler', (), {})()
+    h.command = command
+    h.path = path
+    h.headers = {}
+    h.close_connection = False
+    h.wfile = _WFile()
+    h.sent = []
+    h.hdrs = {}
+    h.send_response = lambda code: h.sent.append(code)
+    h.send_header = lambda k, v: h.hdrs.__setitem__(k, v)
+    h.end_headers = lambda: None
+    h.hub = _Hub()
+    h.node = type('N', (), {'stream_fps': 10.0, 'hub': h.hub})()
+    bind(h, extract_methods(SERVER, 'Handler',
+                            {'_send', '_json', '_err', '_file', '_stream',
+                             '_peer_closed'},
+                            ns={'json': json, 'os': os, 'MIME': MIME,
+                                'time': __import__('time'), 'select': __import__('select'),
+                                'socket': socket}))
+    return h
+
+
+class TestHttpEdgeCases(unittest.TestCase):
+
+    def test_directory_is_404_not_500(self):
+        """`/api/v1/snapshots/..` 不能打到 500：目录 getsize 是成功的。"""
+        import tempfile
+        d = tempfile.mkdtemp()
+        h = make_handler()
+        h._file(d)
+        self.assertEqual(h.sent[-1], 404,
+                         '目录被当成文件打开了（会抛 IsADirectoryError → 500）')
+
+    def test_head_on_stream_returns_immediately(self):
+        h = make_handler(command='HEAD')
+        h._stream()
+        self.assertEqual(h.sent[-1], 200)
+        self.assertEqual(h.hub.calls, 0,
+                         'HEAD 进了 MJPEG 推流循环：curl -I 会挂到超时')
+        self.assertEqual(h.wfile.data, b'',
+                         'HEAD 响应里写了 body（协议错误）')
+
+    def test_head_on_file_sends_headers_only(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, 'a.jpg')
+        with open(p, 'wb') as f:
+            f.write(b'\xff\xd8' + b'x' * 100)
+        h = make_handler(command='HEAD')
+        h._file(p)
+        self.assertEqual(h.sent[-1], 200)
+        self.assertEqual(h.wfile.data, b'')
+        self.assertEqual(h.hdrs.get('Content-Length'), '102')
+
+    def test_peer_closed_detects_hangup(self):
+        """对端「静默」和「挂了」必须区分开 —— 静默不能杀，挂了不能留。
+
+        注意带上「有字节待读」这一档：那种情况是请求还没读完，不是断开。
+        （真正的请求字节在进 handler 之前就被 http.server 读走了，所以
+        响应阶段一般是「无数据 + EOF」，也就是下面 dead 那一对。）
+        """
+        h = make_handler()
+        alive = socket.socketpair()
+        dead = socket.socketpair()
+        try:
+            h.connection = alive[0]
+            self.assertFalse(h._peer_closed(), '对端还活着却被判成断开')
+            alive[1].sendall(b'x')
+            self.assertFalse(h._peer_closed(),
+                             '有数据待读（请求还没读完）不能当成断开')
+            h.connection = dead[0]
+            dead[1].close()
+            self.assertTrue(h._peer_closed(),
+                            '对端已关闭却探测不到 → 相机静默时线程会永久泄漏')
+        finally:
+            for s in (alive[0], alive[1], dead[0]):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------- 录像写盘
+#
+# 这一段在仿真里几乎不会出问题（相机 1.5Hz、磁盘永远是空的），真机上才炸：
+#   * SD 卡写满 → VideoWriter.write 抛异常 → 句柄不释放 + 半个 .part.mp4 留在
+#     clips/ 里，而 `_gc` 只按索引清理，这个文件永远不会被删；
+#   * 编码跟不上采集 → 队列无限长 → 内存按段上涨（一段约 12MB），最后 OOM。
+
+
+class _NoBlockQueue(queue.Queue):
+    """满队列上**阻塞** put 一律判失败。
+
+    旧实现用的是 `put()`（无界队列时看不出问题）。测试里把队列设成有界，
+    阻塞 put 会把测试进程一起挂死 —— 那种失败方式比断言失败更难查。
+    这里让它在满队列 + block=True 时直接抛断言错误；`put_nowait`（block=False）
+    仍然正常抛 queue.Full，新实现的语义不受影响。
+    """
+
+    def put(self, item, block=True, timeout=None):
+        if block and self.full():
+            raise AssertionError(
+                '_flush_segment 用了阻塞 put：队列满会把 ROS 回调线程堵死')
+        return super().put(item, block, timeout)
+
+
+class _FakeWriter:
+    def __init__(self, fail_after=None):
+        self.fail_after = fail_after
+        self.n = 0
+        self.released = False
+
+    def write(self, frame):
+        self.n += 1
+        if self.fail_after is not None and self.n > self.fail_after:
+            raise IOError('No space left on device')
+
+    def release(self):
+        self.released = True
+
+
+class _Frame:
+    def __init__(self, h=4, w=4):
+        self.shape = (h, w, 3)
+
+
+def make_recorder(tmpdir, writer):
+    r = type('Recorder', (), {})()
+    r.clips_dir = tmpdir
+    r.codec = 'avc1'
+    r.session = 1
+    r.seq = 0
+    r.cur = []
+    r.cur_t0 = None
+    r.cur_t1 = None
+    r._lock = threading.Lock()
+    r._flush_q = _NoBlockQueue(maxsize=2)
+    r._dropped_segments = 0
+    r._decode = lambda buf: _Frame()
+    r._fit = lambda frame, w, h: frame
+    r._open_writer = lambda path, fps, size: (writer, 'avc1')
+    r._append_index = lambda rec: None
+    r.get_logger = lambda: Log()
+    bind(r, extract_methods(REC, 'Recorder', {'_flush_segment', '_write_segment'},
+                            ns={'os': os, 'queue': queue, 'time': time,
+                                'json': json, 'even': _safe['even']}))
+    return r
+
+
+class TestRecorderWritePressure(unittest.TestCase):
+
+    def test_write_failure_releases_writer_and_cleans_part(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        w = _FakeWriter(fail_after=1)
+        r = make_recorder(d, w)
+        job = {'seq': 0, 'frames': [(0.0, b'a'), (0.1, b'b')],
+               't0': 0.0, 't1': 0.1, 'wall': 0.0, 'codec': 'avc1'}
+        with self.assertRaises(IOError):
+            r._write_segment(job)
+        self.assertTrue(w.released, '写失败时没 release → 文件句柄泄漏')
+        self.assertEqual(os.listdir(d), [],
+                         'clips/ 里留下了 .part.mp4（_gc 只按索引清，永远删不掉）')
+
+    def test_slow_disk_drops_oldest_segment_instead_of_growing(self):
+        import tempfile
+        r = make_recorder(tempfile.mkdtemp(), _FakeWriter())
+        for i in range(3):
+            r.cur = [(float(i), b'x')]
+            r.cur_t0 = r.cur_t1 = float(i)
+            r._flush_segment()
+        self.assertEqual(r._flush_q.qsize(), 2,
+                         '队列没有上限：写盘跟不上时内存会一直涨')
+        self.assertEqual(r._dropped_segments, 1, '丢弃没记账，手机端看不到')
+        seqs = [r._flush_q.get_nowait()['seq'] for _ in range(2)]
+        self.assertEqual(seqs, [1, 2], '丢的不是最老的段（录像应该保最近的）')
+
+
+# ---------------------------------------------------------------- 告警命令
+
+class TestAlertCommands(unittest.TestCase):
+    """手机端 / 语音发来的三个命令。
+
+    `test` 是个危险命令：它会把 alarm_id、呼叫记录全部重置，并把 is_test 置真，
+    而 `_maybe_call` 见到 is_test 一律直接返回 —— 在真实跌倒告警**进行中**
+    误发一次「模拟告警」，等于把正在打的求救电话全部静音。
+    """
+
+    def make(self, state, is_test=False):
+        d = type('AlertManager', (), {})()
+        d.state = state
+        d.NORMAL, d.SUSPECTED, d.CONFIRMING = 'NORMAL', 'SUSPECTED', 'CONFIRMING'
+        d.ALARM, d.ACKED, d.RESOLVED = 'ALARM', 'ACKED', 'RESOLVED'
+        d.is_test = is_test
+        d.alarm_id = 'alm_real'
+        d.log = Log()
+        d.get_logger = lambda: d.log
+        d.said = []
+        d.set_state = []
+        d.started = []
+        d._say = lambda text: d.said.append(text)
+        d._set_state = lambda new, why='': d.set_state.append((new, why))
+        d._reset = lambda why: None
+        d._start_alarm = lambda test=False: d.started.append(test)
+        bind(d, extract_methods(ALERT, 'AlertManager', {'_on_command'},
+                                ns={'Msg': Msg, 'String': Msg}))
+        return d
+
+    def test_simulated_alarm_refused_while_real_alarm_active(self):
+        for st in ('CONFIRMING', 'ALARM', 'ACKED'):
+            d = self.make(st)
+            d._on_command(Msg(data='test'))
+            self.assertEqual(d.started, [],
+                             f'{st} 状态下「模拟告警」把真实告警的呼叫静音了')
+            self.assertEqual(d.alarm_id, 'alm_real', '真实告警 id 被测试覆盖')
+
+    def test_simulated_alarm_allowed_when_idle(self):
+        d = self.make('NORMAL')
+        d._on_command(Msg(data='test'))
+        self.assertEqual(d.started, [True], '空闲时「模拟告警」应当照常生效')
+
+    def test_ack_voice_matches_behaviour(self):
+        """ack 之后不再拨号，语音就不能说「正在联系家人」。"""
+        d = self.make('ALARM')
+        d._on_command(Msg(data='ack'))
+        self.assertEqual(d.set_state[0][0], 'ACKED')
+        self.assertTrue(d.said, 'ack 之后没有任何语音反馈')
+        self.assertNotIn('正在联系', d.said[0],
+                         '语音承诺「正在联系家人」，但 ACKED 之后一个电话都不打')
 
 
 if __name__ == '__main__':

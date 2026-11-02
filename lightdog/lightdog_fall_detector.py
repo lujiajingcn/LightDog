@@ -191,8 +191,6 @@ class FallDetector(Node):
         self._last_state = None       # 上一次的结论，无新帧时重发
         self._last_z = None
         self._last_spread = None
-        self._last_mask = None
-        self._last_rgb = None
 
         sensor_qos = QoSProfile(depth=1,
                                 reliability=ReliabilityPolicy.BEST_EFFORT,

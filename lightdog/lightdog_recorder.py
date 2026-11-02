@@ -253,7 +253,14 @@ class Recorder(Node):
 
         # 写入串行化：图像回调只负责攒帧，编码在单独线程里做，
         # 否则真机 30Hz 下编码会把回调堵死、直接丢帧。
-        self._flush_q = queue.Queue()
+        #
+        # 队列**必须有界**：写一段 = 解码几百帧 + 重新编码，SD 卡上比采集慢
+        # 是常态。无界队列会让内存按段线性上涨（一段 JPEG 约 12MB），几十分钟
+        # 后 OOM —— server 的 FrameHub 早就用「单槽信箱，跟不上就丢最旧」解决过
+        # 同一个问题，这里同理。6 段约一分钟缓冲，够吸收抖动；
+        # 真跟不上就丢最老的段（环形录像本来就更在意「最近」）。
+        self._flush_q = queue.Queue(maxsize=6)
+        self._dropped_segments = 0
         self._flush_thread = threading.Thread(target=self._flush_worker, daemon=True)
         self._flush_thread.start()
 
@@ -428,10 +435,31 @@ class Recorder(Node):
             seq = self.seq
             self.seq += 1
 
-        self._flush_q.put({
-            'seq': seq, 'frames': frames, 't0': t0, 't1': t1,
-            'wall': time.time(), 'codec': self.codec,
-        })
+        # put_nowait 而不是 put：这个函数跑在图像回调 / 定时器里，排队满了
+        # 绝不能把 ROS 回调堵住（一堵，后面的帧全丢，`frame_age` 直接涨）。
+        job = {'seq': seq, 'frames': frames, 't0': t0, 't1': t1,
+               'wall': time.time(), 'codec': self.codec}
+        try:
+            self._flush_q.put_nowait(job)
+            return
+        except queue.Full:
+            pass
+        # 队列满 = 写盘跟不上。丢**最老**的一段（不是最新的），
+        # 保证手机看到的永远是最近的画面。
+        try:
+            old = self._flush_q.get_nowait()
+            self._flush_q.task_done()
+            self._dropped_segments += 1
+            self.get_logger().warn(
+                f'写盘跟不上，丢弃最老的分段 seg_{old["seq"]:06d}'
+                f'（累计 {self._dropped_segments} 段）')
+        except queue.Empty:
+            pass
+        try:
+            self._flush_q.put_nowait(job)
+        except queue.Full:
+            # 抢不过写线程：认下这次丢弃，别在这里等
+            self._dropped_segments += 1
 
     def _flush_worker(self):
         while True:
@@ -474,15 +502,36 @@ class Recorder(Node):
 
         writer, used = self._open_writer(tmp, fps, (w, h))
         if writer is None:
+            # 编码器打不开时 cv2 可能已经建了个 0 字节的空壳，顺手清掉，
+            # 否则 clips/ 里会慢慢攒一堆没人认领的 .part.mp4。
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             return
         written = 0
-        for _, buf in frames:
-            f = self._decode(buf)
-            if f is None:
-                continue
-            writer.write(self._fit(f, w, h))
-            written += 1
-        writer.release()
+        failed = False
+        try:
+            for _, buf in frames:
+                f = self._decode(buf)
+                if f is None:
+                    continue
+                writer.write(self._fit(f, w, h))
+                written += 1
+        except Exception:
+            # 写失败（磁盘满、编码器崩）：必须**先释放句柄再删半个文件**。
+            # 不释放会漏一个 fd，Windows 上还会让随后的删除失败（文件被占用）；
+            # 不删的话 clips/ 里会永远躺着一个 `_gc` 看不见（它只按索引清）、
+            # 手机也放不了的 .part.mp4。
+            failed = True
+            raise
+        finally:
+            writer.release()
+            if failed:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         if written == 0:
             try:
                 os.remove(tmp)
@@ -979,6 +1028,9 @@ class Recorder(Node):
             'frames_seen': self.n_frames,
             'events': self.n_events,
             'pending_events': len(self.pending),
+            # 写盘跟不上丢掉的段数。>0 说明 SD 卡/CPU 已经扛不住当前帧率，
+            # 手机端能直接看到（不然只表现为「录像莫名其妙缺了一段」）。
+            'dropped_segments': self._dropped_segments,
             'frame_age': round(age, 2),
             'latest_file': clips[-1]['file'] if clips else '',
             'latest_t': clips[-1]['t1'] if clips else 0.0,
@@ -990,7 +1042,15 @@ class Recorder(Node):
     def destroy_node(self):
         try:
             self._flush_segment()
-            self._flush_q.put(None)
+        except Exception:
+            pass
+        # 队列有界，直接 put 在「写盘正好卡住」时会永久阻塞 —— 关节点反而卡死。
+        # 带超时，抢不到就放弃这一轮等待（worker 是 daemon，进程照样能退）。
+        try:
+            self._flush_q.put(None, timeout=2.0)
+        except queue.Full:
+            pass
+        try:
             self._flush_thread.join(timeout=5.0)
         except Exception:
             pass

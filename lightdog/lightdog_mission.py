@@ -389,19 +389,26 @@ class Mission(Node):
             self._cancel_nav('命令全停')
             self.reason = '命令：全部停止'
         elif cmd in ('dock', 'go_dock', 'charge'):
-            # 手动回充：不改 approach_wanted（那是自动判据），直接交给
-            # dock_manager —— 它已经有对齐/重试/冷却，重复一套没意义。
+            # 手动回充：不改 approach_wanted 的自动语义，先导航到桩前；
+            # 没有 Nav2 或关掉了接近模式时，直接交给 dock_manager ——
+            # 它已经有对齐/重试/冷却，重复一套没意义。
             self.manual = False
             self._approach_cooldown_until = 0.0
-            if self.nav_client.server_is_ready():
+            if self.dock_approach and self.nav_client.server_is_ready():
                 self.approach_wanted = True
                 self._approach_manual = True
                 self.reason = '命令：手动回充（先导航到桩前）'
             else:
                 # 没有 Nav2 的时候不能让「手动回充」彻底失效：直接让
                 # dock_manager 自己试（它在桩附近就能成，P3 已验证）。
+                # dock_approach=false 同理 —— 那一支在 update_approach 里会把
+                # approach_wanted 立刻清掉，命令会被**无声吞掉**（reason 还写着
+                # 「先导航到桩前」），所以这里也必须走直接停靠。
+                self.approach_wanted = False
+                self._approach_manual = False
                 self.pub_dock.publish(String(data='dock'))
-                self.reason = '命令：手动回充（Nav2 不可用，直接停靠）'
+                why = '已关闭接近模式' if not self.dock_approach else 'Nav2 不可用'
+                self.reason = f'命令：手动回充（{why}，直接停靠）'
         elif cmd in ('cancel', 'cancel_dock'):
             self.approach_wanted = False
             self._approach_manual = False
@@ -452,7 +459,11 @@ class Mission(Node):
             return self.ALERT
 
         fresh = self._dock_fresh(now)
-        if fresh and self.dock_state in ('ALIGNING', 'DOCKING'):
+        # UNDOCKING 也必须算「回充进行中」：dock_manager 正在用它的 action 把车
+        # 开出桩，这时候调度层若判成 PATROL/FOLLOW，就会往同一个 Nav2 发巡游目标。
+        # 速度上 dock(prio 30) 压得住，但两个控制器抢方向盘、导航目标还会莫名
+        # 成功/失败，状态里全是错的。
+        if fresh and self.dock_state in ('ALIGNING', 'DOCKING', 'UNDOCKING'):
             return self.DOCKING
         if fresh and self.dock_state == 'DOCKED':
             return self.DOCKED

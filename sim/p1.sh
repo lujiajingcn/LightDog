@@ -36,14 +36,14 @@ ros() {
      $1"
 }
 
-# 连发 6 条而不是 `ros2 topic pub --once`。
+# 发一条指令。
 #
-# `--once` 的发布者常常在 DDS 发现完成之前就退出了，消息直接丢；而输出被
-# 重定向掉了，于是现象是「命令成功返回、灯没变」。`-r 10 -t 6` = 10Hz 发 6 条，
-# 约 0.6 秒，足够完成发现。注意 `-t/--times` 是**消息条数**，不是秒。
+# 为什么不用 `ros2 topic pub --once`：它的发布者常常在 DDS 发现完成之前就退出，
+# 消息直接丢；而输出被重定向掉了，于是现象是「命令成功返回、灯没变」。
+# 曾经改成 `-r 10 -t 6` 连发 6 条来绕过，但 `-t/--times` 是**消息条数**不是秒，
+# 本机实际只跑 2~3Hz、要 3~6 秒才发完，一条命令会被执行好几次。
+# 现在统一用 sim/pub_once.py：先等订阅者、只发一条、多活 1 秒完成 ACK/重传。
 pub() {  # pub <topic> <type> <yaml-body>
-  # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
-  # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
   ros "timeout 25 python3 /sim/pub_once.py $1 $2 '$3'"
 }
 
@@ -73,7 +73,9 @@ set_brightness() {
     echo "   检查 lightdog_led 是否在跑：bash sim/p1.sh status" >&2
     return 1
   fi
-  pub /led/brightness std_msgs/msg/Float32 "{data: $v}"
+  # 预检过了也未必发得出去（发现还没收敛时会被判 0 订阅者），所以还要看返回值，
+  # 否则会打出「!! 没有订阅者」+「亮度 -> 0.8」两条自相矛盾的行。
+  pub /led/brightness std_msgs/msg/Float32 "{data: $v}" || return 1
   echo "主灯亮度 -> $v（订阅者 ${n:-?} 个）"
 }
 
@@ -95,8 +97,14 @@ case "$cmd" in
     need_container
     v="${2:-}"
     if [ -z "$v" ]; then echo "用法: bash sim/p1.sh indicator 0.5" >&2; exit 1; fi
-    pub /led/indicator std_msgs/msg/Float32 "{data: $v}"
-    echo "指示灯亮度 -> $v"
+    n=$(topic_subs /led/indicator)
+    if [ "$n" = "0" ]; then
+      echo "!! /led/indicator 没有任何订阅者，发了也不会亮" >&2
+      echo "   检查 lightdog_led 是否在跑：bash sim/p1.sh status" >&2
+      exit 1
+    fi
+    pub /led/indicator std_msgs/msg/Float32 "{data: $v}" || exit 1
+    echo "指示灯亮度 -> $v（订阅者 ${n:-?} 个）"
     ;;
 
   battery)

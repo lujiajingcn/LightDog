@@ -220,13 +220,26 @@ class AlertManager(Node):
         if cmd == 'ack':
             if self.state in (self.ALARM,):
                 self._set_state(self.ACKED, '有人确认已知晓，停止继续呼叫')
-                self._say('已收到确认，正在联系家人')
+                # 语音不能说「正在联系家人」：进 ACKED 之后 _maybe_call 直接返回，
+                # 一个电话都不会再打。之前这句和同一行日志（停止继续呼叫）自相矛盾，
+                # 家属听到的承诺和系统的行为正好相反。
+                self._say('已收到确认，不再重复呼叫')
             else:
                 self.get_logger().info('当前不是 ALARM，ack 忽略')
         elif cmd == 'reset':
             self._reset('人工复位')
         elif cmd == 'test':
-            self._start_alarm(test=True)
+            # 真实告警进行中**不接受**「模拟告警」——
+            # _start_alarm(test=True) 会覆盖 alarm_id / alarm_wall、清空
+            # call_attempts，并把 is_test 置真；而 _maybe_call 见到 is_test 一律
+            # 直接返回。也就是说一次误点（手机界面或 sim/p5.sh test）就能把正在
+            # 进行的真实呼叫**全部静音**，告警记录里的呼叫明细也一起丢。
+            if (self.state in (self.CONFIRMING, self.ALARM, self.ACKED)
+                    and not self.is_test):
+                self.get_logger().warn(
+                    f'真实告警进行中（{self.state}），忽略模拟告警请求')
+            else:
+                self._start_alarm(test=True)
         else:
             self.get_logger().warn(f'未知命令：{cmd}（支持 ack / reset / test）')
 
@@ -316,11 +329,6 @@ class AlertManager(Node):
             if self._age() >= self.resolved_hold:
                 self._reset('告警解除后回到正常')
             return
-
-    def _age_since_standing(self) -> float:
-        if self.standing_since is None:
-            return 0.0
-        return self._now() - self.standing_since
 
     def _reset(self, why: str):
         self._set_state(self.NORMAL, why)

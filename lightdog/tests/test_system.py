@@ -441,6 +441,38 @@ class TestManualDock(unittest.TestCase):
         self.assertFalse(m._approach_manual)
         self.assertIn('导航失败', m.log.text())
 
+    def test_manual_dock_still_works_without_approach_mode(self):
+        """dock_approach=false 时手动「去充电」也不能被吞。
+
+        那一支在 update_approach 里第一行就把 approach_wanted 清掉，而 decide()
+        又不会进 APPROACH —— 命令等于什么都没做，reason 却还写着「先导航到桩前」。
+        """
+        m = make_mission(dock_approach=False)
+        self._nav_ready(m)                 # 就算 Nav2 就绪，也不该走导航
+        feed(m, person=False, dock='IDLE', ratio=0.90)
+
+        m._on_command(String(data='dock'))
+
+        self.assertEqual(m.pub_dock.values, ['dock'],
+                         '关闭接近模式后手动回充没有交给 dock_manager')
+
+
+class TestUndocking(unittest.TestCase):
+
+    def test_undocking_is_not_interrupted_by_patrol(self):
+        """离桩过程中调度层不能发巡游导航目标。
+
+        UNDOCKING 不在「回充进行中」里的话，mode 会掉到 PATROL，
+        _apply 就往同一个 Nav2 发目标 —— 一边离桩一边导航。
+        """
+        m = make_mission(patrol_enabled=True, waypoints=[(1.0, 0.0, 0.0)])
+        feed(m, person=False, dock='UNDOCKING', ratio=0.90)
+
+        m.tick()
+
+        self.assertEqual(m.mode, m.DOCKING)
+        self.assertEqual(m.nav_calls, [], '离桩时调度层还在发导航目标')
+
 
 class TestStopCommand(unittest.TestCase):
 

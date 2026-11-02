@@ -42,6 +42,13 @@ class DockResult:
         self.num_retries = num_retries
 
 
+class UndockResult:
+    def __init__(self, success, error_code=0, error_msg=''):
+        self.success = success
+        self.error_code = error_code
+        self.error_msg = error_msg
+
+
 def make_dock(state=IDLE):
     d = type('DockManager', (), {})()
     d.state = state
@@ -80,7 +87,19 @@ def make_dock(state=IDLE):
     d._undock_epoch = 0
     d._dock_goal_handle = None
     d._undock_goal_handle = None
-    d.align_done = False
+    # 视觉对准
+    d.align_started = 0.0
+    d.align_timeout = 40.0
+    d.align_tol = 0.10
+    d.align_kp = 1.2
+    d.align_max_w = 0.45
+    d.align_scan_rate = 0.35
+    d.marker_visible = False
+    d.dock_pose = None
+    # 停靠后的充电抽查
+    d._dock_ratio_at = None
+    d._dock_check_at = 0.0
+    d._charging_checked = False
     # 外部依赖
     d.clock = Clock()
     d.log = Log()
@@ -102,7 +121,8 @@ def make_dock(state=IDLE):
     bind(d, extract_methods(
         DOCK, 'DockManager',
         {'tick', 'battery_ratio', 'cancel', '_log_cancel', 'fail_docking',
-         'on_dock_result', 'on_dock_goal_response', '_check_charging'},
+         'on_dock_result', 'on_dock_goal_response', '_check_charging',
+         'on_undock_result', '_tick_aligning'},
         ns={'time': time, 'math': math, 'Float32': Float32, 'String': String,
             'Bool': Bool, 'Twist': Twist, **CONSTS}))
     return d
@@ -281,6 +301,80 @@ class TestLowBattery(unittest.TestCase):
         d.retry_until = time.monotonic() + 30.0
         d.tick()
         self.assertEqual(d.dock_calls, [], '重试冷却期内又发起回充了')
+
+
+class TestUndock(unittest.TestCase):
+
+    def test_undock_success_releases_sim_charge(self):
+        """离桩后必须放掉仿真充电积分量。
+
+        battery_ratio() 里 charge_ah 的优先级高于真实电池，不清就永久冻结在
+        离桩那一刻：低电判定再也读不到真实电量，车宁可不充电也不回桩。
+        """
+        d = make_dock(UNDOCKING)
+        d.busy = True
+        d.charge_ah = 3.0
+        d._dock_ratio_at = 0.60
+        d._charging_checked = True
+
+        d.on_undock_result(
+            Future(type('R', (), {'result': UndockResult(True)})()),
+            d._undock_epoch)
+
+        self.assertEqual(d.state, IDLE)
+        self.assertFalse(d.busy)
+        self.assertIsNone(d.charge_ah, '离桩后没清积分量，电量会停在离桩那一刻')
+        self.assertIsNone(d._dock_ratio_at)
+        self.assertFalse(d._charging_checked)
+
+    def test_failed_undock_keeps_charge_state(self):
+        """离桩失败时车还在桩上，积分量不能清 —— 否则电量显示会跳回真实值。"""
+        d = make_dock(UNDOCKING)
+        d.busy = True
+        d.charge_ah = 3.0
+
+        d.on_undock_result(
+            Future(type('R', (), {'result': UndockResult(False, 905, 'timeout')})()),
+            d._undock_epoch)
+
+        self.assertEqual(d.charge_ah, 3.0)
+        self.assertIn('离桩失败', d.log.text('error'))
+
+
+class TestAlign(unittest.TestCase):
+
+    def _timed_out(self, **over):
+        d = make_dock(ALIGNING)
+        d.busy = True
+        d.align_started = time.monotonic() - 100.0
+        d.align_timeout = 40.0
+        for k, v in over.items():
+            setattr(d, k, v)
+        return d, time.monotonic()
+
+    def test_align_timeout_counts_as_retry(self):
+        """对准超时是一次失败，必须记进 retries。
+
+        原来只设冷却、不计数：marker 一直看不见就会每 retry_cooldown 秒重来
+        一遍，max_retries 永远不生效，日志里还写着「第 0 次重试」。
+        """
+        d, now = self._timed_out(retries=0, max_retries=2)
+
+        d._tick_aligning(now)
+
+        self.assertEqual(d.retries, 1, '对准超时没记进 retries')
+        self.assertEqual(d.state, IDLE)
+        self.assertFalse(d.busy)
+        self.assertTrue(d.pub_vel.last.is_zero(), '放弃对准时没发零速')
+        self.assertGreater(d.retry_until, now)
+
+    def test_align_retries_reset_after_limit(self):
+        d, now = self._timed_out(retries=2, max_retries=2)
+
+        d._tick_aligning(now)
+
+        self.assertEqual(d.retries, 0, '达到上限后应清零重新计数')
+        self.assertIn('已达上限', d.log.text('error'))
 
 
 if __name__ == '__main__':

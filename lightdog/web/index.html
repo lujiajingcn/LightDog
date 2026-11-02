@@ -39,6 +39,9 @@
     <div class="actions">
       <button id="btn-snap" class="btn">拍一张</button>
       <button id="btn-event" class="btn warn">标记事件</button>
+      <!-- 急停：/api/v1/estop 早就实现了，页面上一直没有入口。
+           这是安全功能，不经过调度层、不依赖告警链路，按钮必须一直可用。 -->
+      <button id="btn-estop" class="btn danger">急停</button>
     </div>
 
     <div class="chips" id="chips"></div>

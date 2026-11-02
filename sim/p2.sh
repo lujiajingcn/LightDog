@@ -45,8 +45,8 @@ ros() {
      $1"
 }
 
-# 连发 6 条而不是 `--once`：单发时发布进程常在 DDS 发现完成前退出，消息会丢，
-# 而输出被重定向掉了 → 现象是「命令成功返回、车没动」。见 sim/system.sh 的说明。
+# 用 sim/pub_once.py 发一条：`--once` 的发布进程常在 DDS 发现完成前退出，
+# 消息会丢，而输出被重定向掉了 → 现象是「命令成功返回、车没动」。
 pub() {  # pub <topic> <type> <yaml-body>；返回 1 = 没人订阅，这条命令没送到
   # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
   # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
@@ -174,8 +174,12 @@ case "$cmd" in
     # 反过来的话，跟随节点还活着，它下一拍就用 P 控制重算的速度覆盖掉这条零速
     # （实测「stop 之后车还在往前挪半秒」）。
     kill_p2
-    pub /cmd_vel_follow geometry_msgs/msg/Twist '{}'
-    pub /cmd_vel geometry_msgs/msg/Twist '{}'
+    # 节点已经死了，/cmd_vel_follow 上 0 个订阅者是**预期状态**，不是故障：
+    # 这条零速只是把 mux 里残留的跟随指令刷掉。原来忽略返回值 → 每次 stop 都先
+    # 打一行「!! 没有订阅者」，再打「机器人已停」，长期下来人会开始无视告警。
+    pub /cmd_vel_follow geometry_msgs/msg/Twist '{}' 2>/dev/null || true
+    # /cmd_vel 这条是真要送到（mux/collision_monitor 还在跑），失败要说出来。
+    pub /cmd_vel geometry_msgs/msg/Twist '{}' || echo "  !! 零速没送达，机器人可能还在动"
     echo "P2 节点已停，机器人已停。亮度保持最后状态（bash sim/p1.sh led off 可复位）"
     ;;
 
@@ -215,7 +219,6 @@ PY"
   watch)
     need_container
     echo "实时监控（Ctrl+C 退出）：present | position(fwd/left) | cmd_vel(v/w)"
-    ros "timeout 90 ros2 topic echo /person/present std_msgs/msg/Bool 2>/dev/null | head -3" >/dev/null 2>&1
     ros "bash -c '
       (timeout 60 ros2 topic echo /person/position geometry_msgs/msg/PointStamped 2>/dev/null | grep -E \"^  x:|^  y:|^  z:\" | paste - - - -d\" \" ) &
       (timeout 60 ros2 topic echo /cmd_vel geometry_msgs/msg/Twist 2>/dev/null | grep -E \"^  x: |^  z: \" | paste - - -d\" \" ) &
@@ -227,7 +230,7 @@ PY"
     v="${2:-}"
     if [ -z "$v" ]; then echo "用法: bash sim/p2.sh brightness 0.8 | off" >&2; exit 1; fi
     case "$v" in off) v=0.0 ;; on|full|max) v=1.0 ;; esac
-    pub /led/brightness std_msgs/msg/Float32 "{data: $v}"
+    pub /led/brightness std_msgs/msg/Float32 "{data: $v}" || exit 1
     echo "主灯亮度 -> $v（注意：light_auto 还在跑的话会被它覆盖，先 bash sim/p2.sh stop）"
     ;;
 

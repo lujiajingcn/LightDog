@@ -136,6 +136,9 @@ main { padding: 12px 14px 24px; }
 }
 .btn:active { transform: scale(.97); background: var(--bg-2); }
 .btn.warn { border-color: #5a3410; background: #2a1a08; color: #ffbd66; }
+/* 急停：未按下时是「危险但克制」的暗红，按下后整块变实心红 —— 一眼能看出当前锁着 */
+.btn.danger { border-color: #6b2326; background: #2b1113; color: #ff9ea1; flex: none; }
+.btn.danger.on { background: #e5484d; border-color: #e5484d; color: #fff; }
 .btn.ghost { background: transparent; flex: none; }
 .btn.small { padding: 8px 12px; font-size: 13px; border-radius: 10px; flex: none; }
 .btn:disabled { opacity: .45; }

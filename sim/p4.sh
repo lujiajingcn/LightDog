@@ -51,8 +51,8 @@ ros() {
      $1"
 }
 
-# 连发 6 条而不是 `--once`：单发时发布进程常在 DDS 发现完成前退出，消息会丢，
-# 而输出被重定向掉了 → 现象是「命令成功返回、什么都没发生」。
+# 用 sim/pub_once.py 发一条：`--once` 的发布进程常在 DDS 发现完成前退出，
+# 消息会丢，而输出被重定向掉了 → 现象是「命令成功返回、什么都没发生」。
 pub() {  # pub <topic> <type> <yaml-body>；返回 1 = 没人订阅，这条命令没送到
   # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
   # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
@@ -209,7 +209,9 @@ case "$cmd" in
 
   snap)
     need_container
-    pub /recorder/snapshot std_msgs/msg/Empty '{}' 
+    # 必须确认送达：没送到的话下面 ls -lt 照样能列出**上一张**快照，
+    # 屏幕上一片"成功"，而这一张根本没生成。
+    pub /recorder/snapshot std_msgs/msg/Empty '{}' || exit 1
     sleep 2
     ros "ls -lt $DATA_DIR/snapshots 2>/dev/null | head -3"
     ;;
@@ -367,7 +369,7 @@ for d in sorted(glob.glob('$DATA_DIR/events/*/'), reverse=True):
   watch)
     need_container
     echo "实时监控 /recorder/state（Ctrl+C 退出）："
-    ros "timeout 60 ros2 topic echo /recorder/state std_msgs/msg/String 2>/dev/null" \
+    ros "timeout 60 ros2 topic echo /recorder/state std_msgs/msg/String --truncate-length 999999 2>/dev/null" \
       | grep --line-buffered data | sed 's/^data: //' \
       | while IFS= read -r line; do echo "  $line" | cut -c1-160; done
     ;;
@@ -386,7 +388,7 @@ for d in sorted(glob.glob('$DATA_DIR/events/*/'), reverse=True):
     ros "ros2 node list 2>/dev/null | grep -E 'lightdog_(recorder|server)' || echo '  (未启动)'"
     echo
     echo "=== /recorder/state ==="
-    ros "timeout 6 ros2 topic echo /recorder/state std_msgs/msg/String --once 2>/dev/null | grep data || echo '  (读不到)'"
+    ros "timeout 6 ros2 topic echo /recorder/state std_msgs/msg/String --once --truncate-length 999999 2>/dev/null | grep data || echo '  (读不到)'"
     echo "=== HTTP ==="
     printf '  health  '
     curl_api "/api/v1/health" -m 5 -w '  [HTTP %{http_code}]\n' 2>/dev/null || echo "  (连不上，端口 $PORT 没映射或后端没起)"

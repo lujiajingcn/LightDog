@@ -81,8 +81,8 @@ ros_script() {
   } | "$DOCKER" exec -i "$CONTAINER" bash -s
 }
 
-# 连发 6 条而不是 `--once`：单发时发布进程常在 DDS 发现完成前退出，消息会丢，
-# 而输出被重定向掉了 → 现象是「命令成功返回、什么都没发生」。
+# 用 sim/pub_once.py 发一条：`--once` 的发布进程常在 DDS 发现完成前退出，
+# 消息会丢，而输出被重定向掉了 → 现象是「命令成功返回、什么都没发生」。
 pub() {  # pub <topic> <type> <yaml-body>；返回 1 = 没人订阅，这条命令没送到
   # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
   # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
@@ -323,8 +323,13 @@ EOS
 }
 
 show_pose() {
-  ros_script <<'EOS'
-export WORLD="${WORLD:-turtlebot3_world}"
+  # 这里必须是 <<EOS（不带引号）：`${WORLD:-...}` 写在带引号的 heredoc 里时，
+  # 展开发生在**容器内**的 bash，而 docker exec 不继承宿主环境变量 —— 于是
+  # 无论 sim/.env 里 WORLD 改成什么，这里永远读 turtlebot3_world，
+  # status 就会对着一个不存在的世界报「什么都还没生成」。
+  # 正文里没有 $ 和反引号（apply_pose 用的也是这种写法），可以安全展开。
+  ros_script <<EOS
+export WORLD='$WORLD'
 python3 - <<'PY'
 import math, os, re, subprocess
 
@@ -371,7 +376,11 @@ EOS
 
 one_shot() {
   # 只取一条消息。/fall/* 是 BEST_EFFORT，偶尔会等满超时，所以给足 15s。
-  ros "timeout 15 ros2 topic echo $1 ${2:-} --once 2>&1 | head -3"
+  #
+  # --truncate-length 必须有：Jazzy 的 `ros2 topic echo` 默认把**字符串/数组**
+  # 截到 128 个字符，后面补 `...`。`/alert/state` 是几百字符的 JSON，
+  # 不放开就只能看到 `{"state": "ALARM", "age": 12.3, "contact_...` 半截。
+  ros "timeout 15 ros2 topic echo $1 ${2:-} --once --truncate-length 999999 2>&1 | head -3"
 }
 
 cmd="${1:-status}"
@@ -432,12 +441,15 @@ case "$cmd" in
   watch)
     need_container
     echo "实时监控（Ctrl+C 退出）：fall | z95 | alert"
+    # 注意 alert 那一路：--truncate-length 不能省。默认 128 字符会把 JSON 截断成
+    # 半截，下面 json.loads 直接抛异常、被 except 吞掉 -> [alert] 一行都不显示，
+    # 看起来像「告警状态没在发」，其实是显示端的锅。
     ros_script <<'EOS'
 ( timeout 150 ros2 topic echo /fall/state std_msgs/msg/String 2>/dev/null \
     | grep -E '^data:' | sed 's/^data: /[fall ] /' ) &
 ( timeout 150 ros2 topic echo /fall/z_p95 std_msgs/msg/Float32 2>/dev/null \
     | grep -E '^data:' | sed 's/^data: /[z95  ] /' ) &
-( timeout 150 ros2 topic echo /alert/state std_msgs/msg/String 2>/dev/null \
+( timeout 150 ros2 topic echo /alert/state std_msgs/msg/String --truncate-length 999999 2>/dev/null \
     | grep -E '^data:' | sed 's/^data: //' \
     | python3 -u -c '
 import json, sys, time
@@ -536,7 +548,12 @@ print('已保存 %s（%dx%d, %d 字节）' %
       (out, got['img'].shape[1], got['img'].shape[0], os.path.getsize(out)))
 PY
 EOS
-    echo "宿主机路径：$(cd "$(dirname "$0")/.." && pwd)/data/fall_debug.png"
+    # 别写死 fall_debug.png：P5_DEBUG_OUT 一改，这句话就在骗人。
+    # 容器里 /data 就是宿主机的 <repo>/data（compose 挂的卷）；写在别处宿主看不到。
+    case "$OUT" in
+      /data/*) echo "宿主机路径：$(cd "$(dirname "$0")/.." && pwd)/data/${OUT#/data/}" ;;
+      *)      echo "容器内路径：$OUT（不在 /data 下，宿主机看不到，用 docker cp 取）" ;;
+    esac
     ;;
 
   probe)
@@ -577,7 +594,7 @@ EOS
     ros "timeout 10 ros2 topic echo /fall/z_p95 --once 2>&1 | head -2" | sed 's/^/  /'
     echo
     echo "=== 告警状态机 ==="
-    ros "timeout 10 ros2 topic echo /alert/state --once 2>&1 | head -2"
+    ros "timeout 10 ros2 topic echo /alert/state --once --truncate-length 999999 2>&1 | head -2"
     echo
     echo "=== 告警记录（HTTP /api/v1/alarms）==="
     body=$(curl_api /api/v1/alarms)

@@ -56,6 +56,7 @@ iOS Safari 播 `<video>` 会先发 `Range: bytes=0-1` 探一下，服务端回 `
 import hmac
 import json
 import os
+import select
 import shutil
 import socket
 import sys
@@ -777,8 +778,29 @@ class Handler(BaseHTTPRequestHandler):
     def _err(self, code, msg):
         self._json({'error': msg, 'code': code}, code)
 
+    def _peer_closed(self):
+        """对端是否已经把连接断开了（不读走任何数据）。
+
+        长连接线程的唯一「死亡信号」是写失败。但对 MJPEG 来说，相机没出帧时
+        一个字节都不写，写失败就永远等不到 —— 于是手机切后台、人走了，
+        线程还挂在那儿。这里用 select + MSG_PEEK 主动探：
+        正常情况下 socket 永远不可读；可读且 peek 到 EOF，就是 FIN/RST。
+        """
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            if not r:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b''
+        except (OSError, ValueError):
+            return True
+
     def _file(self, path, ctype=None, cache_sec=0):
         """带 Range 的静态文件响应。视频回放全靠这个。"""
+        # 必须先 isfile：目录的 getsize() 是**成功**的，随后 open() 抛
+        # IsADirectoryError，被 do_GET 兜成 500 + traceback。`/api/v1/snapshots/..`
+        # 就是这么走到 500 的（不是穿越 —— 读不到内容，纯粹是噪音）。
+        if not os.path.isfile(path):
+            return self._err(404, 'not found')
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -929,13 +951,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith('/api/v1/snapshots/'):
             name = path[len('/api/v1/snapshots/'):]
-            if '/' in name or '\\' in name:
+            if name in ('.', '..') or '/' in name or '\\' in name:
                 return self._err(400, 'bad name')
             return self._file(os.path.join(self.node.snaps_dir, name), cache_sec=3600)
 
         if path.startswith('/api/v1/clips/'):
             name = path[len('/api/v1/clips/'):]
-            if '/' in name or '\\' in name:
+            if name in ('.', '..') or '/' in name or '\\' in name:
                 return self._err(400, 'bad name')
             return self._file(os.path.join(self.node.clips_dir, name), cache_sec=3600)
 
@@ -1091,6 +1113,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
 
+        # 同上：HEAD 不能进推送循环
+        if self.command == 'HEAD':
+            return
+
         try:
             self.wfile.write(b'retry: 3000\n\n')
             self.wfile.flush()
@@ -1181,17 +1207,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
 
+        # HEAD 只要头，绝不能进循环：`do_HEAD` 是直接转调 do_GET 的，
+        # 不拦的话 `curl -I /api/v1/stream.mjpg` 会一直挂着直到超时，
+        # 而且会往一个 HEAD 响应里真的写帧（协议错误）。
+        if self.command == 'HEAD':
+            return
+
         last_seq = -1
         min_dt = 1.0 / self.node.stream_fps
         last_t = 0.0
         try:
             while True:
                 jpeg, seq, _ = self.node.hub.wait_newer(last_seq, timeout=2.0)
-                if jpeg is None:
-                    time.sleep(0.2)
-                    continue
-                if seq == last_seq:
-                    # 相机静默：继续等，靠客户端断开触发 BrokenPipe 退出
+                if jpeg is None or seq == last_seq:
+                    # 相机静默 / 还没有帧：这一段不发任何字节，也就永远触发不了
+                    # BrokenPipe，客户端中间断掉的话这个线程会一直挂着
+                    # （手机切后台很常见）。主动探一下对端是否已关。
+                    if self._peer_closed():
+                        return
+                    if jpeg is None:
+                        time.sleep(0.2)
+                    # seq == last_seq 时 wait_newer 自己会阻塞 2s，不用再 sleep
                     continue
                 dt = time.time() - last_t
                 if dt < min_dt:

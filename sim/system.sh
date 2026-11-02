@@ -165,7 +165,9 @@ case "$cmd" in
     ros "ros2 node list 2>/dev/null | grep -E 'lightdog_(mission|voice)' || echo '  (未启动)'"
     echo
     echo "=== 调度状态 ==="
-    ros "timeout 8 ros2 topic echo /mission/state std_msgs/msg/String --once 2>/dev/null | grep data || echo '  (读不到)'"
+    # --truncate-length：Jazzy 的 topic echo 默认把字符串截到 128 字符，
+    # 这个 JSON 有三百多字符，不放开就只能看到 mode/reason 的后半截。
+    ros "timeout 8 ros2 topic echo /mission/state std_msgs/msg/String --once --truncate-length 999999 2>/dev/null | grep data || echo '  (读不到)'"
     echo "=== 模式（纯字符串）==="
     ros "timeout 8 ros2 topic echo /mission/mode std_msgs/msg/String --once 2>/dev/null | grep data || echo '  (读不到)'"
     echo "=== 跟随放行 ==="
@@ -191,10 +193,10 @@ case "$cmd" in
   estop)
     # 急停是安全关键路径：**确认不了就当失败**，绝不打印「已闭锁」了事。
     #
-    # 为什么要循环重发：`ros2 topic pub` 是短命进程，RELIABLE 的样本还没被
-    # 所有订阅者 ACK 它就析构了。丢包是**按订阅者**发生的 —— 实测出现过
-    # mux 收到了、mission 没收到（一个锁上、一个还自以为能动），所以确认
-    # 必须两个消费者都点名，只看 mux 会骗过自己。
+    # 为什么还要循环：投递已经由 pub_once 保证（只发一条 + 多活 1.5s 等 ACK），
+    # 但「发到了」不等于「生效了」—— mux 和 mission 是两个独立订阅者，任何一方
+    # 没跟上都可能是「一个锁上、一个还自以为能动」。所以每轮都**回读状态**，
+    # 只有 mux=estop 且 mission=ESTOP（或 mission 没在跑）才算成功，否则重发。
     ok=0
     for i in 1 2 3 4 5 6; do
       # durable=1：急停是「状态」不是「事件」，用 TRANSIENT_LOCAL 让之后

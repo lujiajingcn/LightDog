@@ -51,9 +51,10 @@ ros() {
      $1"
 }
 
-# 连发 6 条而不是 `--once`：单发时发布进程常在 DDS 发现完成前退出，消息会丢。
+# 用 sim/pub_once.py 发一条：`--once` 的发布进程常在 DDS 发现完成前退出，
+# 消息会丢，而输出被重定向掉了 → 现象是「命令成功返回、车没动」。
 # 这三个命令本身都有 busy 保护（dock_manager 的 start_docking / start_undocking
-# 都是 `if self.busy: return`），重复发没有副作用。
+# 都是 `if self.busy: return`），就算真的重复送达也没有副作用。
 pub() {  # pub <topic> <type> <yaml-body>；返回 1 = 没人订阅，这条命令没送到
   # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
   # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
@@ -139,27 +140,36 @@ case "$cmd" in
   stop)
     need_container
     # 先取消（让 docking_server 松开方向盘），再杀节点，最后补一条零速
-    pub /dock/command std_msgs/msg/String '{data: cancel}'
+    #
+    # cancel 发不出去**不该拦住"停"这个动作本身**：节点照杀，只提醒一句。
+    pub /dock/command std_msgs/msg/String '{data: cancel}' 2>/dev/null \
+      || echo "  (cancel 没送达 —— P3 节点本来就没起？仍继续执行停止)"
     kill_p3
-    pub /cmd_vel_dock geometry_msgs/msg/Twist '{}' 
+    # 这一条只是把 mux 里残留的最后指令刷成零速。节点刚被杀掉，
+    # /cmd_vel_dock 上 0 个订阅者是**预期状态**，不算失败，所以连告警都吞掉。
+    pub /cmd_vel_dock geometry_msgs/msg/Twist '{}' 2>/dev/null || true
     echo "P3 节点已停"
     ;;
 
+  # 下面三条是**命令**，必须确认送达才报成功。
+  # pub 在没人订阅时返回 1（消息直接进了黑洞），原来忽略返回值 →
+  # 屏幕上先打「!! 没有订阅者」再打「已发 dock 命令」，自相矛盾，
+  # 而操作者只会看最后一行。
   dock)
     need_container
-    pub /dock/command std_msgs/msg/String '{data: dock}'
+    pub /dock/command std_msgs/msg/String '{data: dock}' || exit 1
     echo "已发 dock 命令。用 bash sim/p3.sh watch 看进度"
     ;;
 
   undock)
     need_container
-    pub /dock/command std_msgs/msg/String '{data: undock}'
+    pub /dock/command std_msgs/msg/String '{data: undock}' || exit 1
     echo "已发 undock 命令"
     ;;
 
   cancel)
     need_container
-    pub /dock/command std_msgs/msg/String '{data: cancel}'
+    pub /dock/command std_msgs/msg/String '{data: cancel}' || exit 1
     echo "已发 cancel 命令"
     ;;
 
@@ -172,10 +182,12 @@ case "$cmd" in
       echo "注入值会在 5 秒后自动失效（sim_battery_timeout），无需额外操作"
       exit 0
     fi
-    # 1Hz 连发 60 条 = 注入 60 秒；窗口是 sim_battery_timeout(5s)，1Hz 足够新鲜。
+    # -t 60 数的是**消息条数**，不是秒数。这台机器 `-r 1` 实际只能跑到 2~3Hz，
+    # 所以 60 条往往 20~30 秒就发完了；好在窗口只有 sim_battery_timeout(5s)，
+    # 只要注入期间持续有新鲜值就够，停发 5 秒后才回落到真实电池。
     # nohup 不能省：docker exec 的 shell 一退出，后台子进程会被回收，
     # 表现为「注入成功、2 秒后电量直接跳回真实值」。
-    ros "nohup timeout 65 ros2 topic pub -r 1 -t 60 /dock/sim_battery_ratio std_msgs/msg/Float32 '{data: $v}' >/dev/null 2>&1 & echo '注入 $v（后台持续 60s）'"
+    ros "nohup timeout 65 ros2 topic pub -r 1 -t 60 /dock/sim_battery_ratio std_msgs/msg/Float32 '{data: $v}' >/dev/null 2>&1 & echo '注入 $v（后台，60 条消息 ≈ 20~30s，停发 5s 后失效）'"
     ;;
 
   pose)

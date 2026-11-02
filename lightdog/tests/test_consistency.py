@@ -148,5 +148,35 @@ class TestVersions(unittest.TestCase):
         self.assertEqual(missing, [], '\n'.join(missing))
 
 
+class TestSimEchoTruncation(unittest.TestCase):
+    """`ros2 topic echo` 默认把字符串截到 128 字符（Jazzy 起）。
+
+    JSON 状态话题普遍三百多字符，于是：
+      * `status` 只显示半截，排查时看不到关键字段；
+      * `p5.sh watch` 里对 `/alert/state` 做 json.loads —— 截断后必然抛异常，
+        被 except 吞掉 -> [alert] 一行都不显示，看着像「状态根本没在发」。
+    这类失败**没有任何报错**，只表现为信息缺失，所以用静态检查钉住。
+    """
+
+    JSON_TOPICS = ('/recorder/state', '/alert/state', '/mission/state')
+
+    def test_json_topics_are_not_truncated(self):
+        sim = os.path.join(os.path.dirname(PKG), 'sim')
+        checked = 0
+        for path in sorted(glob.glob(os.path.join(sim, '*.sh'))):
+            with open(path, encoding='utf-8') as f:
+                lines = f.read().splitlines()
+            for ln in lines:
+                if 'ros2 topic echo' not in ln:
+                    continue
+                if not any(t in ln for t in self.JSON_TOPICS):
+                    continue
+                checked += 1
+                self.assertIn('truncate-length', ln,
+                              f'{os.path.basename(path)}：JSON 话题被截断 -> '
+                              f'{ln.strip()}')
+        self.assertGreater(checked, 3, '一个 JSON 话题都没扫到，检查逻辑失效了')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

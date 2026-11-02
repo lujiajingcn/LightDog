@@ -15,7 +15,6 @@ class Probe(Node):
         self.t0 = time.monotonic()
         self.n = {}
         self.last = {}
-        self.first = {}
         self.frames = []
         self.pos_times = []
 
@@ -31,7 +30,6 @@ class Probe(Node):
         def cb(msg):
             self.n[key] = self.n.get(key, 0) + 1
             self.last[key] = msg
-            self.first.setdefault(key, msg)
             if key == 'pos':
                 now = time.monotonic()
                 if self.pos_times:

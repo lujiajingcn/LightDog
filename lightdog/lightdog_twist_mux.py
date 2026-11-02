@@ -294,7 +294,6 @@ class TwistMux(Node):
             Bool, str(p('hold_topic').value), self._on_hold, 10)
 
         self.active_name = None       # 上一个周期的赢家，用来只打切换日志
-        self._stale = False           # 上一个周期是否是「源活着但指令失效」
         self.subs = []
         for src in self.sources:
             # 用默认参数绑定的 lambda 捕获当前 src，避免闭包陷阱
@@ -384,7 +383,6 @@ class TwistMux(Node):
             if self.active_name != gate:
                 self.get_logger().warn(f'安全闸 {gate} 生效 -> 输出零速')
                 self.active_name = gate
-                self._stale = False
             self.pub_state.publish(String(data=gate))
             self.pub.publish(Twist())
             return
@@ -411,7 +409,6 @@ class TwistMux(Node):
                 self.get_logger().info(
                     f'仲裁: 切到 {best.name}（{best.topic}, prio {best.prio}）')
             self.active_name = name
-        self._stale = stale
 
         # 状态周期发布（不是只在切换时发）：否则 `ros2 topic echo --once`
         # 得等到下次切换才有消息，排查"为什么车不动"时全是超时。

@@ -33,6 +33,7 @@ const S = {
   frameCount: 0,
   fpsShown: 0,
   contacts: [],
+  estop: false,
 };
 
 /* ------------------------------------------------------------------ */
@@ -103,6 +104,23 @@ function setConn(state) {
   S.online = state === 'on';
 }
 
+function setEstopButton(on) {
+  const btn = $('btn-estop');
+  if (!btn) return;
+  S.estop = !!on;
+  btn.classList.toggle('on', S.estop);
+  btn.textContent = S.estop ? '解除急停' : '急停';
+}
+
+function renderEstop(st) {
+  // 以 mux 的实际闸门为准：急停生效后 /cmd_vel_mux_state 就是 'estop'。
+  // mission.estop 是同一事实的另一个视角（它也可能因为别的路径看到锁存值），
+  // 两者取或，避免其中一个节点没起时按钮显示错误状态。
+  const on = !!((st.motion && st.motion.source === 'estop')
+    || (st.mission && st.mission.estop));
+  setEstopButton(on);
+}
+
 function renderStatus(st) {
   setConn('on');
 
@@ -142,8 +160,14 @@ function renderStatus(st) {
     chips.push(`<span class="chip">剩余 <b>${(st.storage.free_mb / 1024).toFixed(1)}GB</b></span>`);
   }
   chips.push(`<span class="chip ${st.person && st.person.present ? 'ok' : ''}">人 <b>${st.person && st.person.present ? '在' : '无'}</b></span>`);
-  if (st.motion && st.motion.source) {
-    chips.push(`<span class="chip ${st.motion.source === 'stop' ? '' : 'busy'}">运动源 <b>${st.motion.source}</b></span>`);
+  const src = st.motion && st.motion.source;
+  if (src) {
+    // mux 实际只会发 idle / estop / hold / nav / follow / dock（后面可能带
+    // (stale)）。原来判的是 `=== 'stop'`，而 mux 从来不发 'stop' ——
+    // 结果待机时也被标成 busy，一眼看不出到底哪个才是"在动"。
+    const moving = src === 'follow' || src === 'dock' || src === 'nav';
+    const cls = src === 'estop' ? 'bad' : (moving ? 'busy' : '');
+    chips.push(`<span class="chip ${cls}">运动源 <b>${src}</b></span>`);
   }
   if (rec.events !== undefined) {
     chips.push(`<span class="chip">事件 <b>${rec.events}</b></span>`);
@@ -151,6 +175,7 @@ function renderStatus(st) {
   $('chips').innerHTML = chips.join('');
 
   $('rec-flag').classList.toggle('on', !!rec.recording);
+  renderEstop(st);
 
   // 设置页的设备信息
   //
@@ -736,6 +761,28 @@ async function triggerEvent() {
   }
 }
 
+async function toggleEstop() {
+  const want = !S.estop;
+  // 刹车不问，解除要问：误触「急停」的代价只是停一下，误触「解除」的代价是
+  // 一台还在动的车。所以只在解除时弹确认。
+  if (!want && !window.confirm('确认解除急停？机器人会重新接受运动指令。')) return;
+  const btn = $('btn-estop');
+  btn.disabled = true;
+  try {
+    await api('/estop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: want }),
+    });
+    setEstopButton(want);          // 立刻反馈，不等下一轮 /status
+    toast(want ? '已急停（轮子已锁，需手动解除）' : '已解除急停');
+  } catch (e) {
+    toast('急停操作失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function alarmCmd(cmd, okMsg) {
   try {
     const r = await api('/alarms/' + cmd, { method: 'POST' });
@@ -781,6 +828,7 @@ function boot() {
   });
   $('btn-snap').addEventListener('click', takeSnapshot);
   $('btn-event').addEventListener('click', triggerEvent);
+  $('btn-estop').addEventListener('click', toggleEstop);
   $('btn-reload-events').addEventListener('click', () => { loadEvents(); loadClips(); });
   $('btn-reload-alarms').addEventListener('click', loadAlarms);
   $('player-close').addEventListener('click', closePlayer);

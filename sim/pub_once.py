@@ -28,6 +28,7 @@ VOLATILE，否则一个后启动的语音节点会把上一条命令重放一遍
 """
 
 import sys
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -91,21 +92,23 @@ def main(argv):
         pub = node.create_publisher(cls, topic, qos)
 
         def spin_until(deadline):
-            while node.get_clock().now().nanoseconds * 1e-9 < deadline:
+            # 用墙钟，不用 node.get_clock()：这个 node 一旦被设成 use_sim_time
+            # 而 /clock 没在走（仿真暂停、gz 卡住），ROS 时钟就冻结在某一刻，
+            # 循环条件永远不成立 → 进程挂死，调用方的 timeout 只能兜底杀它，
+            # 消息反而发不出去。"等多久"是墙钟概念。
+            while time.monotonic() < deadline:
                 rclpy.spin_once(node, timeout_sec=0.05)
 
         # 先等「至少有一个订阅者」。这台机器 DDS 发现经常要 1~2 秒，
         # 而原来的做法只转 0.3 秒就发，然后数订阅者得 0 —— 既误报失败，
         # 也等于把「发早了」这个老问题又抄了一遍。
         # 等不到也照发（锁存类/还没起的订阅者场景），由返回码让调用方判断。
-        now = node.get_clock().now().nanoseconds * 1e-9
-        spin_until(now + wait_subs)
+        spin_until(time.monotonic() + wait_subs)
         subs_before = node.count_subscribers(topic)
 
         pub.publish(msg)
         # 关键：发完不要马上退出，留时间让 RELIABLE 完成 ACK/重传。
-        now = node.get_clock().now().nanoseconds * 1e-9
-        spin_until(now + max(0.0, hold))
+        spin_until(time.monotonic() + max(0.0, hold))
         subs = node.count_subscribers(topic)
         print(f'sent {topic} ({tname}) body={fields} '
               f'subscribers={subs} (发前 {subs_before})')
