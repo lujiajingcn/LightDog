@@ -11,6 +11,63 @@ WORLD="${WORLD:-turtlebot3_world}"
 SPAWN_X="${SPAWN_X:-0.5}"
 SPAWN_Y="${SPAWN_Y:-0.0}"
 
+# 各阶段 PID 先全部初始化：cleanup 可能在任何一个节点起来之前就被触发
+# （`docker stop` 立刻发 SIGTERM），而脚本开了 `set -u`，未定义变量会让
+# 清理函数自己先崩掉，反而留下一堆孤儿进程。
+XVFB_PID="" VNC_PID="" NOVNC_PID="" MUX_PID="" SIM_PID="" SLAM_PID=""
+GUI_PID="" P4_PID="" P5_PID="" SYS_PID=""
+
+# 递归杀整棵进程树。
+#
+# 为什么不能只 `kill $PID`：`ros2 launch` 只是调度器，真正的节点是它的
+# 子进程。杀掉 launch 之后子进程会被 init 收养继续活着 —— 实测表现为
+# 「重启后有两个 lightdog_mission 同时抢 /follow/enable」，排查了很久。
+kill_tree() {
+  local pid="$1" sig="${2:-TERM}" kids k
+  if [ -z "$pid" ]; then
+    return 0
+  fi
+  kids=$(ps -o pid= --ppid "$pid" 2>/dev/null || true)
+  for k in $kids; do
+    kill_tree "$k" "$sig"
+  done
+  kill -"$sig" "$pid" 2>/dev/null || true
+  return 0
+}
+
+CLEANED=0
+cleanup() {
+  # 注意：这里一律用 if 而不是 `[ ... ] && foo`。
+  # 脚本开了 `set -e`，而 `[ 条件 ] && cmd` 在条件为假时整条命令返回 1，
+  # 会被当成"清理函数失败"直接掀掉整个脚本 —— 后面的清理一步都不跑。
+  if [ "$CLEANED" = "1" ]; then
+    return 0
+  fi
+  CLEANED=1
+  echo "=== Shutting down ==="
+  local p
+  for p in "$GUI_PID" "$P4_PID" "$P5_PID" "$SYS_PID" "$SIM_PID" "$SLAM_PID" "$MUX_PID"; do
+    if [ -n "$p" ]; then
+      kill_tree "$p" TERM
+    fi
+  done
+  sleep 1
+  for p in "$GUI_PID" "$P4_PID" "$P5_PID" "$SYS_PID" "$SIM_PID" "$SLAM_PID" "$MUX_PID"; do
+    if [ -n "$p" ]; then
+      kill_tree "$p" KILL
+    fi
+  done
+  for p in "$XVFB_PID" "$VNC_PID" "$NOVNC_PID"; do
+    if [ -n "$p" ]; then
+      kill -TERM "$p" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+# TERM/INT 覆盖 `docker stop` / Ctrl+C；EXIT 兜住「某个 launch 自己挂了」
+# 之后的正常退出路径。CLEANED 保证只跑一次。
+trap cleanup TERM INT EXIT
+
 # 1) 上游唯一必需的补丁（幂等；失败则直接退出，不带着坏配置继续）
 echo "=== Patching upstream ==="
 python3 /patch_upstream.py
@@ -77,7 +134,6 @@ sleep 8
 #      放在 SLAM 之后、Gazebo GUI 之前，是因为这两个节点不依赖任何东西 ——
 #      相机没出图时 recorder 只是空转，server 的 /status 照样回 200。早点起，
 #      GUI 那 30 秒的等待时间里录像已经开始了。
-P4_PID=""
 # 存储卡根目录。P4 的录像和 P5 的 contacts.json 都落在这里，所以在两个
 # ENABLE_* 判断之前就定下来（否则 ENABLE_P4=0 时它会是个空串，
 # contacts_path 就变成 `:=/contacts.json`，参数看着合法但指向根目录）。
@@ -105,7 +161,6 @@ fi
 #
 #      默认开：没有 "人" 的时候检测器只是持续报 absent，代价可以忽略，
 #      但手机端 /status 里的 alert 字段一直是 NORMAL —— 看起来才像个成品。
-P5_PID=""
 if [ "${ENABLE_P5:-1}" = "1" ]; then
   echo "=== Starting P5 fall detector + alert manager ==="
   nohup ros2 launch lightdog lightdog_p5.launch.py \
@@ -123,7 +178,6 @@ fi
 #
 #      放在最后起：它一起来就会发 /follow/enable，而 P2 的跟随节点如果还没起，
 #      这条消息只是没人收 —— 反正跟随节点没收到过时按自己的 enabled 工作。
-SYS_PID=""
 if [ "${ENABLE_SYSTEM:-1}" = "1" ]; then
   echo "=== Starting system layer (mission + voice) ==="
   nohup ros2 launch lightdog lightdog_system.launch.py \
@@ -138,7 +192,6 @@ fi
 #    - Xvfb 下没有窗口管理器，窗口靠创建顺序叠放 → 后建的在上层，
 #      所以 GUI 必须在 RViz 之后再起，打开 noVNC 才是 3D 视图在最前面
 BASE="${LINOROBOT2_BASE:-4wd}"
-GUI_PID=""
 if [ "${SHOW_GUI:-1}" = "1" ]; then
   echo "=== Starting Gazebo GUI (SHOW_GUI=1) ==="
   gz sim -g --gui-config /gui.config > /tmp/gzgui.log 2>&1 &
@@ -172,7 +225,11 @@ echo "  System: PID ${SYS_PID:-未启动} (log /tmp/system.log)"
 echo "  LED log: /tmp/lightdog_led.log (via ros2 launch)"
 echo ""
 
-wait -n $SIM_PID $SLAM_PID
+# `|| true` 不是可有可无的：脚本开头是 `set -e`，而 `wait -n` 会返回
+# **先退出的那个子进程的退出码**。任何一个 launch 以非零退出时，这一行会让
+# shell 当场退出 —— 后面的清理代码一行都不执行，于是所有节点变成孤儿，
+# 下次 `docker restart` 起来后两份节点同时抢话题。清理现在交给 trap，
+# 这里只需要「等到有事发生」。
+wait -n $SIM_PID $SLAM_PID || true
 echo "A process exited, shutting down..."
-kill $XVFB_PID $VNC_PID $NOVNC_PID $SIM_PID $SLAM_PID $MUX_PID ${GUI_PID:-} ${P4_PID:-} ${P5_PID:-} ${SYS_PID:-} 2>/dev/null || true
 exit 0

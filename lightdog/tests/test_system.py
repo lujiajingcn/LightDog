@@ -16,7 +16,6 @@ import json
 import math
 import os
 import sys
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +48,7 @@ MISSION_METHODS = {
     '_person_ready', '_dock_fresh', '_alert_fresh', '_alert_holds',
     '_ratio_fresh', '_nav_busy', '_cancel_nav', '_on_command',
     '_on_person', '_on_dock', '_on_ratio', '_on_alert', '_on_estop',
+    '_nav_failed',
 }
 
 
@@ -95,6 +95,7 @@ def make_mission(**over):
     m.mode_since = 0.0
     m.reason = ''
     m.approach_wanted = False
+    m._approach_manual = False
     m._low_since = None
     m._approach_cooldown_until = 0.0
     m.waypoints = []
@@ -403,6 +404,69 @@ def voice_funcs():
     return f
 
 
+class TestManualDock(unittest.TestCase):
+    """手动回充不能被「自动低电迟滞」吃掉。"""
+
+    def _nav_ready(self, m):
+        m.nav_client = type('C', (), {'server_is_ready': lambda self: True})()
+
+    def test_full_battery_still_honours_manual_dock(self):
+        m = make_mission()
+        self._nav_ready(m)
+        feed(m, person=False, dock='IDLE', ratio=0.90)
+        m._on_command(String(data='dock'))
+        self.assertTrue(m.approach_wanted, '手动 dock 命令应当被接受')
+        m.tick()
+        self.assertTrue(
+            m.approach_wanted,
+            '满电时手动回充被 update_approach 当成「电量已恢复」清掉了')
+        self.assertEqual(m.mode, m.APPROACH)
+
+    def test_auto_approach_is_still_cleared_when_battery_recovers(self):
+        m = make_mission()
+        feed(m, person=False, dock='IDLE', ratio=0.90)
+        m.approach_wanted = True          # 自动判定留下的
+        m.tick()
+        self.assertFalse(m.approach_wanted,
+                         '自动回充必须在电量回到 clear_ratio 以上时解除')
+
+    def test_manual_dock_cleared_after_nav_failure(self):
+        m = make_mission()
+        m.approach_wanted = True
+        m._approach_manual = True
+        m._nav_tag = 'approach'
+        m._nav_state = 'active'
+        m._nav_failed(0, 'aborted', 'approach')
+        self.assertFalse(m.approach_wanted)
+        self.assertFalse(m._approach_manual)
+        self.assertIn('导航失败', m.log.text())
+
+
+class TestStopCommand(unittest.TestCase):
+
+    def test_stop_command_stops_everything(self):
+        """「停下」不能只停跟随：巡游/回充还在跑的话车照旧往前走。"""
+        m = make_mission()
+        m.patrol_enabled = True
+        m.waypoints = [(1.0, 0.0, 0.0)]
+        m.approach_wanted = True
+        m._nav_tag = 'patrol'
+        m._nav_state = 'active'
+        m._on_command(String(data='stop'))
+        self.assertFalse(m.follow_enabled)
+        self.assertFalse(m.patrol_enabled)
+        self.assertFalse(m.approach_wanted)
+        self.assertIn('cancel', m.pub_dock.values)
+        self.assertEqual(m.mode, m.IDLE)
+
+    def test_stop_does_not_enter_manual(self):
+        """MANUAL 仍然给跟随放行（见 _apply），所以「停下」绝不能设成 manual。"""
+        m = make_mission()
+        m._on_command(String(data='stop'))
+        self.assertFalse(m.manual)
+        self.assertEqual(m.pub_follow.values[-1], False)
+
+
 class TestVoiceIntents(unittest.TestCase):
 
     def setUp(self):
@@ -441,6 +505,32 @@ class TestVoiceIntents(unittest.TestCase):
     def test_charge_commands(self):
         self.assertEqual(self.f['match_intent']('回去充电'), 'dock')
         self.assertEqual(self.f['match_intent']('去充电'), 'dock')
+        self.assertEqual(self.f['match_intent']('离桩'), 'undock')
+
+    def test_patrol_negation_does_not_start_patrol(self):
+        """「别巡逻」含「巡逻」。patrol_on 排在前面的话，一句劝阻会让车开始巡游。"""
+        for txt in ('别巡逻', '不用巡逻', '停止巡逻', '取消巡逻'):
+            self.assertEqual(self.f['match_intent'](txt), 'patrol_off', txt)
+        # 正向不能被误伤
+        self.assertEqual(self.f['match_intent']('去巡逻'), 'patrol_on')
+        self.assertEqual(self.f['match_intent']('开始巡逻'), 'patrol_on')
+
+    def test_charge_negation_does_not_dock(self):
+        """「别充电」含「充电」。dock 排前面的话，劝阻会变成派车去充电。"""
+        for txt in ('不要充电', '别充电', '不用充电', '不用回充'):
+            self.assertEqual(self.f['match_intent'](txt), 'stop_dock', txt)
+        self.assertEqual(self.f['match_intent']('去充电'), 'dock')
+
+    def test_stop_maps_to_full_stop(self):
+        cmd = extract_const(VOICE, 'MISSION_CMD')
+        self.assertEqual(cmd['stop'], 'stop',
+                         '「停下」只发 follow_off 的话，巡游中的车不会停')
+        self.assertEqual(cmd['stop_dock'], 'cancel')
+
+    def test_undock_keeps_unambiguous_phrases_only(self):
+        """「出来」在中文里更常是「过来」，不能当离桩。"""
+        # '你出来' 里没有任何「跟/停/充电」关键词，摘掉 '出来' 之后应当匹配不到东西
+        self.assertIsNone(self.f['match_intent']('你出来'))
         self.assertEqual(self.f['match_intent']('离桩'), 'undock')
 
     def test_unknown_text_falls_through(self):
@@ -484,6 +574,7 @@ def make_mux():
     m.max_lin, m.max_ang = 0.50, 1.50
     m._warned_clamp = False
     m.pub, m.pub_state, m.pub_beat = Pub(), Pub(), Pub()
+    m.pub_estop = Pub()
     m.active_name = None
     m._stale = False
     m.estop = False
@@ -541,6 +632,24 @@ class TestSafetyGate(unittest.TestCase):
         push(m, 'nav', 0.30)
         m._tick()
         self.assertAlmostEqual(m.pub.last.linear.x, 0.30, places=6)
+
+    def test_estop_is_republished_to_keep_the_latch_alive(self):
+        """mux 必须把急停状态回发一份。
+
+        `/safety/estop` 的写者（CLI / 语音 / 网页按钮）都是短命或条件存活的，
+        TRANSIENT_LOCAL 的锁存样本随最后一个 writer 退出而消失。没有这层回发，
+        「CLI 按下急停 -> 只重启 mission」就会让新 mission 从 estop=False 起步，
+        而 mux 还锁着 —— 两个消费者对同一个安全状态各记一套。
+        """
+        m = make_mux()
+        m._on_estop(Msg(True))
+        self.assertEqual(m.pub_estop.values, [True],
+                         '收到急停后必须回发一份，让锁存有长期持有者')
+        # 重复收到同值不能再发（否则和订阅形成回环）
+        m._on_estop(Msg(True))
+        self.assertEqual(len(m.pub_estop.values), 1)
+        m._on_estop(Msg(False))
+        self.assertEqual(m.pub_estop.values, [True, False])
 
     def test_hold_expires_when_mission_dies(self):
         m = make_mux()

@@ -128,7 +128,10 @@ class AlertManager(Node):
         self.last_absent = None
         self.absent_since = None      # 本轮"连续无人"的起点
         self.standing_since = None    # 本轮"连续站立"的起点（恢复判定用）
-        self.since = self._now()      # 进入当前状态的时刻
+        # 进入当前状态的时刻。用 None 而不是 0 表示「还没进过任何状态」：
+        # 仿真里 use_sim_time 下 /clock 未到时 _now() 就是 0，拿 0 当初始值
+        # 会让手机端 NORMAL 一开机就显示「已持续 200+ 秒」（那其实是开机时长）。
+        self.since = None
         self.alarm_id = ''
         self.alarm_wall = 0.0
         self.is_test = False          # 手动 test 触发的告警（不拨号、不自动解除）
@@ -167,7 +170,16 @@ class AlertManager(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def _age(self) -> float:
-        return self._now() - self.since
+        """在**当前状态**里待了多久。
+
+        `since <= 0` 是「还没进入过任何状态」，不是「1970 年就进来了」。
+        仿真里 use_sim_time 打开、/clock 还没到时构造节点，`self.since` 会拿到
+        0.0；不特判的话手机端 NORMAL 状态一开机就显示「已持续 232 秒」，
+        而那个数字其实是整个仿真跑了多久 —— 看起来像状态机坏了。
+        """
+        if self.since is None:
+            return 0.0
+        return max(0.0, self._now() - self.since)
 
     def _say(self, text: str):
         m = String()
@@ -323,7 +335,6 @@ class AlertManager(Node):
     # ---------- 告警 ----------
 
     def _start_alarm(self, test: bool = False):
-        now = self._now()
         self.alarm_wall = time.time()
         self.is_test = bool(test)
         self.alarm_id = 'alm_%s%s' % (
@@ -422,6 +433,12 @@ class AlertManager(Node):
                     f'告警已发出，但没有可呼叫的号码。手机端 /api/v1/contacts 可添加。')
             return
 
+        # 轮次标签必须在 call_idx 自增**之前**算：
+        # round_no = call_idx // len + 1 才是「这是第几轮的第几个联系人」。
+        # 原来写的是自增后取 self.rounds + 1，而 rounds 只在「本轮最后一个
+        # 联系人打完」时才 +1，于是 2 个联系人时会打成 1、2、2、3 ——
+        # 第一轮看起来只联系了一个人，翻看告警记录时很容易误判成漏打。
+        round_no = self.call_idx // len(contacts) + 1
         c = contacts[self.call_idx % len(contacts)]
         self.call_idx += 1
         if self.call_idx % len(contacts) == 0:
@@ -431,7 +448,7 @@ class AlertManager(Node):
         attempt = {
             'name': c['name'], 'phone': c['phone'],
             'at_wall': round(time.time(), 3),
-            'round': self.rounds + 1,
+            'round': round_no,
             'dialed': False,
         }
 
@@ -469,7 +486,7 @@ class AlertManager(Node):
             'state': self.state,
             'alarm_id': self.alarm_id,
             'alarm_wall': round(self.alarm_wall, 3),
-            'since': round(self.since, 3),
+            'since': 0.0 if self.since is None else round(self.since, 3),
             'age': round(self._age(), 2),
             'z_p95': None if self.z_p95 is None else round(self.z_p95, 3),
             'is_test': bool(self.is_test),

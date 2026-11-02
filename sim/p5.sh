@@ -81,6 +81,23 @@ ros_script() {
   } | "$DOCKER" exec -i "$CONTAINER" bash -s
 }
 
+# 连发 6 条而不是 `--once`：单发时发布进程常在 DDS 发现完成前退出，消息会丢，
+# 而输出被重定向掉了 → 现象是「命令成功返回、什么都没发生」。
+pub() {  # pub <topic> <type> <yaml-body>；返回 1 = 没人订阅，这条命令没送到
+  # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
+  # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
+  #
+  # 必须检查 subscribers：没有订阅者时发布「成功」返回，消息直接进了黑洞，
+  # 脚本却照样打印「已下发 ack」—— 实测真出现过（DDS 发现还没收敛就发了）。
+  local out
+  out=$(ros "timeout 25 python3 /sim/pub_once.py $1 $2 '$3'")
+  echo "$out"
+  if echo "$out" | grep -q 'subscribers=0'; then
+    echo "!! $1 没有订阅者，这条命令没人收（对应节点没起来？）" >&2
+    return 1
+  fi
+}
+
 need_container() {
   if ! "$DOCKER" ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "容器 $CONTAINER 没在运行。先执行：" >&2
@@ -91,7 +108,19 @@ need_container() {
 
 # 这个容器里 `pkill -f` 不生效，必须按 PID 杀（P3 踩过）
 kill_p5() {
-  ros "for p in \$(ps -eo pid,args --no-headers | grep -E 'lightdog_(fall_detector|alert_manager)|lightdog_p5.launch.py' | grep -v grep | awk '{print \$1}'); do kill -9 \$p 2>/dev/null; done; sleep 1; true"
+  # 停止分两段，顺序不能反：
+  #   1) 先对整个进程组发 SIGTERM。ros2 launch 装着信号处理，会依次关掉子节点，
+  #      rclpy 正常 shutdown 时会向 DDS 发「我走了」。直接 kill -9 不会发这条，
+  #      对端只能等租约超时 —— 这段时间 `ros2 node list` 会一直展示**幽灵节点**
+  #      （实测杀完立刻 list 看到两个 lightdog_mission，8 秒后自己变回一个）。
+  #      幽灵让人根本无法判断「到底有没有起重复实例」。
+  #   2) 再对剩下的顽固进程补 SIGKILL。
+  # 另外两点也是为了不误伤自己：
+  #   * awk -v me=$$ 排除执行这条命令的 shell（它的命令行里含有模式原文）；
+  #   * 模式里用 \. 而不是裸点，让「模式原文」本身不构成一次匹配。
+  ros "f() { ps -eo pid,args --no-headers | grep -E 'lightdog_(fall_detector|alert_manager)\\.py|lightdog_p5\\.launch\\.py' | grep -v grep | awk -v me=\$\$ '\$1 != me {print \$1}'; }; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -TERM \$pids 2>/dev/null; sleep 2; fi; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -9 \$pids 2>/dev/null; fi; sleep 1; true"
 }
 
 # --noproxy '*' 是必须的：本机 shell 环境里带着指向 WorkBuddy 沙箱代理的
@@ -126,7 +155,7 @@ apply_pose() {
   ros_script <<EOS
 export MODE='$mode' DIST='$DIST' LIE_Z='$LIE_Z' STAND_Z='$STAND_Z' WORLD='$WORLD'
 python3 - <<'PY'
-import math, os, re, subprocess, sys
+import math, os, re, subprocess, sys, time
 
 world = os.environ['WORLD']
 mode = os.environ['MODE']
@@ -142,6 +171,42 @@ def num(block, key):
     m = re.search(key + r': ([0-9.eE+-]+)', block)
     return float(m.group(1)) if m else 0.0
 
+
+def read_pose():
+    """返回 {name: (x, y, z)}，读 /world/<world>/pose/info。"""
+    raw = subprocess.run(['gz', 'topic', '-e', '-t', '/world/%s/pose/info' % world, '-n', '1'],
+                         capture_output=True, timeout=25).stdout.decode('utf-8', 'replace')
+    out = {}
+    for blk in raw.split('name: "')[1:]:
+        name = blk.split('"')[0]
+        mp = re.search(r'position \{(.*?)\}', blk, re.S)
+        if mp:
+            out[name] = (num(mp.group(1), 'x'), num(mp.group(1), 'y'), num(mp.group(1), 'z'))
+    return out
+
+
+# P2 的 lightdog_person_sim 会以 5Hz 沿既定路径搬运同一个 person 实体。
+# 它一在跑，下面的 set_pose 立刻被覆盖 —— 而服务照样回 true，于是表现为
+# 「摆位成功、/fall/state 却一直 absent」。这里先让它让路（参数回调）。
+def node_alive(name):
+    try:
+        r = subprocess.run(['ros2', 'node', 'list'], capture_output=True, timeout=20)
+        return name in r.stdout.decode('utf-8', 'replace')
+    except Exception:
+        return False
+
+
+if node_alive('/lightdog_person_sim'):
+    try:
+        r = subprocess.run(['ros2', 'param', 'set', '/lightdog_person_sim', 'enabled', 'false'],
+                           capture_output=True, timeout=20)
+        ok = b'Set parameter successful' in r.stdout
+        print('  person_sim -> %s' % ('已暂停' if ok else '暂停失败，位姿可能被覆盖'))
+        if not ok:
+            print('    (stdout: %s)' % r.stdout.decode('utf-8', 'replace').strip()[:120])
+    except Exception as e:
+        print('  person_sim 暂停异常：%s' % e)
+    time.sleep(0.5)
 
 try:
     raw = subprocess.run(['gz', 'topic', '-e', '-t', '/world/%s/pose/info' % world, '-n', '1'],
@@ -193,14 +258,66 @@ req = ('name: "person", position: {x: %.4f, y: %.4f, z: %.4f}, '
        'orientation: {x: %.6f, y: %.6f, z: %.6f, w: %.6f}' %
        (px, py, pz, ox, oy, oz, ow))
 
-r = subprocess.run(['gz', 'service', '-s', '/world/%s/set_pose' % world,
-                    '--reqtype', 'gz.msgs.Pose', '--reptype', 'gz.msgs.Boolean',
-                    '--timeout', '3000', '--req', req],
-                   capture_output=True, timeout=25)
-out = (r.stdout + r.stderr).decode('utf-8', 'replace').strip()
-print('  set_pose -> %s' % (out or 'no output'))
+r = None
+out = ''
+# 每个进程的第一次 gz service 调用常因服务发现没完成而超时（实测必现一次），
+# 重试即可，不要当失败。
+for attempt in range(1, 4):
+    r = subprocess.run(['gz', 'service', '-s', '/world/%s/set_pose' % world,
+                        '--reqtype', 'gz.msgs.Pose', '--reptype', 'gz.msgs.Boolean',
+                        '--timeout', '3000', '--req', req],
+                       capture_output=True, timeout=25)
+    out = (r.stdout + r.stderr).decode('utf-8', 'replace').strip()
+    print('  set_pose[%d] -> %s' % (attempt, out or 'no output'))
+    if 'true' in out.lower():
+        break
+    time.sleep(0.5)
 if 'true' not in out.lower():
     sys.exit(1)
+
+# 回读校验：set_pose 返回 true 只说明服务收下了请求，不保证实体真的动了
+# （被其它节点覆盖、实体名对不上都会这样）。差得离谱就当失败。
+time.sleep(0.6)
+pos = read_pose().get('person')
+if pos is None:
+    print('  回读失败：世界里的 person 实体不见了', file=sys.stderr)
+    sys.exit(1)
+err = math.hypot(pos[0] - px, pos[1] - py)
+print('  回读    x=%.3f y=%.3f z=%.3f  偏差 %.3fm' % (pos[0], pos[1], pos[2], err))
+if err > 0.15:
+    print('  位姿没生效（被其它节点覆盖？检查 lightdog_person_sim 是否仍在跑）',
+          file=sys.stderr)
+    sys.exit(1)
+
+# 坐标对了不等于「检测器看得见」：人可能正好被墙/柱子挡住，或者落在视场外。
+# 以前就是这样静默失败的 —— set_pose 回 true、身位打印得漂漂亮亮，
+# /fall/state 却一直是 absent。这里直接把检测器的话读回来。
+if node_alive('/lightdog_fall_detector'):
+    want = 'lying' if mode == 'fall' else 'standing'
+    seen = None
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            r = subprocess.run(['ros2', 'topic', 'echo', '/fall/state', '--once',
+                                '--qos-reliability', 'best_effort'],
+                               capture_output=True, timeout=6)
+            txt = r.stdout.decode('utf-8', 'replace')
+            m = re.search(r'data:\s*(\w+)', txt)
+            if m:
+                seen = m.group(1)
+                if seen == want:
+                    break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    print('  检测器  /fall/state=%s（期望 %s）' % (seen or '?', want))
+    if seen != want:
+        print('  检测器看不到人：多半是机器人被挡住或人落在视场外。', file=sys.stderr)
+        print('  机器人当前 yaw 指向的位置可能贴着墙/柱子。干净的做法是', file=sys.stderr)
+        # 注意：上面是 <<EOS（不带引号）的 heredoc，反引号和美元符都会被 shell 展开，
+        # 所以这里不能写命令的引号形式，否则会把 p2.sh 真的执行一遍。
+        print('  bash sim/p2.sh reset 回出生点后重新走一遍。', file=sys.stderr)
+        sys.exit(1)
 PY
 EOS
 }
@@ -345,7 +462,7 @@ EOS
 
   test)
     need_container
-    ros "ros2 topic pub --once /alert/command std_msgs/msg/String '{data: test}'" >/dev/null 2>&1
+    pub /alert/command std_msgs/msg/String '{data: test}' || exit 1
     echo "已下发 test（跳过两级确认，直接进 ALARM）。2 秒后状态："
     sleep 2
     one_shot /alert/state std_msgs/msg/String
@@ -353,7 +470,7 @@ EOS
 
   ack)
     need_container
-    ros "ros2 topic pub --once /alert/command std_msgs/msg/String '{data: ack}'" >/dev/null 2>&1
+    pub /alert/command std_msgs/msg/String '{data: ack}' || exit 1
     echo "已下发 ack（确认已知晓，停止重复呼叫）"
     sleep 2
     one_shot /alert/state std_msgs/msg/String
@@ -361,7 +478,7 @@ EOS
 
   reset)
     need_container
-    ros "ros2 topic pub --once /alert/command std_msgs/msg/String '{data: reset}'" >/dev/null 2>&1
+    pub /alert/command std_msgs/msg/String '{data: reset}' || exit 1
     echo "已下发 reset（回到 NORMAL）"
     sleep 2
     one_shot /alert/state std_msgs/msg/String

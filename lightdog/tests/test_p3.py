@@ -21,7 +21,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness import (  # noqa: E402
-    Bool, Clock, Float32, Future, GoalHandle, Log, Msg, Pub, String, Twist,
+    Bool, Clock, Float32, Future, GoalHandle, Log, Pub, String, Twist,
     bind, extract_methods, source_of,
 )
 

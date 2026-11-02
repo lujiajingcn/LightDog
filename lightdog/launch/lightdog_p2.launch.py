@@ -35,11 +35,8 @@ collision_monitor，最后由它独占 `/cmd_vel`。
     然后 sim/p2.sh 会自动 spawn 人（或手动 bash sim/p2.sh spawn）
 """
 
-import os
-
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare

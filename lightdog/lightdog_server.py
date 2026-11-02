@@ -651,6 +651,22 @@ class LightDogServer(Node):
             return []
         out = [by_id[a] for a in order]
         out.reverse()                       # 最新的在前
+
+        # 告警还在进行中时，jsonl 里最后一行是「刚进 ALARM / 刚 ACK」那一刻的快照，
+        # 之后的呼叫记录都还没落盘 —— 于是历史列表显示「呼叫 0 次」，而 /status
+        # 里明明已经打了 3 轮。用实时消息覆盖同一条记录，两个接口对同一条告警
+        # 说法才一致（和 current_alert 里那段「别两副面孔」是同一个道理）。
+        live = self.alert or {}
+        if live.get('state') in ('ALARM', 'ACKED') and live.get('alarm_id'):
+            for a in out:
+                if a.get('alarm_id') != live['alarm_id']:
+                    continue
+                for k in ('state', 'call_attempts', 'rounds',
+                          'contact_count', 'since', 'age', 'z_p95'):
+                    if k in live:
+                        a[k] = live[k]
+                break
+
         for a in out:
             if a.get('event_id'):
                 continue

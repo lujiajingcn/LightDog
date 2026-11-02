@@ -51,6 +51,24 @@ ros() {
      $1"
 }
 
+# 连发 6 条而不是 `--once`：单发时发布进程常在 DDS 发现完成前退出，消息会丢。
+# 这三个命令本身都有 busy 保护（dock_manager 的 start_docking / start_undocking
+# 都是 `if self.busy: return`），重复发没有副作用。
+pub() {  # pub <topic> <type> <yaml-body>；返回 1 = 没人订阅，这条命令没送到
+  # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
+  # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
+  #
+  # 必须检查 subscribers：没有订阅者时发布「成功」返回，消息直接进了黑洞，
+  # 脚本却照样打印「已下发」。实测真出现过（DDS 发现还没收敛就发了）。
+  local out
+  out=$(ros "timeout 25 python3 /sim/pub_once.py $1 $2 '$3'")
+  echo "$out"
+  if echo "$out" | grep -q 'subscribers=0'; then
+    echo "!! $1 没有订阅者，这条命令没人收（对应节点没起来？）" >&2
+    return 1
+  fi
+}
+
 need_container() {
   if ! "$DOCKER" ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "容器 $CONTAINER 没在运行。先执行：" >&2
@@ -62,7 +80,19 @@ need_container() {
 # 这个容器里 `pkill -f` 不生效（试过，进程纹丝不动），必须按 PID 杀。
 kill_p3() {
   # 不含 twist_mux：它是常驻基础设施，由 entrypoint 起
-  ros "for p in \$(ps -eo pid,args --no-headers | grep -E 'lightdog_(aruco_dock|dock_manager)|lightdog_p3.launch.py' | grep -v grep | awk '{print \$1}'); do kill -9 \$p 2>/dev/null; done; sleep 1; true"
+  # 停止分两段，顺序不能反：
+  #   1) 先对整个进程组发 SIGTERM。ros2 launch 装着信号处理，会依次关掉子节点，
+  #      rclpy 正常 shutdown 时会向 DDS 发「我走了」。直接 kill -9 不会发这条，
+  #      对端只能等租约超时 —— 这段时间 `ros2 node list` 会一直展示**幽灵节点**
+  #      （实测杀完立刻 list 看到两个 lightdog_mission，8 秒后自己变回一个）。
+  #      幽灵让人根本无法判断「到底有没有起重复实例」。
+  #   2) 再对剩下的顽固进程补 SIGKILL。
+  # 另外两点也是为了不误伤自己：
+  #   * awk -v me=$$ 排除执行这条命令的 shell（它的命令行里含有模式原文）；
+  #   * 模式里用 \. 而不是裸点，让「模式原文」本身不构成一次匹配。
+  ros "f() { ps -eo pid,args --no-headers | grep -E 'lightdog_(aruco_dock|dock_manager)\\.py|lightdog_p3\\.launch\\.py' | grep -v grep | awk -v me=\$\$ '\$1 != me {print \$1}'; }; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -TERM \$pids 2>/dev/null; sleep 2; fi; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -9 \$pids 2>/dev/null; fi; sleep 1; true"
 }
 
 cmd="${1:-status}"
@@ -108,27 +138,28 @@ case "$cmd" in
 
   stop)
     need_container
-    ros "ros2 topic pub --once /dock/command std_msgs/msg/String '{data: cancel}' >/dev/null 2>&1; true"
-    ros "ros2 topic pub --once /cmd_vel_dock geometry_msgs/msg/Twist '{}' >/dev/null 2>&1; true"
+    # 先取消（让 docking_server 松开方向盘），再杀节点，最后补一条零速
+    pub /dock/command std_msgs/msg/String '{data: cancel}'
     kill_p3
+    pub /cmd_vel_dock geometry_msgs/msg/Twist '{}' 
     echo "P3 节点已停"
     ;;
 
   dock)
     need_container
-    ros "ros2 topic pub --once /dock/command std_msgs/msg/String '{data: dock}' >/dev/null 2>&1"
+    pub /dock/command std_msgs/msg/String '{data: dock}'
     echo "已发 dock 命令。用 bash sim/p3.sh watch 看进度"
     ;;
 
   undock)
     need_container
-    ros "ros2 topic pub --once /dock/command std_msgs/msg/String '{data: undock}' >/dev/null 2>&1"
+    pub /dock/command std_msgs/msg/String '{data: undock}'
     echo "已发 undock 命令"
     ;;
 
   cancel)
     need_container
-    ros "ros2 topic pub --once /dock/command std_msgs/msg/String '{data: cancel}' >/dev/null 2>&1"
+    pub /dock/command std_msgs/msg/String '{data: cancel}'
     echo "已发 cancel 命令"
     ;;
 
@@ -141,8 +172,10 @@ case "$cmd" in
       echo "注入值会在 5 秒后自动失效（sim_battery_timeout），无需额外操作"
       exit 0
     fi
-    # 每 2 秒重发一次，让注入值一直新鲜（超时窗口 5s）
-    ros "for i in \$(seq 1 30); do ros2 topic pub --once /dock/sim_battery_ratio std_msgs/msg/Float32 '{data: $v}' >/dev/null 2>&1; sleep 2; done & echo '注入 $v（后台持续 60s）'"
+    # 1Hz 连发 60 条 = 注入 60 秒；窗口是 sim_battery_timeout(5s)，1Hz 足够新鲜。
+    # nohup 不能省：docker exec 的 shell 一退出，后台子进程会被回收，
+    # 表现为「注入成功、2 秒后电量直接跳回真实值」。
+    ros "nohup timeout 65 ros2 topic pub -r 1 -t 60 /dock/sim_battery_ratio std_msgs/msg/Float32 '{data: $v}' >/dev/null 2>&1 & echo '注入 $v（后台持续 60s）'"
     ;;
 
   pose)

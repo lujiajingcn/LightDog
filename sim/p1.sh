@@ -36,6 +36,27 @@ ros() {
      $1"
 }
 
+# 连发 6 条而不是 `ros2 topic pub --once`。
+#
+# `--once` 的发布者常常在 DDS 发现完成之前就退出了，消息直接丢；而输出被
+# 重定向掉了，于是现象是「命令成功返回、灯没变」。`-r 10 -t 6` = 10Hz 发 6 条，
+# 约 0.6 秒，足够完成发现。注意 `-t/--times` 是**消息条数**，不是秒。
+pub() {  # pub <topic> <type> <yaml-body>
+  # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
+  # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
+  ros "timeout 25 python3 /sim/pub_once.py $1 $2 '$3'"
+}
+
+# 某个话题有几个订阅者。
+#
+# 这里不能靠「读回自己发的值」确认：`/led/brightness` 只有订阅者（lightdog_led），
+# 没有任何节点会把它再发出来，echo 永远读不到 —— 于是「读不到」既可能是没发成功，
+# 也可能是正常。查订阅者数量是这条链路上唯一诚实的确认手段：0 个订阅者
+# 说明发出去也没人收（节点没起 / 话题名写错），这一点必须报出来。
+topic_subs() {
+  ros "timeout 8 ros2 topic info $1 2>/dev/null | sed -n 's/^Subscription count: //p' | head -1"
+}
+
 need_container() {
   if ! "$DOCKER" ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "容器 $CONTAINER 没在运行。先执行：" >&2
@@ -45,9 +66,15 @@ need_container() {
 }
 
 set_brightness() {
-  local v="$1"
-  ros "ros2 topic pub --once /led/brightness std_msgs/msg/Float32 '{data: $v}'" >/dev/null 2>&1
-  echo "主灯亮度 -> $v"
+  local v="$1" n
+  n=$(topic_subs /led/brightness)
+  if [ "$n" = "0" ]; then
+    echo "!! /led/brightness 没有任何订阅者，发了也不会亮" >&2
+    echo "   检查 lightdog_led 是否在跑：bash sim/p1.sh status" >&2
+    return 1
+  fi
+  pub /led/brightness std_msgs/msg/Float32 "{data: $v}"
+  echo "主灯亮度 -> $v（订阅者 ${n:-?} 个）"
 }
 
 cmd="${1:-status}"
@@ -68,7 +95,7 @@ case "$cmd" in
     need_container
     v="${2:-}"
     if [ -z "$v" ]; then echo "用法: bash sim/p1.sh indicator 0.5" >&2; exit 1; fi
-    ros "ros2 topic pub --once /led/indicator std_msgs/msg/Float32 '{data: $v}'" >/dev/null 2>&1
+    pub /led/indicator std_msgs/msg/Float32 "{data: $v}"
     echo "指示灯亮度 -> $v"
     ;;
 

@@ -72,10 +72,40 @@ class PersonSim(Node):
 
         self.create_timer(1.0 / hz, self._tick)
 
+        # enabled / speed 支持运行时改。
+        #
+        # 为什么必须支持：P5 的跌倒用例要自己用 set_pose 摆人的位姿（站着 / 躺下）。
+        # 只要本节点还在跑，它每 0.2s 就把人搬回既定路径，P5 摆的位置立刻被覆盖，
+        # 而 set_pose 本身仍然返回 true —— 表现为「摆位成功但 /fall/state 一直 absent」，
+        # 极难定位。有了这个回调，P5 只要 `ros2 param set ... enabled false`
+        # 就能临时让路，测完再打开，不必杀掉 P2 的整条链路。
+        self.add_on_set_parameters_callback(self._on_set_params)
+
         self.get_logger().info(
             f'LightDog person-sim ready: entity={self.entity} world={self.world} '
             f'waypoints={self.wps} speed={self.speed:.2f}m/s '
             f'loop={self.total:.2f}m enabled={self.enabled}')
+
+    def _on_set_params(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+
+        for prm in params:
+            if prm.name == 'enabled':
+                want = bool(prm.value)
+                if want != self.enabled:
+                    self.get_logger().info(
+                        'person-sim %s（P5 摆位 / 其它用例接管人模型）'
+                        % ('恢复行走' if want else '暂停行走'))
+                self.enabled = want
+            elif prm.name == 'speed':
+                try:
+                    val = float(prm.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(successful=False, reason='speed 必须是数字')
+                if val < 0.0:
+                    return SetParametersResult(successful=False, reason='speed 不能为负')
+                self.speed = val
+        return SetParametersResult(successful=True)
 
     def _pose_at(self, dist):
         """按沿路径的累计距离返回 (x, y, yaw)。"""

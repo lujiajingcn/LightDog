@@ -68,3 +68,6 @@ services:
       - ./entrypoint.sh:/entrypoint.sh:ro
       - ./patch_upstream.py:/patch_upstream.py:ro
       - ./gui.config:/gui.config:ro
+      # 整个 sim/ 目录只读挂进来：p1~p5/system.sh 里的 `python3 /sim/pub_once.py`
+      # 靠它。按单个文件挂的话，每加一个脚本都要改 compose + 重建容器。
+      - ./:/sim:ro

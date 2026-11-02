@@ -87,6 +87,7 @@ def make_mux():
     m.pub = Pub()
     m.pub_state = Pub()
     m.pub_beat = Pub()
+    m.pub_estop = Pub()
     m.active_name = None
     m._stale = False
     m.estop = False

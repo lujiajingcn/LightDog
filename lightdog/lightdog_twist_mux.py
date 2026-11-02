@@ -275,6 +275,19 @@ class TwistMux(Node):
         self.hold = False             # 调度层按住：它停发就自动放开（见 _hold_stale）
         self._hold_stamp = 0.0
         self.hold_timeout = 3.0       # 必须 > 调度层 1Hz 的刷新周期
+
+        # 急停状态的**长期持有者**。
+        #
+        # 为什么本节点要回发自己刚收到的值：`/safety/estop` 的写者有 CLI、
+        # 语音、网页按钮，它们都是短命或有条件存活的；TRANSIENT_LOCAL 的锁存
+        # 样本随**最后一个 writer 退出**而消失。于是出现过这种情况：
+        # 用 CLI 按下急停 -> 只重启 mission -> 新 mission 收不到任何锁存值，
+        # 从 estop=False 起步，而 mux 还老老实实锁着。
+        # 本节点是 entrypoint 起的常驻进程，只要它活着，锁存就一直有主人，
+        # 后来者一定能继承「已经急停」。
+        self.pub_estop = self.create_publisher(
+            Bool, str(p('estop_topic').value), SAFETY_QOS)
+
         self.create_subscription(
             Bool, str(p('estop_topic').value), self._on_estop, SAFETY_QOS)
         self.create_subscription(
@@ -303,13 +316,20 @@ class TwistMux(Node):
 
     def _on_estop(self, msg: Bool):
         v = bool(msg.data)
-        if v != self.estop:
-            if v:
-                self.get_logger().warn(
-                    '急停闭锁（/safety/estop=true）-> 输出零速，直到显式解除')
-            else:
-                self.get_logger().info('急停已解除')
+        if v == self.estop:
+            return
+        if v:
+            self.get_logger().warn(
+                '急停闭锁（/safety/estop=true）-> 输出零速，直到显式解除')
+        else:
+            self.get_logger().info('急停已解除')
         self.estop = v
+        # 回发一份（同一话题、同一 QoS）。上面已经 `v == self.estop` 早退，
+        # 所以自己收到自己的消息不会再发，不会形成循环。
+        try:
+            self.pub_estop.publish(Bool(data=v))
+        except Exception:                      # 发布失败不该影响刹车本身
+            pass
 
     def _on_hold(self, msg: Bool):
         v = bool(msg.data)

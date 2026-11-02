@@ -51,6 +51,23 @@ ros() {
      $1"
 }
 
+# 连发 6 条而不是 `--once`：单发时发布进程常在 DDS 发现完成前退出，消息会丢，
+# 而输出被重定向掉了 → 现象是「命令成功返回、什么都没发生」。
+pub() {  # pub <topic> <type> <yaml-body>；返回 1 = 没人订阅，这条命令没送到
+  # 只发一条：pub_once.py 会让 publisher 多活 1 秒完成 ACK/重传。
+  # 为什么不再连发 6 条，见 sim/system.sh 里 send() 上面那段说明。
+  #
+  # 必须检查 subscribers：没有订阅者时发布「成功」返回，消息直接进了黑洞，
+  # 脚本却照样打印「已下发」。实测真出现过（DDS 发现还没收敛就发了）。
+  local out
+  out=$(ros "timeout 25 python3 /sim/pub_once.py $1 $2 '$3'")
+  echo "$out"
+  if echo "$out" | grep -q 'subscribers=0'; then
+    echo "!! $1 没有订阅者，这条命令没人收（对应节点没起来？）" >&2
+    return 1
+  fi
+}
+
 need_container() {
   if ! "$DOCKER" ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "容器 $CONTAINER 没在运行。先执行：" >&2
@@ -59,9 +76,23 @@ need_container() {
   fi
 }
 
-# 这个容器里 `pkill -f` 不生效（P3 踩过），必须按 PID 杀
+# 这个容器里 `pkill -f` 不生效（P3 踩过），必须按 PID 杀。
+# awk 排除执行者自己的 PID：这条命令自己的命令行里就含 `lightdog_p4.launch.py`，
+# 会被同一个 grep 匹配到，可能先把自己杀掉、后面的节点一个都不处理。
 kill_p4() {
-  ros "for p in \$(ps -eo pid,args --no-headers | grep -E 'lightdog_(recorder|server)|lightdog_p4.launch.py' | grep -v grep | awk '{print \$1}'); do kill -9 \$p 2>/dev/null; done; sleep 1; true"
+  # 停止分两段，顺序不能反：
+  #   1) 先对整个进程组发 SIGTERM。ros2 launch 装着信号处理，会依次关掉子节点，
+  #      rclpy 正常 shutdown 时会向 DDS 发「我走了」。直接 kill -9 不会发这条，
+  #      对端只能等租约超时 —— 这段时间 `ros2 node list` 会一直展示**幽灵节点**
+  #      （实测杀完立刻 list 看到两个 lightdog_mission，8 秒后自己变回一个）。
+  #      幽灵让人根本无法判断「到底有没有起重复实例」。
+  #   2) 再对剩下的顽固进程补 SIGKILL。
+  # 另外两点也是为了不误伤自己：
+  #   * awk -v me=$$ 排除执行这条命令的 shell（它的命令行里含有模式原文）；
+  #   * 模式里用 \. 而不是裸点，让「模式原文」本身不构成一次匹配。
+  ros "f() { ps -eo pid,args --no-headers | grep -E 'lightdog_(recorder|server)\\.py|lightdog_p4\\.launch\\.py' | grep -v grep | awk -v me=\$\$ '\$1 != me {print \$1}'; }; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -TERM \$pids 2>/dev/null; sleep 2; fi; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -9 \$pids 2>/dev/null; fi; sleep 1; true"
 }
 
 # 本机局域网 IPv4 列表。
@@ -178,7 +209,7 @@ case "$cmd" in
 
   snap)
     need_container
-    ros "ros2 topic pub --once /recorder/snapshot std_msgs/msg/Empty '{}' >/dev/null 2>&1"
+    pub /recorder/snapshot std_msgs/msg/Empty '{}' 
     sleep 2
     ros "ls -lt $DATA_DIR/snapshots 2>/dev/null | head -3"
     ;;

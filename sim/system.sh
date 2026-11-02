@@ -56,39 +56,62 @@ need_container() {
 }
 
 kill_system() {
-  # pkill -f 在这个容器里不生效，必须按 PID 杀
-  ros "for p in \$(ps -eo pid,args --no-headers | grep -E 'lightdog_(mission|voice)|lightdog_system.launch.py' | grep -v grep | awk '{print \$1}'); do kill -9 \$p 2>/dev/null; done; sleep 1; true"
+  # 停止分两段，顺序不能反：
+  #   1) 先对整个进程组发 SIGTERM。ros2 launch 装着信号处理，会依次关掉子节点，
+  #      rclpy 正常 shutdown 时会向 DDS 发「我走了」。直接 kill -9 不会发这条，
+  #      对端只能等租约超时 —— 这段时间 `ros2 node list` 会一直展示**幽灵节点**
+  #      （实测杀完立刻 list 看到两个 lightdog_mission，8 秒后自己变回一个）。
+  #      幽灵让人根本无法判断「到底有没有起重复实例」。
+  #   2) 再对剩下的顽固进程补 SIGKILL。
+  # 另外两点也是为了不误伤自己：
+  #   * awk -v me=$$ 排除执行这条命令的 shell（它的命令行里含有模式原文）；
+  #   * 模式里用 \. 而不是裸点，让「模式原文」本身不构成一次匹配。
+  ros "f() { ps -eo pid,args --no-headers | grep -E 'lightdog_(mission|voice)\\.py|lightdog_system\\.launch\\.py' | grep -v grep | awk -v me=\$\$ '\$1 != me {print \$1}'; }; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -TERM \$pids 2>/dev/null; sleep 2; fi; \
+       pids=\$(f); if [ -n \"\$pids\" ]; then kill -9 \$pids 2>/dev/null; fi; sleep 1; true"
 }
 
-# 单发一条消息在本容器里经常丢：`ros2 topic pub --once` 的发布者往往在
-# DDS 发现完成之前就退出了（实测急停发不进去，等 1 秒看状态还是 idle）。
-# 改成连发；下面这些指令本身都是幂等的（dock 重复发只会重申意图，
-# undock 有 busy 保护），重复发没有副作用。
+# 发命令：一条消息 + 发布者多活一会儿，而不是连发。
 #
-# ⚠️ 两个已经踩过的坑，改这个函数前务必先看：
+# 这里踩过两个坑，改之前务必看完：
 #
-# 1. `-t/--times` 是**消息条数**，不是秒。写 `-t 0.6` 会被 argparse 直接拒掉
-#    （invalid nonnegative_int value），而 send() 把 stdout/stderr 全丢了，
-#    于是表现为「命令成功返回但什么事都没发生」。
-#    `-r 10 -t 6` = 10Hz 发 6 条 ≈ 0.6s。
+# 1) `ros2 topic pub --once` 会丢消息：短命进程在 DDS 发现完成前就退出了，
+#    RELIABLE 的 writer 还没等到 ACK 就被析构，未确认的样本直接没了。
+#    实测急停发不进去，等 1 秒看状态还是 idle。
 #
-# 2. 连 0.6s 也**不够**。`ros2 topic pub` 是发完就退的短命进程，RELIABLE 的
-#    writer 在析构时还没等到对端 ACK，未确认的样本会被丢掉。实测 5 轮
-#    `-t 6` 只到了 1 轮，而且两个订阅者（twist_mux / mission）收到的结果
-#    还不一样 —— 一个锁上了、一个没锁上，非常吓人。
-#    所以：**突发发两轮**，安全相关的命令（急停）再用 state_read 读回确认。
+# 2) 「连发 6 条」是更糟的补法：这台机器上 `-r 10` 实际只能跑到 2~3Hz
+#    （CLI 启动 + CPU 被仿真占满），6 条要 3~6 秒才发完。收端看到的是
+#    **同一条指令被执行 6 次** —— 语音重复播报、dock 被连点、
+#    日志里 6 行一模一样。去重窗口根本盖不住 6 秒。
 #
-# 3. 回显里别用 `<` `>` 当箭头。`echo sent: /light/mode <- off` 会被 bash 解析成
+# 正确做法：`sim/pub_once.py` 只 publish 一次，但让 DataWriter 多活 1 秒，
+# 由 RELIABLE 自己完成重传。收端恰好收到 1 条，且能报出订阅者数量 ——
+# 「发了但没人收」这种静默失败从此可查。
+#
+# 3) 回显里别用 `<` `>` 当箭头。`echo sent: /light/mode <- off` 会被 bash 解析成
 #    「stdin 重定向自文件 `-`」，报 `bash: -: No such file or directory` ——
 #    整条命令直接失效，而且报错离真正原因隔着好几层（docker exec 里）。
-PUB_RATE="${PUB_RATE:-10}"
-PUB_TIMES="${PUB_TIMES:-6}"
+PUB_HOLD="${PUB_HOLD:-1.0}"
 
-send() {  # send <topic> <type> <data>
-  ros "timeout 15 ros2 topic pub -r $PUB_RATE -t $PUB_TIMES $1 $2 '{data: \"$3\"}' >/dev/null 2>&1"
-  sleep 0.3
-  ros "timeout 15 ros2 topic pub -r $PUB_RATE -t $PUB_TIMES $1 $2 '{data: \"$3\"}' >/dev/null 2>&1" \
-    && echo "sent $1 = $3（未校验，用 status 读回）"
+pub_raw() {  # pub_raw <topic> <type> <yaml-body> [hold] [durable]
+  local hold="${4:-$PUB_HOLD}" dur="${5:-0}"
+  ros "timeout 25 python3 /sim/pub_once.py $1 $2 '$3' $hold $dur"
+}
+
+send() {  # send <topic> <type> <text>
+  # 单引号会破坏容器那层的引号结构，直接剔除（中文指令里也不该有）
+  local text="${3//\'/}" out
+  out=$(pub_raw "$1" "$2" "{data: \"$text\"}")
+  if echo "$out" | grep -q 'subscribers=0'; then
+    echo "!! $1 当前没有订阅者，命令没人收（节点没起？话题名写错？）" >&2
+    return 1
+  fi
+  if echo "$out" | grep -q '^sent '; then
+    echo "sent $1 = $text"
+    return 0
+  fi
+  echo "!! 发送失败：$out" >&2
+  return 1
 }
 
 # 读一个 String 话题的当前值，去掉 "data: " 前缀。
@@ -115,6 +138,15 @@ case "$cmd" in
   start)
     need_container
     kill_system
+    # 再确认一次没有残留：kill 没清干净时宁可报错，也不要起第二份。
+    # 两个 mission 同时跑会各自发 /follow/enable 与 /mission/hold_motion，
+    # 跟随器收到的最后一条谁也说不好，排查起来像"信号随机丢失"。
+    left=$(ros "ps -eo pid,args --no-headers | grep -E 'lightdog_(mission|voice)\.py' | grep -v grep | wc -l")
+    if [ "${left:-0}" != "0" ]; then
+      echo "!! 还有 $left 个系统层进程没杀掉，先手工检查：" >&2
+      ros "ps -eo pid,etime,args --no-headers | grep -E 'lightdog_(mission|voice)\.py' | grep -v grep | sed 's/--ros-args.*//'" >&2
+      exit 1
+    fi
     ros "nohup ros2 launch lightdog lightdog_system.launch.py > /tmp/system.log 2>&1 & echo started"
     sleep 8
     echo "系统层已拉起，日志 /tmp/system.log（容器内）。当前节点："
@@ -165,7 +197,10 @@ case "$cmd" in
     # 必须两个消费者都点名，只看 mux 会骗过自己。
     ok=0
     for i in 1 2 3 4 5 6; do
-      ros "timeout 15 ros2 topic pub -r $PUB_RATE -t $PUB_TIMES --qos-durability transient_local /safety/estop std_msgs/msg/Bool '{data: true}'" >/dev/null 2>&1
+      # durable=1：急停是「状态」不是「事件」，用 TRANSIENT_LOCAL 让之后
+      # 才启动的节点也能继承"已经急停"这个既成事实（实测 kill 掉 mission
+      # 再拉起，0.8s 内就进 ESTOP，不需要任何人重发）。
+      pub_raw /safety/estop std_msgs/msg/Bool '{data: true}' 1.5 1 >/dev/null 2>&1
       sleep 0.8
       m="$(state_read /cmd_vel_mux_state)"
       s="$(state_read /mission/mode)"
@@ -187,7 +222,7 @@ case "$cmd" in
   clear_estop)
     ok=0
     for i in 1 2 3 4 5 6; do
-      ros "timeout 15 ros2 topic pub -r $PUB_RATE -t $PUB_TIMES --qos-durability transient_local /safety/estop std_msgs/msg/Bool '{data: false}'" >/dev/null 2>&1
+      pub_raw /safety/estop std_msgs/msg/Bool '{data: false}' 1.5 1 >/dev/null 2>&1
       sleep 0.8
       m="$(state_read /cmd_vel_mux_state)"
       s="$(state_read /mission/mode)"

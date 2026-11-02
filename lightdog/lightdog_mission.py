@@ -248,6 +248,10 @@ class Mission(Node):
         self.approach_wanted = False
         self._low_since = None
         self._approach_cooldown_until = 0.0
+        # 「手动要求回充」与「低电自动判定」必须分开记：共用 approach_wanted
+        # 的话，用户满电时点「回充」会被 update_approach 当场上限迟滞清掉
+        # （电量 >= clear_ratio -> 解除接近），表现是命令被无声吞掉。
+        self._approach_manual = False
 
         # 巡游
         self.waypoints, bad = parse_waypoints(p('patrol_waypoints').value)
@@ -365,9 +369,25 @@ class Mission(Node):
             self.patrol_enabled = True
             self._wp_index = 0
             self.reason = '命令：开始巡游'
+            if not self.waypoints:
+                # 不 warn 的话现场看到的是「说了开始巡逻、车一动不动」，
+                # 而 decide() 里那条 `and self.waypoints` 把原因藏得死死的。
+                self.get_logger().warn(
+                    'patrol_on：patrol_waypoints 为空，巡游不会真的动起来'
+                    '（先在 config/system_params.yaml 里填 "x,y,yaw; ..."）')
         elif cmd == 'patrol_off':
             self.patrol_enabled = False
             self.reason = '命令：停止巡游'
+        elif cmd in ('stop', 'halt', 'all_stop'):
+            # 「停下」= 停掉所有会让车动起来的东西。不设 manual：MANUAL 仍然
+            # 给跟随放行（见 _apply），人站在面前时车会继续跟过来。
+            self.follow_enabled = False
+            self.patrol_enabled = False
+            self.approach_wanted = False
+            self._approach_manual = False
+            self.pub_dock.publish(String(data='cancel'))
+            self._cancel_nav('命令全停')
+            self.reason = '命令：全部停止'
         elif cmd in ('dock', 'go_dock', 'charge'):
             # 手动回充：不改 approach_wanted（那是自动判据），直接交给
             # dock_manager —— 它已经有对齐/重试/冷却，重复一套没意义。
@@ -375,6 +395,7 @@ class Mission(Node):
             self._approach_cooldown_until = 0.0
             if self.nav_client.server_is_ready():
                 self.approach_wanted = True
+                self._approach_manual = True
                 self.reason = '命令：手动回充（先导航到桩前）'
             else:
                 # 没有 Nav2 的时候不能让「手动回充」彻底失效：直接让
@@ -383,11 +404,13 @@ class Mission(Node):
                 self.reason = '命令：手动回充（Nav2 不可用，直接停靠）'
         elif cmd in ('cancel', 'cancel_dock'):
             self.approach_wanted = False
+            self._approach_manual = False
             self.pub_dock.publish(String(data='cancel'))
             self._cancel_nav('命令取消')
             self.reason = '命令：取消回充'
         elif cmd == 'undock':
             self.approach_wanted = False
+            self._approach_manual = False
             self.pub_dock.publish(String(data='undock'))
             self.reason = '命令：离桩'
         elif cmd == 'status':
@@ -452,6 +475,12 @@ class Mission(Node):
         """低电判据的迟滞。只改 approach_wanted，不决定模式。"""
         if not self.dock_approach:
             self.approach_wanted = False
+            self._approach_manual = False
+            return
+
+        # 手动回充不受电量迟滞约束：用户说去充电就去充电，哪怕电量是 90%。
+        # 它只由「到达桩前 / 导航失败 / 取消」三件事结束。
+        if self._approach_manual:
             return
 
         if not self._ratio_fresh(now):
@@ -596,6 +625,7 @@ class Mission(Node):
                 self._cancel_nav('超时')
                 self._nav_fail += 1
                 self.approach_wanted = False
+                self._approach_manual = False
                 self._approach_cooldown_until = now + self.approach_cooldown
             return
         if now < self._nav_cooldown_until:
@@ -669,15 +699,19 @@ class Mission(Node):
         try:
             status = future.result().status
         except Exception as e:
-            self._nav_failed(epoch, f'结果异常：{e}')
+            self._nav_failed(epoch, f'结果异常：{e}', tag)
             return
         self._nav_state = None
         self._nav_handle = None
-        self._nav_tag = None
         if status == GoalStatus.STATUS_SUCCEEDED:
+            self._nav_tag = None
             self._on_nav_success(tag)
         else:
-            self._nav_failed(epoch, f'status={status}')
+            # 这里**必须把 tag 传下去**：先把 _nav_tag 清空再调 _nav_failed，
+            # 它读到的就是 None，`if tag == 'approach'` 永远不成立 ——
+            # 回充导航失败时既不清 approach_wanted、也不进冷却，
+            # 下一拍立刻重发同一个到不了的目标，形成无声的失败循环。
+            self._nav_failed(epoch, f'status={status}', tag)
 
     def _on_nav_success(self, tag):
         now = time.monotonic()
@@ -689,6 +723,7 @@ class Mission(Node):
             # 才会自动切到 DOCKING 模式。这里先把「想要回充」清掉，
             # 否则它一失败我们立刻又发一次导航，变成两个状态机打架。
             self.approach_wanted = False
+            self._approach_manual = False
             self._approach_cooldown_until = now + self.approach_cooldown
         elif tag == 'patrol':
             self.get_logger().info(
@@ -697,12 +732,13 @@ class Mission(Node):
             self._patrol_wait_until = now + self.patrol_dwell
             self._wp_index = (self._wp_index + 1) % max(1, len(self.waypoints))
 
-    def _nav_failed(self, epoch, why):
+    def _nav_failed(self, epoch, why, tag=None):
         if epoch != self._nav_epoch:
             return
         self._nav_state = None
         self._nav_handle = None
-        tag = self._nav_tag
+        if tag is None:
+            tag = self._nav_tag
         self._nav_tag = None
         self._nav_fail += 1
         now = time.monotonic()
@@ -710,6 +746,7 @@ class Mission(Node):
         self.get_logger().error(f'导航失败 [{tag}]：{why}')
         if tag == 'approach':
             self.approach_wanted = False
+            self._approach_manual = False
             self._approach_cooldown_until = now + self.approach_cooldown
 
     def _cancel_nav(self, why):

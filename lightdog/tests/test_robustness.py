@@ -317,5 +317,131 @@ class TestLightAutoSurvivesDetectorDeath(unittest.TestCase):
         self.assertEqual(d.log.text('warn'), '')
 
 
+# ---------------------------------------------------------------- 呼叫轮次
+
+def make_caller(contacts, interval=0.0):
+    """只装 _maybe_call 需要的那几个属性，不碰 rclpy。"""
+    import shlex
+    import time as _time
+
+    d = type('AlertManager', (), {})()
+    d.state = ALARM
+    d.ACKED = 'ACKED'
+    d.is_test = False
+    d.last_call = None
+    d.call_interval = interval
+    d.max_rounds = 3
+    d.rounds = 0
+    d.call_idx = 0
+    d.call_attempts = []
+    d.call_command = ''
+    d.clock = Clock()
+    d.log = Log()
+    d.get_clock = lambda: d.clock
+    d.get_logger = lambda: d.log
+    d._load_contacts = lambda: contacts
+    d._say = lambda text: None
+    d._publish = lambda: None
+    bind(d, extract_methods(ALERT, 'AlertManager', {'_maybe_call', '_now'},
+                            ns={'time': _time, 'shlex': shlex, 'subprocess': None}))
+    return d
+
+
+class TestCallRounds(unittest.TestCase):
+    """告警呼叫的轮次编排。
+
+    2 个联系人、max_rounds=3 时，标签应当是
+    1,1,2,2,3,3（每个联系人都打满一轮），而不是 1,2,2,3 ——
+    后者看告警记录会以为第一轮漏掉了一个人。
+    """
+
+    CONTACTS = [{'name': '张阿姨', 'phone': '13800000001'},
+                {'name': '社区值班', 'phone': '13800000002'}]
+
+    def test_round_labels_cover_every_contact(self):
+        d = make_caller(self.CONTACTS)
+        for _ in range(4):
+            d._maybe_call()
+        labels = [a['round'] for a in d.call_attempts]
+        self.assertEqual(labels, [1, 1, 2, 2],
+                         '轮次标签与「第几轮」不一致，告警记录会误导')
+
+    def test_stops_after_max_rounds(self):
+        d = make_caller(self.CONTACTS)
+        for _ in range(20):
+            d._maybe_call()
+        n = len(self.CONTACTS) * d.max_rounds
+        self.assertEqual(len(d.call_attempts), n,
+                         '呼叫次数超过了 max_rounds × 联系人数')
+        self.assertEqual(d.rounds, d.max_rounds)
+
+    def test_last_round_is_not_dropped(self):
+        """轮次判据若写成 >=，最后一轮会被整体跳过。"""
+        d = make_caller(self.CONTACTS)
+        for _ in range(20):
+            d._maybe_call()
+        self.assertEqual(d.call_attempts[-1]['name'], '社区值班')
+
+
+# ---------------------------------------------------------------- 告警历史
+
+SERVER = source_of('lightdog_server.py')
+
+
+def make_server(tmpdir, live_alert):
+    """只装 alarms() 需要的东西：一个 jsonl 文件 + 一条实时告警。"""
+    d = type('LightDogServer', (), {})()
+    d.data_dir = tmpdir
+    d.alert = live_alert
+    d.event_of_alarm = lambda aid: None
+    d.newest_event_since = lambda t: None
+    bind(d, extract_methods(SERVER, 'LightDogServer', {'alarms'},
+                            ns={'os': os, 'json': __import__('json')}))
+    return d
+
+
+class TestAlarmHistoryConsistency(unittest.TestCase):
+    """历史列表与实时状态必须说同一句话。
+
+    jsonl 只在 (alarm_id, state) 变化时落一行，所以告警进行中时最后一行
+    是「刚进 ALARM」的快照，呼叫记录还没进去 —— 列表显示「呼叫 0 次」而
+    /status 已经有 3 次，手机端两个页面对不上。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, 'alarms.jsonl')
+
+    def _write(self, rows):
+        import json
+        with open(self.path, 'w', encoding='utf-8') as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+
+    def test_live_calls_show_up_in_history(self):
+        self._write([{'alarm_id': 'alm_1', 'state': 'ALARM',
+                      'alarm_wall': 100.0, 'call_attempts': [], 'rounds': 0}])
+        live = {'alarm_id': 'alm_1', 'state': 'ALARM',
+                'call_attempts': [{'name': '张阿姨', 'round': 1}], 'rounds': 1}
+        got = make_server(self.tmp, live).alarms()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(len(got[0]['call_attempts']), 1,
+                         '进行中的告警在历史里显示 0 次呼叫')
+        self.assertEqual(got[0]['rounds'], 1)
+
+    def test_finished_alarm_is_not_overwritten(self):
+        """已结束（NORMAL）的告警不能被上一条实时消息篡改。"""
+        self._write([{'alarm_id': 'alm_1', 'state': 'NORMAL',
+                      'alarm_wall': 100.0,
+                      'call_attempts': [{'name': '甲'}, {'name': '乙'}],
+                      'rounds': 1}])
+        live = {'alarm_id': 'alm_1', 'state': 'NORMAL', 'call_attempts': [],
+                'rounds': 0}
+        got = make_server(self.tmp, live).alarms()
+        self.assertEqual(len(got[0]['call_attempts']), 2,
+                         '已结束的告警被实时消息清空了呼叫记录')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

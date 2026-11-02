@@ -20,7 +20,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from harness import PKG, ROOT, source_of  # noqa: E402
+from harness import PKG, source_of  # noqa: E402
 
 try:
     import yaml

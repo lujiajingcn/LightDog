@@ -80,22 +80,34 @@ from lightdog_qos import SAFETY_QOS
 # 「停」相关的必须排在「跟」前面：「别跟着我」同时包含「跟」和「别跟」，
 # 先匹配到 follow 的话，机器人会朝你走过来 —— 这是最容易出人命的一条歧义。
 RULES = (
-    # 解锁必须排在加锁**前面**：「解除急停」里含「急停」、「解除刹车」里含「刹车」，
-    # 顺序反了的话，唯一的解锁口令会被理解成再加一次锁 —— 运营者喊三遍都解不开。
-    # 反过来不会误判：「急停」不含「解除急停」，所以先匹配 clear 是安全的。
+    # 顺序即优先级，**每一条都是踩过的坑**，不要凭「看起来更整齐」重排。
+    #
+    # 1) 解锁必须排在加锁**前面**：「解除急停」里含「急停」、「解除刹车」里含
+    #    「刹车」，顺序反了的话，唯一的解锁口令会被理解成再加一次锁 ——
+    #    运营者喊三遍都解不开。反过来不会误判：「急停」不含「解除急停」。
     ('clear_estop', ('解除急停', '取消急停', '解除刹车')),
     ('estop', ('急停', '紧急停止', '紧急刹车', '刹车', 'emergency stop')),
     ('stop_follow', ('别跟', '不要跟', '不要再跟', '不用跟', '不跟',
                      '别跟着', '停止跟随', 'stop following')),
-    ('follow', ('过来', '跟着我', '跟我走', '跟上', '来一下', 'come here', 'follow me')),
+    # 2) 否定式必须排在它要否定的词**前面**。
+    #    「不要充电」含「充电」（dock 的关键词），dock 排前面的话，
+    #    喊「别充电」反而会把车派去充电 —— 和「别跟着我」同一类歧义。
+    ('stop_dock', ('不用充电', '不要充电', '别充电', '不用回充', '别回充',
+                   '取消充电')),
+    # 3) 停止巡逻要排在 stop 之前：「停止巡逻」含「停止」，stop 先匹配的话
+    #    只是停掉跟随，巡游照跑（车还在走）。也不能排在 patrol_on 之后：
+    #    「别巡逻」「不用巡逻」含「巡逻」，会被理解成**开始**巡逻。
+    ('patrol_off', ('停止巡逻', '不用巡逻', '别巡逻', '取消巡逻')),
     ('stop', ('停下', '停止', '别动', '站住', '不要动', 'stop', 'halt')),
-    ('undock', ('离桩', '离开充电', '出来', 'undock')),
+    ('follow', ('过来', '跟着我', '跟我走', '跟上', '来一下', 'come here', 'follow me')),
+    # '出来' 故意不收：中文里「你出来一下」通常是「过来」而不是「离桩」，
+    # 把一句招呼理解成离桩动作，代价是一台正在充电的车自己开走。
+    ('undock', ('离桩', '离开充电', 'undock')),
     ('dock', ('充电', '回充', '回去充电', '回桩', '去充电', 'charge', 'dock')),
     ('light_on', ('开灯', '把灯打开', '灯打开', '亮一点', '灯亮', 'light on')),
     ('light_off', ('关灯', '把灯关掉', '灯关掉', '暗一点', '灯灭', 'light off')),
     ('light_auto', ('自动灯光', '灯自动', '灯光自动', 'auto light')),
     ('patrol_on', ('开始巡逻', '去巡逻', '巡逻', 'patrol')),
-    ('patrol_off', ('停止巡逻', '不用巡逻', '别巡逻')),
     ('status', ('状态', '报告情况', '现在怎么样', 'status')),
 )
 
@@ -103,9 +115,11 @@ RULES = (
 MISSION_CMD = {
     'follow': 'follow',
     'stop_follow': 'follow_off',
-    'stop': 'follow_off',        # 「停下」= 停止跟随（急停是另一条，见下）
+    # 「停下」必须是**全停**，不能只停跟随：车正在巡游/回充时喊「停下」，
+    # 只发 follow_off 的话它照旧往前走 —— 这是用户最不能接受的一种「不听话」。
+    'stop': 'stop',
+    'stop_dock': 'cancel',
     'dock': 'dock',
-    'undock': 'cancel',          # 由 dock_manager 自己离桩更可靠；见 _act
     'patrol_on': 'patrol_on',
     'patrol_off': 'patrol_off',
     'status': 'status',
@@ -190,15 +204,26 @@ class VoiceBridge(Node):
         self.declare_parameter('tts_max_len', 200)
         self.declare_parameter('tts_timeout', 10.0)
         self.declare_parameter('estop_topic', '/safety/estop')
+        # 同一条指令多久内只执行一次。
+        #
+        # 两个来源都需要它：
+        #  * 外部 ASR 会把同一句话的中间结果连发多帧（「把灯打」「把灯打开」）；
+        #  * sim/system.sh 为了对抗丢包会连发 6 条（-r 10 -t 6），每一条都会
+        #    触发一次完整动作 —— 日志里出现 6 行「语音：patrol_off」，
+        #    配上真机 TTS 就是同一句话说六遍。
+        self.declare_parameter('command_dedupe', 0.8)
 
         p = self.get_parameter
         self.tts_command = str(p('tts_command').value).strip()
         self.tts_dedupe = max(0.0, float(p('tts_dedupe').value))
         self.tts_max_len = max(16, int(p('tts_max_len').value))
         self.tts_timeout = max(1.0, float(p('tts_timeout').value))
+        self.command_dedupe = max(0.0, float(p('command_dedupe').value))
 
         self._last_say = ''
         self._last_say_at = 0.0
+        self._last_cmd = None
+        self._last_cmd_at = 0.0
         self._estop = False
         self._warned_tts = False
 
@@ -228,6 +253,17 @@ class VoiceBridge(Node):
                 self.get_logger().info(
                     f'语音：没听懂（text={text!r}），不执行任何动作')
             return
+
+        # 去重按**原文**而不是意图：连发/中间结果都是同一句话，
+        # 而「开灯」紧接着「关灯」是两句不同的话，必须都执行。
+        key = normalize(text) or intent
+        now = time.monotonic()
+        if (key == self._last_cmd
+                and (now - self._last_cmd_at) < self.command_dedupe):
+            return
+        self._last_cmd = key
+        self._last_cmd_at = now
+
         self.get_logger().info(
             f'语音：{intent}'
             f'（text={text!r}' + (f', conf={conf:.2f}' if conf else '') + '）')

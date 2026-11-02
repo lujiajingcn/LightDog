@@ -59,4 +59,7 @@
     tts_dedupe: 1.5        # 同一句话多久内不重复播（告警状态机 1Hz 刷新）
     tts_max_len: 200
     tts_timeout: 10.0
+    # 同一条指令多久内只执行一次：ASR 的中间结果连发、以及 sim 脚本为抗丢包
+    # 连发 6 条，都会让同一句话被执行多遍（真机上就是同一句话说六遍）。
+    command_dedupe: 0.8
     estop_topic: /safety/estop
