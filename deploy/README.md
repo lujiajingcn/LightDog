@@ -129,6 +129,37 @@ RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ---
 
+## 下位机串口（mcu）
+
+`lightdog-mcu` 是速度/心跳出树莓派的唯一一跳，但它在 `nodes.conf` 里是
+**装而不启用**（仿真里没有 STM32，启用只会刷「串口打不开」的 error）。
+
+```bash
+# 真车：接好串口、确认固件在跑之后启用
+sudo usermod -aG dialout "$USER"          # 改完要重新登录
+ls -l /dev/ttyAMA0                        # 或 /dev/serial/by-id/usb-...
+sudo systemctl enable --now lightdog-mcu
+journalctl -t lightdog-mcu -n 30 -f       # 应看到「串口已打开」
+```
+
+验证顺序（每一层都能独立定位）：
+
+```bash
+# 1) 协议本身：两侧共读黄金向量
+make -C firmware test                     # 宿主机有 gcc；容器里见 firmware/README.md
+
+# 2) 桥接在发心跳了吗（没有示波器就看话题）
+ros2 topic hz /cmd_vel_muxed              # 10Hz
+
+# 3) 固件的回传到了吗
+ros2 topic echo /battery_state --once --truncate-length 400
+ros2 topic echo /mcu/fault --once        # 空 = 没故障；有 JSON 就看 text 字段
+```
+
+**串口打不开时不要先怀疑节点**：90% 是用户不在 `dialout` 组，或者
+`/boot/firmware/config.txt` 里没开 `enable_uart=1`。节点不会崩，只会每 10 秒
+报一次错 —— 这是刻意的：车不动总比节点退出好查。
+
 ## 外呼通道（自建 SIP）
 
 跌倒告警要真的打电话。方案已定：**自建 SIP**，Asterisk 与机器人同机，机器人通过

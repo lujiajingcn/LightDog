@@ -45,6 +45,8 @@
 | `p4_params.yaml` | `faststart` | `false` | `true`（需 ffmpeg） | 视频的 `moov` 在文件尾，手机端边下边播要等整段下完。真机上 ffmpeg 一般都有，开了只是多一次 `-c copy` 重封装 |
 | `system_params.yaml` | `dock_pose_x/y/yaw` | `-0.50/0.00/0.00` | **按现场测** | 低电回充的导航目标是「桩前 1m」，桩位填错会导航到墙上。填错不会崩，只会永远差那么一点 |
 | `system_params.yaml` | `patrol_waypoints` | `''` | `"x,y,yaw; x,y,yaw"` | 空 = 不巡游。格式必须用分号分隔、逗号分字段，坏数据会被**计数并跳过**而不是猜一个默认值 |
+| `mcu_params.yaml` | `port` / `baud` | `/dev/ttyAMA0` / `115200` | 按实际接线与固件改 | 打不开串口时车**完全不动**，日志里只有一行「串口打不开」。用 USB 转 TTL 时写 `/dev/serial/by-id/...`，别写 `/dev/ttyUSB0`（重启后编号会变） |
+| `mcu_params.yaml` | `cmd_hold` | `0.30` | 与 `twist_mux` 的 `follow_hold` 一致 | 太长：跟随节点让出控制权后车还带着最后一条速度走；太短：正常指令被切成一顿一顿 |
 | `p1` 灯组 | 见 `docs/P1_led_battery.md` | — | — | LED 真机由固件驱动，`lightdog_led` 要停掉 |
 
 ## 二、真机上不要启动的节点
@@ -60,6 +62,7 @@
 | 节点/机制 | 为什么真机必须有 |
 |---|---|
 | `lightdog_mission` | 仿真里可以只跑 P2/P3 手动验证，真机上没人负责「跟随器别压死 Nav2」「低电自己回桩」。**没有它，跟随和回充会互相抢方向盘** |
+| `lightdog_mcu_bridge` | 速度与心跳出树莓派的**唯一一跳**。仿真里没有 STM32 所以默认不启用；真车忘了 enable 的表现是「车完全不动，日志里只有串口打不开」，很容易被误判成底盘坏了 |
 | MCU 侧 300ms 断 PWM 看门狗 | 只有它能保证「上位机进程死了车也会停」。ROS 侧再怎么努力都做不到这一点，见 `docs/firmware_protocol.md` §二 |
 
 ## 三、传感器/上游失效时的行为（fail-safe 方向）

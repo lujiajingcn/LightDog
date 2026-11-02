@@ -1,0 +1,48 @@
+# 下位机串口桥接（STM32）参数
+#
+# 真车必须启用这个节点：它是 /cmd_vel_muxed 与固件之间唯一的一跳。
+# 没有它，twist_mux 的心跳出不了树莓派，固件 300ms 就断 PWM —— 现象是
+# 「车不动，日志里只有几行串口打不开」，看起来像底盘坏了。
+#
+# 仿真里没有 STM32，deploy/nodes.conf 里这一项是「装但不启用」。
+/lightdog_mcu_bridge:
+  ros__parameters:
+    use_sim_time: false          # 串口与固件都是墙钟，跟仿真时钟没有关系
+
+    # ---- 串口 ----
+    # 树莓派 5 的板载 UART。用 USB 转 TTL 时改成 /dev/ttyUSB0 或
+    # /dev/serial/by-id/usb-...（by-id 更稳：重启后 ttyUSB 的编号会变）。
+    # 需要先确认 /boot/firmware/config.txt 里有 enable_uart=1，
+    # 且用户在该设备的组里（dialout）。
+    port: /dev/ttyAMA0
+    baud: 115200                 # 与固件一致；460800 需要两边同时改
+    reconnect_sec: 2.0           # 打不开时的重试间隔（不会崩，只报错）
+
+    # ---- 时序 ----
+    heartbeat_hz: 10.0           # 固件 300ms 无心跳断 PWM，10Hz = 连丢 3 帧
+    # 多久没收到新速度就主动发零速。
+    # 这条不是「优化」：lightdog_follower 让出控制权时会「发一次零速然后停发」，
+    # 桥接节点如果照着最后一条指令一直发，车会带着它走到底。
+    # 0.30 与 twist_mux 的 follow_hold 一致，比它短会把正常指令打成停顿。
+    cmd_hold: 0.30
+
+    # ---- 二次限幅 ----
+    # twist_mux 已经钳过一次；这里再钳一次是防「上位机参数被改成 1.0」。
+    # 固件还要钳第三次 —— 三层都做，是因为任何一层都可能是错的那一层。
+    max_linear: 0.25
+    max_angular: 0.70
+
+    # ---- 话题 ----
+    cmd_vel_topic: /cmd_vel_muxed
+    led_topic: /led/brightness
+    estop_topic: /safety/estop
+    odom_topic: /odom
+    battery_topic: /battery_state
+    fault_topic: /mcu/fault        # JSON：{"fault":3,"text":"link_lost+overcurrent"}
+    odom_frame_id: odom
+    base_frame_id: base_link
+
+    # 物理急停按钮松开后，是否允许固件自动解除闭锁。
+    # 默认 false：闭锁只能由人显式解除（lightdog-estop clear）。
+    # 改成 true 的后果是「按一下急停，松手车就能继续走」—— 那不是急停。
+    estop_auto_release: false

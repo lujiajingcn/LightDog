@@ -23,6 +23,7 @@ install(PROGRAMS
   lightdog_alert_manager.py
   lightdog_mission.py
   lightdog_voice.py
+  lightdog_mcu_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -32,6 +33,7 @@ install(PROGRAMS
 install(FILES
   lightdog_qos.py
   lightdog_call.py
+  lightdog_mcu_proto.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -28,7 +28,7 @@
 
 | 需求 | 状态 | 落在哪 | 还差什么（硬件相关） |
 |---|---|---|---|
-| 可以灵活移动 | ✅ 完成 | `lightdog_twist_mux` 仲裁 + `/cmd_vel_muxed`；Nav2 巡游 | 底盘、编码器、MCU 看门狗（见 `docs/firmware_protocol.md`） |
+| 可以灵活移动 | ✅ 完成（仿真）/ 🟡 待固件 | `lightdog_twist_mux` 仲裁 + `/cmd_vel_muxed`；`lightdog_mcu_bridge` 串口桥接；协议定稿 + 两侧实现 | 底盘、编码器、电机驱动；固件照 `firmware/` 的参考实现接（`make -C firmware test` 可先验 94 项） |
 | 通过麦克风能听到指令 | 🟡 链路完成 | `lightdog_voice`：`/voice/command` 文本进 → 语义解析 → 调度层动作。13 类意图，含「别跟着我」「解除急停」这类高风险歧义 | 平台已定：**树莓派 5**（无 CUDA）→ ASR 走 whisper.cpp/sherpa-onnx、TTS 走 Piper，见 `docs/hardware_readiness.md` §8.5/8.6。真机只需把 ASR 输出灌进 `/voice/command`，本节点一行不用改 |
 | 通过摄像头能看见动作 | ✅ 完成（仿真） | `lightdog_person_detector` + `lightdog_fall_detector`；后端可插拔（`color` / `yolo`） | 真机换 `backend: yolo`；相机高度 0.3745m 偏低，需抬高后重标定 |
 | 可以调节 led 亮度 | 🟡 ROS 侧完成 | `/led/brightness` + 自动调光 + 手动覆盖（`/light/mode`）+ 语音控制；按时间积分的渐变 | **LED 固件**（订阅 `/led/brightness` 转 PWM） |

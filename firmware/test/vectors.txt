@@ -1,0 +1,16 @@
+# LightDog 串口协议黄金向量 —— Python 与 C 两侧都读这一个文件
+# 格式：<说明> <TYPE两字节hex> <PAYLOAD hex 或 -> <完整帧 hex>
+# 生成方式：lightdog/lightdog_mcu_proto.py 编码；C 侧只校验、不生成。
+# 任何一行被改动而另一侧没跟着改，firmware/test/test_proto.c 与
+# lightdog/tests/test_mcu_proto.py 会同时失败。
+
+cmd_vel 0,0|01|0000000000000000|aa55080100000000000000005140
+cmd_vel 0.25,-0.7|01|0000803e333333bf|aa5508010000803e333333bf057a
+led 0.85|02|9a99593f|aa5504029a99593f3577
+heartbeat|03|-|aa5500036c2d
+estop on|04|01|aa550104014927
+battery 42%,24.6V,1.5A|81|3d0ad73ecdccc4410000c03f|aa550c813d0ad73ecdccc4410000c03f9f33
+odom 1.5,-0.25,3.14159,0.2,0.1|82|0000c03f000080bed00f4940cdcc4c3ecdcccc3d|aa5514820000c03f000080bed00f4940cdcc4c3ecdcccc3d5eeb
+estop_state on|83|01|aa5501830146a5
+fault link_lost+overcurrent|84|0300|aa550284030061db
+payload 内嵌 SYNC 0xAA55|7e|aa55aa55|aa55047eaa55aa559915
