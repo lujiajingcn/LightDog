@@ -28,8 +28,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness import (  # noqa: E402
-    Clock, Log, Msg, Pub, bind, extract_const, extract_funcs, extract_methods,
-    source_of,
+    Clock, Log, Msg, Pub, bind, extract_class, extract_const, extract_funcs,
+    extract_methods, source_of,
 )
 
 REC = source_of('lightdog_recorder.py')
@@ -795,6 +795,83 @@ class TestEstopPersistence(unittest.TestCase):
         self.assertFalse(t._load_estop())
         t._persist_estop(True)              # 不该抛异常
         self.assertEqual(t.logs, [], '空路径不该产生任何日志')
+
+
+# ---------------------------------------------------------- 验收脚本自检
+#
+# deploy/acceptance.py 是「上车那天照着跑」的东西，它的价值全在
+# 「没测到就不算通过」。而这个判据最容易被写成「统计里没有 FAIL 就是通过」
+# —— 第一版就是这么写的，跑出第一个 SKIP 项时报告照样打「全部通过，可以上车」。
+# 下面这组把它钉住。
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+ACC = os.path.join(REPO_ROOT, 'deploy', 'acceptance.py')
+
+# add() 里用到的模块级常量，exec 类体时必须一起给，否则运行到那一行就 NameError
+_ACC_NS = {n: extract_const(ACC, n) for n in
+           ('PASS', 'FAIL', 'SKIP', 'MANUAL', 'G', 'R', 'Y', 'D', 'B', 'E')}
+_ACC_NS.update({'sys': sys, 'time': time})
+
+
+class TestAcceptanceVerdict(unittest.TestCase):
+    """验收脚本的判定：跳过 ≠ 通过。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.Report = extract_class(ACC, 'Report', ns=_ACC_NS)
+        cls.ORDER = extract_const(ACC, 'ORDER')
+
+    def make(self, *statuses):
+        import contextlib
+        import io
+        r = self.Report(quick=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            for i, st in enumerate(statuses, start=1):
+                r.add(i, f't{i}', st, '')
+        return r
+
+    def test_skip_is_not_a_pass(self):
+        """纯 SKIP 必须判 2。曾经返回 0，报告写「全部通过，可以上车」。"""
+        r = self.make('SKIP')
+        self.assertEqual(r.verdict(set()), 2,
+                         'SKIP 被当成了通过 —— 这就是假绿报告')
+
+    def test_signed_skip_passes(self):
+        """用 --allow-skip 逐条签字后，才允许判 0。"""
+        r = self.make('SKIP')
+        self.assertEqual(r.verdict({1}), 0)
+
+    def test_all_pass_is_zero(self):
+        self.assertEqual(self.make('PASS', 'PASS').verdict(set()), 0)
+
+    def test_manual_blocks(self):
+        r = self.make('PASS', '待人工')
+        self.assertEqual(r.verdict(set()), 2, '待人工不能算通过')
+
+    def test_fail_beats_signed_skip(self):
+        """就算把跳过的项都签了，有 FAIL 也是 1。"""
+        r = self.make('FAIL', 'SKIP')
+        self.assertEqual(r.verdict({2}), 1)
+
+    def test_unacked_skip_listed(self):
+        r = self.make('PASS', 'SKIP', 'SKIP')
+        left = r.unacked_skips({2})
+        self.assertEqual([x['no'] for x in left], [3],
+                         '签过字的跳过项不该再出现在待办里')
+
+    def test_destructive_check_runs_last(self):
+        """第 1 条会 kill 掉 twist_mux，必须最后跑。
+
+        按 1→10 的顺序跑的话，它一执行完，后面每条都在「没有速度仲裁」的
+        残局里跑，全是假失败。
+        """
+        self.assertEqual(self.ORDER[-1], 1,
+                         'kill twist_mux 的那条必须排在最后')
+
+    def test_order_covers_every_check(self):
+        self.assertEqual(sorted(self.ORDER), list(range(1, 11)),
+                         'ORDER 必须是 1~10 的一个排列，不能漏也不能重')
 
 
 if __name__ == '__main__':

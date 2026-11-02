@@ -170,6 +170,18 @@ systemctl show -p NRestarts --value lightdog-mission
 细节见 `deploy/README.md`。**注意这套只给真机**：它检测 `/opt/ros` 和
 workspace 的 `install/`，仿真容器里没有 systemd，继续用 `sim/*.sh`。
 
+### 6) 上车验收清单（一条命令）
+
+`docs/firmware_protocol.md` §七 那张 10 条的表可以直接跑：
+
+```bash
+python3 deploy/acceptance.py            # 完整
+python3 deploy/acceptance.py --quick    # 自查（时长缩短，不能签字）
+```
+
+生成的 `deploy/acceptance-<时间>.md` 里，脚本测不到的项会明确标成「待人工」，
+不会因为它们没失败就算通过。退出码 2 表示「清单还没走完」。
+
 > 注意：`ros2 topic echo` 在本容器里不稳定（订阅不到，而直接写 rclpy 的探针能收到），
 > 验收时用探针而不是 CLI。
 >
