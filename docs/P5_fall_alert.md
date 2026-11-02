@@ -314,6 +314,47 @@ POST /alarms/bogus      400   (期望 400)
 `NORMAL` 也要落一行，是因为**人工 reset 是从 ALARM 直接跳 NORMAL 的**
 （不经过 RESOLVED）。不记的话，这条告警在历史里会永远停在"告警中"（踩过，见 §6.6）。
 
+### 5.7 端到端复验（2026-11-02，容器 sim）
+
+两个脚本，都在容器内跑：
+
+```
+# 主链路：站立 -> 躺倒 -> SUSPECTED -> CONFIRMING -> ALARM -> 起身 -> NORMAL
+docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash; \
+  source /home/ros/linorobot2_ws/install/setup.bash; \
+  python3 /home/ros/linorobot2_ws/src/lightdog/tests/verify_p5.py --ros-args -p use_sim_time:=true'
+
+# 补充：误报抑制 + 呼叫/ack
+python3 .../tests/verify_p5_extra.py --ros-args -p use_sim_time:=true
+```
+
+「躺倒」用 `gz service set_pose` 给 person 加 `roll=90°` 并把 z 抬到 0.17m
+（躯干半径，不抬会有一半埋进地面）。实测时间线：
+
+```
+fall=standing z_p95=1.14  alert=NORMAL
+    +0.6s sim   fall=lying    z_p95=0.33  alert=SUSPECTED
+    +5.5s sim   fall=lying    z_p95=0.33  alert=CONFIRMING   ← 一级确认 4.9s
+   +20.4s sim   fall=lying    z_p95=0.33  alert=ALARM        ← 二级确认 14.9s
+```
+
+- 姿态判据：站 1.14m / 躺 0.33m，阈值 0.50 与 0.68 两侧余量都很大。
+- 告警事件：`pre=25 / post=10 / duration=35.0`，**935 帧**，78KB。
+  抽首帧 = 人站着，尾帧 = 人躺在地上 —— 这正是 `event_pre: 25` 想买的东西。
+- 手机端：`/status.alert` 直接给出 `ALARM + alarm_id + contact_count=2 +
+  call_attempts[{张阿姨, dialed:false}]`；`/alarms` 历史同步。
+- 起身后 3.6s sim 进 RESOLVED、8.6s sim 回 NORMAL（`resolved_hold`）。
+
+补充脚本验的两条：
+
+| 场景 | 结果 |
+|---|---|
+| 躺 3s 就起身（弯腰/蹲下）| 只到 `SUSPECTED`，起身后回 `NORMAL`，**没进 CONFIRMING/ALARM** |
+| 真实跌倒 -> 拨打 -> ack | 第 1 次呼叫写入 `call_attempts`；ack 后 70s（>1 个 `call_interval`）不再新增 |
+
+注意所有时间都是**仿真秒**：本机 RTF≈0.42，`confirm_window: 15` 在墙钟上是 35 秒左右，
+用秒表对比会以为状态机慢了 2.4 倍。
+
 ---
 
 ## 六、踩的坑

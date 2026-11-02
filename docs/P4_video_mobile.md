@@ -228,6 +228,41 @@ data/events/evt_20261101_142306_fall/{meta.json,thumb.jpg,video.mp4}
 顺带验证了**索引恢复**：重启后 recorder 打出
 `已恢复 12 个历史分段，下一个 seq=12`，接着从 12 往下写，不会覆盖旧文件。
 
+### 5.6 端到端复验（2026-11-02，容器 sim）
+
+一条命令跑完（脚本在包内，直接在容器里执行）：
+
+```
+docker exec sim bash -lc 'source /opt/ros/jazzy/setup.bash; \
+  source /home/ros/linorobot2_ws/install/setup.bash; \
+  python3 /home/ros/linorobot2_ws/src/lightdog/tests/verify_p4.py'
+```
+
+结果 27 项全通过。要点：
+
+| 项 | 实测 |
+|---|---|
+| 静态页 `/` | 200，4904B |
+| `snapshot.jpg` | 200，16KB，`640×480` 解码，mean=158 |
+| 分段回放 | `seg_000107.mp4` 254 帧 / 10.03s，索引帧数与实测**完全一致** |
+| MJPEG | `multipart/x-mixed-replace`，6s 内 3 帧 |
+| 事件切片 | `pre=8/post=8` -> 412 帧 / 16.0s，视频 39KB 全可解码，缩略图 640×480 |
+| 联系人 | PUT 两个 -> `/data/contacts.json` 210B，读回一致 |
+| Range（`p4.sh probe`） | 事件视频与分段均 **206**，`bytes 0-1023/N` |
+
+本轮修的两个问题：
+
+1. **`/api/v1/clips` 只有文件名和大小**，手机端没法显示「这段多长、几点录的」。
+   recorder 早就把 `t0/t1/frames/fps` 写进 `clips.jsonl`，后端却没读。
+   现在按 `(mtime,size)` 缓存合并进返回值（缺索引时自动退化成旧行为）。
+2. **事件窗口字段被静默忽略**：HTTP 层原本把请求 JSON 原样转发，而 recorder
+   只认 `pre`/`post`，客户端照 meta 里的 `pre_sec`/`post_sec` 写就会按默认
+   10/10 切 —— `202` 受理成功、窗口却是错的。现在两个名字都收，并夹到 0~300s。
+
+另外 `max_event_frames` 从 900 提到 1200：合成是从窗口**头部**往后写的，
+撞上限丢的是尾巴（对 P5 就是「倒下之后」那段）。实测 25.9fps × 35s = 910 帧，
+旧值已经丢掉 0.3s；真机 30Hz 会丢 5s。40s 窗口复验得 1063 帧 / 40.0s，确认不再截断。
+
 ---
 
 ## 六、踩的坑
