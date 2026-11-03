@@ -2,11 +2,24 @@
 """
 LightDog 人体检测器（P2 / 场景 1）
 
-## 这一版为什么不是 YOLO
+## 三个后端（`backend` 参数）
+
+    color  仿真占位实现：认高饱和橙色上衣，只用 numpy。零依赖、结果确定，
+           用来验证「检测 -> 跟随 -> 光照」这条控制闭环。
+    yolo   ultralytics，调试方便（自动做预处理）。但 Pi 5 无 CUDA，PyTorch
+           CPU 只有 1~2 FPS，撑不住 frame_timeout 要求的 ≥3 FPS。
+    onnx   onnxruntime + 320 输入，真机用这个（Pi 5 上 6~10 FPS）。
+           预处理/后处理在本文件里用纯 numpy 实现，见 letterbox / decode_yolo_onnx。
+
+三者共用同一套「框 -> base_link 3D 点」的几何换算，所以换后端不会改动
+`/person/position` 的语义（frame_id=base_link），下游节点一行都不用动。
+缺依赖时**一律回退到 color 并打 error**，不会「启动成功但永远检测不到人」。
+
+## 这一版为什么最早不是 YOLO
 
 产品的最终形态需要姿态识别（P5 跌倒检测），那时必须上真实模型。但 P2 要解决的
 是「检测 -> 跟随 -> 光照」这条**控制闭环**能不能跑通，而且仿真里的「人」是我们
-自己造的几何体，颜色可控。所以这一版用**颜色 + 深度**做检测，好处是：
+自己造的几何体，颜色可控。所以第一版用**颜色 + 深度**做检测，好处是：
 
 - 零额外依赖：只用 numpy，不装 torch / ultralytics / opencv（镜像里都没有，
   当前网络下装 torch 要拉 ~2GB）
@@ -119,6 +132,204 @@ def rgb_to_hsv(rgb: np.ndarray):
     return h, s, mx
 
 
+# ---------------------------------------------------------------- onnx 后端
+#
+# 为什么单独写一套预处理/后处理，而不是继续用 ultralytics：
+#   Pi 5 没有 CUDA，ultralytics 走 PyTorch CPU 实测 1~2 FPS（docs/hardware_readiness.md
+#   §8.5），撑不住 frame_timeout 要求的 ≥3 FPS。onnxruntime + 320 输入能到 6~10 FPS。
+#   代价是模型的输入输出要自己接 —— letterbox、解码、NMS 全在这里。
+#
+# 这一段的函数都是**纯 numpy**、不碰 onnxruntime、不碰 ROS，所以可以在宿主机上
+# 直接跑回归（lightdog/tests/test_onnx_detector.py）。这类几何换算最容易出的错是
+# 「padding 补偿漏一项」，表现是坐标整体偏几十像素而**不报任何错** —— 只能靠
+# 对着已知输入断言来挡。
+
+ONNX_PAD = 114      # letterbox 填充灰度，与 ultralytics 默认值一致
+
+
+def _resize_bilinear(img, out_w, out_h):
+    """(H, W, C) uint8 双线性缩放到 out_w × out_h，返回 float32。
+
+    不用 cv2.resize 是为了让这几段能在没有 cv2 的宿主机上测；
+    也不用整数最近邻 —— 320 输入下最近邻丢掉的细节恰好是远距离行人的轮廓。
+    """
+    h, w = img.shape[:2]
+    if out_w == w and out_h == h:
+        return img.astype(np.float32)
+
+    # 像素中心对齐（对齐 OpenCV 的 INTER_LINEAR 约定）：不这么做时，
+    # 缩放 2 倍的图会整体偏半个像素，两三个 stage 累积下来就是可见的偏移。
+    ys = (np.arange(out_h, dtype=np.float32) + 0.5) * (h / out_h) - 0.5
+    xs = (np.arange(out_w, dtype=np.float32) + 0.5) * (w / out_w) - 0.5
+
+    y0 = np.floor(ys).astype(np.int32)
+    x0 = np.floor(xs).astype(np.int32)
+    wy = (ys - y0).clip(0.0, 1.0)[:, None, None]
+    wx = (xs - x0).clip(0.0, 1.0)[None, :, None]
+    # 越界的邻居夹到边缘，同时把权重归零，避免把边上的像素重复加权
+    y0c = y0.clip(0, h - 1)
+    y1c = (y0 + 1).clip(0, h - 1)
+    x0c = x0.clip(0, w - 1)
+    x1c = (x0 + 1).clip(0, w - 1)
+
+    src = img.astype(np.float32)
+    top = src[y0c][:, x0c] * (1.0 - wx) + src[y0c][:, x1c] * wx
+    bot = src[y1c][:, x0c] * (1.0 - wx) + src[y1c][:, x1c] * wx
+    return top * (1.0 - wy) + bot * wy
+
+
+def letterbox(rgb, size=320, pad=ONNX_PAD):
+    """等比缩放 + 居中填充到 size×size。
+
+    返回 (canvas, scale, dx, dy)：
+      canvas —— (size, size, 3) uint8
+      scale  —— 缩放比（原图 -> canvas）
+      dx, dy —— 左上角填充量，**还原坐标时必须减掉**
+
+    只做等比、不做拉伸：拉伸会把人的宽高比改掉，而下游 `_bbox_to_point`
+    用框的像素高度反推躯干高度，宽高比错了距离就跟着错。
+    """
+    h, w = rgb.shape[:2]
+    if h <= 0 or w <= 0:
+        raise ValueError('letterbox 收到空图：%dx%d' % (w, h))
+    scale = min(float(size) / float(w), float(size) / float(h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    canvas = np.full((size, size, 3), pad, dtype=np.uint8)
+    dx = (size - new_w) // 2
+    dy = (size - new_h) // 2
+    canvas[dy:dy + new_h, dx:dx + new_w] = _resize_bilinear(
+        rgb, new_w, new_h).clip(0, 255).astype(np.uint8)
+    return canvas, scale, dx, dy
+
+
+def nms(boxes, scores, iou_thr=0.45):
+    """单类别 NMS。boxes=(N,4) xyxy，scores=(N,)。返回保留的下标列表。
+
+    朴素实现（不依赖 torchvision / cv2.dnn）：一个人的场景里候选框通常
+    只有个位数，O(N²) 的代价可以忽略，换来的是这段逻辑在宿主机上可以断言。
+    """
+    boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    if boxes.shape[0] == 0:
+        return []
+
+    order = np.argsort(scores)[::-1]
+    keep = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        area_i = max(0.0, boxes[i, 2] - boxes[i, 0]) * max(0.0, boxes[i, 3] - boxes[i, 1])
+        area_r = (np.maximum(0.0, boxes[rest, 2] - boxes[rest, 0]) *
+                  np.maximum(0.0, boxes[rest, 3] - boxes[rest, 1]))
+        union = area_i + area_r - inter
+        iou = np.where(union > 1e-9, inter / np.maximum(union, 1e-9), 0.0)
+        order = rest[iou <= iou_thr]
+    return keep
+
+
+def decode_yolo_onnx(out, scale, dx, dy, img_w, img_h,
+                     conf_thr=0.35, iou_thr=0.45, person_class=0):
+    """YOLOv8 的 onnx 输出 -> 原图坐标的框，按分数降序。
+
+    out 接受两种布局：
+      (1, 4+nc, N)  —— ultralytics 导出的默认布局（320 输入时 N=2100）
+      (1, N, 4+nc)  —— 某些导出器会转置
+    靠「哪个维度更小就当成 4+nc」判断：4+nc 至少是 5（单类别自训练模型），
+    而 N 是 2100/8400 这种量级，不会混淆。
+
+    还原公式：x_orig = (x_in_canvas - dx) / scale
+    —— 漏掉 dx/dy 或除以 scale 的写法都能"跑起来"，只是框整体偏，
+    偏多少取决于 padding 多大，是最难归因的一类错。
+    """
+    a = np.asarray(out, dtype=np.float32)
+    if a.ndim == 3:
+        a = a[0]
+    elif a.ndim == 1:
+        a = a.reshape(-1, 1)
+    if a.ndim != 2:
+        raise ValueError('decode_yolo_onnx 看不懂的输出形状：%s' % (np.shape(out),))
+
+    rows, cols = a.shape
+    # rows 小、cols 大 -> 已经是 (4+nc, N)
+    if rows > cols:
+        a = a.T
+        rows, cols = cols, rows
+
+    if rows < 5:
+        raise ValueError('输出只有 %d 行，不可能是 4+nc（nc≥1）' % rows)
+    num_cls = rows - 4
+    if person_class >= 0 and person_class >= num_cls:
+        raise ValueError(
+            'onnx_person_class=%d 超出模型类别数 %d（模型不是 COCO 的 80 类？）'
+            % (person_class, num_cls))
+
+    cx, cy, bw, bh = a[0], a[1], a[2], a[3]
+    if person_class >= 0:
+        score = a[4 + person_class]
+    else:
+        score = a[4:].max(axis=0)
+
+    m = score >= float(conf_thr)
+    if not m.any():
+        return []
+    cx, cy, bw, bh, score = cx[m], cy[m], bw[m], bh[m], score[m]
+
+    x1 = (cx - bw * 0.5 - float(dx)) / float(scale)
+    y1 = (cy - bh * 0.5 - float(dy)) / float(scale)
+    x2 = (cx + bw * 0.5 - float(dx)) / float(scale)
+    y2 = (cy + bh * 0.5 - float(dy)) / float(scale)
+
+    # 裁到原图内：padding 区域解出来的负坐标如果直接留着，
+    # 下游取深度会索引越界（numpy 负索引是静默绕回，比报错更难查）。
+    x1 = np.clip(x1, 0.0, img_w - 1.0)
+    y1 = np.clip(y1, 0.0, img_h - 1.0)
+    x2 = np.clip(x2, 0.0, img_w - 1.0)
+    y2 = np.clip(y2, 0.0, img_h - 1.0)
+
+    boxes = np.stack([x1, y1, x2, y2], axis=1)
+    keep = nms(boxes, score, iou_thr)
+    out_list = [(float(boxes[i, 0]), float(boxes[i, 1]),
+                 float(boxes[i, 2]), float(boxes[i, 3]), float(score[i]))
+                for i in keep]
+    out_list.sort(key=lambda t: t[4], reverse=True)
+    return out_list
+
+
+def check_onnx_input(shape, want_size):
+    """校验 onnx 的输入形状，返回错误说明；没问题返回 None。
+
+    单独抽出来是为了能测：真模型不在仓库里，而这条校验恰恰是
+    「坐标整体偏且不报错」的唯一防线，不能只靠肉眼看日志确认。
+
+    shape 里可能是 int，也可能是字符串（动态维度，如 'batch' / 'height'）。
+    动态维度按参数 want_size 走，静态维度必须严格等于它。
+    """
+    shape = list(shape)
+    if len(shape) != 4:
+        return f'onnx 输入维度是 {shape}，期望 4 维 (N,C,H,W)'
+    c = shape[1]
+    if isinstance(c, int) and c != 3:
+        return f'onnx 输入通道是 {c}，期望 3（RGB/BGR）'
+    for axis, label in ((2, '高'), (3, '宽')):
+        v = shape[axis]
+        if isinstance(v, int) and v != int(want_size):
+            return (f'onnx 模型输入{label}度是 {v}，但 onnx_size={want_size}。'
+                    f'两者不一致会让所有坐标整体偏，拒绝使用 —— '
+                    f'要么把 onnx_size 改成 {v}，要么重新导出 '
+                    f'imgsz={want_size} 的模型')
+    return None
+
+
 class PersonDetector(Node):
 
     def __init__(self):
@@ -133,7 +344,8 @@ class PersonDetector(Node):
         self.declare_parameter('camera_offset', [-0.065, 0.0, 0.255])
 
         # ---- 检测后端 ----
-        # color = 仿真占位实现（认橙色上衣）；yolo = 真机用的人体检测。
+        # color = 仿真占位实现（认橙色上衣）；yolo = ultralytics（调试方便，
+        # 但 Pi 5 上 1~2 FPS，撑不住）；onnx = onnxruntime + 320 输入（真机用这个）。
         # 换后端**不改**输出契约：仍然是 /person/present + /person/position
         # （frame=base_link）。几何换算两边共用，见 _bbox_to_point。
         self.declare_parameter('backend', 'color')
@@ -141,6 +353,20 @@ class PersonDetector(Node):
         self.declare_parameter('yolo_conf', 0.35)
         # COCO 里 person = 0。设 -1 表示不限类别（换自训练模型时用）。
         self.declare_parameter('yolo_person_class', 0)
+
+        # -- onnx 后端 --
+        # 这些参数与 yolo_* 是两套：换后端时不用改另一套，也就不会出现
+        # 「改了 yolo_conf 却没生效」这种看代码才发现的误会。
+        self.declare_parameter('onnx_model', 'yolov8n_320.onnx')
+        # 320 是 Pi 5 实测 6~10 FPS 的输入尺寸（hardware_readiness.md §8.5）。
+        # 必须和模型的实际输入尺寸一致 —— 加载时会校验，不一致直接回退。
+        self.declare_parameter('onnx_size', 320)
+        self.declare_parameter('onnx_conf', 0.35)
+        self.declare_parameter('onnx_iou', 0.45)
+        self.declare_parameter('onnx_person_class', 0)
+        # Pi 5 只有 4 核，而 10Hz 的 twist_mux 也在同一颗 CPU 上抢。
+        # 留 2 核给控制环，比把推理跑满更划算（推理慢 30%，控制抖 0）。
+        self.declare_parameter('onnx_threads', 2)
 
         # ---- 颜色判据（HSV 归一化 0~1；橙色上衣实测 H≈0.052）----
         self.declare_parameter('h_min', 0.012)
@@ -181,15 +407,34 @@ class PersonDetector(Node):
         self.yolo_person_class = int(p('yolo_person_class').value)
         self._yolo_model = None
         self._warned_yolo = False
+
+        self.onnx_conf = float(p('onnx_conf').value)
+        self.onnx_iou = float(p('onnx_iou').value)
+        self.onnx_person_class = int(p('onnx_person_class').value)
+        self.onnx_size = int(p('onnx_size').value)
+        self._onnx = None
+        self._onnx_input = None
+        self._warned_onnx = False
+        self._onnx_ms = []            # 最近的推理耗时（毫秒），用于报平均帧率
+        self._onnx_slow_warned = False
+
         if self.backend == 'yolo':
             self._yolo_model = self._load_yolo(str(p('yolo_model').value))
             if self._yolo_model is None:
                 # 回退而不是崩：仿真环境里没有 torch，假装成 yolo 只会让
                 # 整个 P2 链路「启动成功但永远无人」。
                 self.backend = 'color'
+        elif self.backend == 'onnx':
+            self._onnx, self._onnx_input = self._load_onnx(
+                str(p('onnx_model').value), int(p('onnx_threads').value))
+            if self._onnx is None:
+                # 和 yolo 分支同一个理由：宁可退回「只认橙色」的显式降级，
+                # 也不要「启动成功、日志正常、永远检测不到人」。
+                self.backend = 'color'
         elif self.backend != 'color':
             self.get_logger().error(
-                f'未知 backend={self.backend!r}（只认 color / yolo），按 color 运行')
+                f'未知 backend={self.backend!r}（只认 color / yolo / onnx），'
+                '按 color 运行')
             self.backend = 'color'
         self.h_min, self.h_max = p('h_min').value, p('h_max').value
         self.s_min = float(p('s_min').value)
@@ -276,6 +521,76 @@ class PersonDetector(Node):
             f'检测后端 = YOLO({path}) conf={self.yolo_conf} '
             f'class={self.yolo_person_class}')
         return model
+
+    def _load_onnx(self, path, threads):
+        """加载 onnx 模型并**校验输入尺寸**；返回 (session, input_name) 或 (None, None)。
+
+        为什么一定要校验尺寸：letterbox 是按 onnx_size 做的，模型若是 640 而参数
+        写 320，推理不报错、框也能解出来，只是所有坐标都差一个缩放比 ——
+        表现是「检测得到人，但距离永远不对」，查起来要绕很久。
+        宁可启动时就报 error 并回退到颜色（颜色也不对，但那是显式降级）。
+        """
+        try:
+            import onnxruntime as ort
+        except ImportError as e:
+            self.get_logger().error(
+                f'backend=onnx 但无法 import onnxruntime（{e}）。'
+                '已回退到 color —— 在 Pi 5 上装 onnxruntime：'
+                'pip install onnxruntime（ARM64 有官方 wheel）')
+            return None, None
+
+        try:
+            opts = ort.SessionOptions()
+            # 推理线程数要留余量：10Hz 的 twist_mux 和本节点抢同一颗 CPU，
+            # 把 4 核全给推理会让控制环抖动（见 hardware_readiness.md §8.7）。
+            opts.intra_op_num_threads = max(1, int(threads))
+            opts.inter_op_num_threads = 1
+            # 图优化开满：320 输入下能白拿一截，不需要改模型
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess = ort.InferenceSession(
+                path, sess_options=opts, providers=['CPUExecutionProvider'])
+        except Exception as e:
+            self.get_logger().error(
+                f'加载 onnx 模型 {path!r} 失败（{e}），已回退到 color')
+            return None, None
+
+        try:
+            inp = sess.get_inputs()[0]
+            shape = list(inp.shape)
+        except Exception as e:
+            self.get_logger().error(f'读 onnx 输入定义失败（{e}），已回退到 color')
+            return None, None
+
+        # 维度/通道/尺寸一起校验：静态尺寸必须与 onnx_size 一致，
+        # 动态尺寸（字符串）按参数走。不一致就拒绝使用并回退。
+        err = check_onnx_input(shape, self.onnx_size)
+        if err is not None:
+            self.get_logger().error(f'{err}，已回退到 color')
+            return None, None
+
+        # 预热：onnxruntime 首次 run 要做一次性准备（内存池、算子绑定），
+        # Pi 5 上是几百毫秒。不预热的话这段开销落在 10Hz 定时器的**第一帧**，
+        # 表现为「刚启动时跟随反应特别慢」，而且只在真机上出现、仿真里复现不了。
+        # 顺便用一次全零输入把输出形状和类别数验掉 —— 比等到真有人站在
+        # 镜头前才发现 onnx_person_class 越界要好。
+        try:
+            dummy = np.zeros(
+                (1, 3, self.onnx_size, self.onnx_size), dtype=np.float32)
+            raw = sess.run(None, {inp.name: dummy})[0]
+            decode_yolo_onnx(raw, 1.0, 0, 0, self.onnx_size, self.onnx_size,
+                             conf_thr=2.0, iou_thr=self.onnx_iou,
+                             person_class=self.onnx_person_class)
+        except Exception as e:
+            self.get_logger().error(
+                f'onnx 预热推理失败（{e}），模型不兼容，已回退到 color')
+            return None, None
+
+        self.get_logger().info(
+            f'检测后端 = ONNX({path}) 输入={shape} size={self.onnx_size} '
+            f'conf={self.onnx_conf} iou={self.onnx_iou} '
+            f'class={self.onnx_person_class} threads={threads} '
+            f'输出={np.shape(raw)}')
+        return sess, inp.name
 
     # ---------- 回调 ----------
 
@@ -382,6 +697,8 @@ class PersonDetector(Node):
             return None
         if self.backend == 'yolo':
             bbox, mask = self._bbox_yolo(rgb), None
+        elif self.backend == 'onnx':
+            bbox, mask = self._bbox_onnx(rgb), None
         else:
             bbox, mask = self._bbox_color(rgb)
         if bbox is None:
@@ -496,6 +813,77 @@ class PersonDetector(Node):
         if (u1 - u0 + 1) < 2 or (v1 - v0 + 1) < self.min_h:
             return None
         return best
+
+    def _bbox_onnx(self, rgb):
+        """onnxruntime 后端：返回人的外接框或 None。
+
+        与 yolo 后端的分工差别：ultralytics 把预处理（letterbox、BGR、归一化）
+        全包了，这里得自己做 —— 所以预处理和还原被抽成了模块级纯函数，
+        单独有回归（test_onnx_detector.py）兜着漏乘 scale / 漏减 padding 这类错。
+        """
+        if self._onnx is None:
+            return None
+        h, w = rgb.shape[:2]
+        t0 = time.monotonic()
+        try:
+            canvas, scale, dx, dy = letterbox(rgb, self.onnx_size)
+            # ultralytics 训练时是 BGR，导出的 onnx 继承了这个约定。
+            # 传 RGB 也能跑出框，但分数会低一截 —— 这是「能用但莫名其妙漏检」
+            # 的典型来源，所以这里显式反转通道。
+            blob = canvas[:, :, ::-1].astype(np.float32) / 255.0
+            blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
+            raw = self._onnx.run(None, {self._onnx_input: blob})[0]
+            dets = decode_yolo_onnx(
+                raw, scale, dx, dy, w, h,
+                conf_thr=self.onnx_conf, iou_thr=self.onnx_iou,
+                person_class=self.onnx_person_class)
+        except Exception as e:                       # 推理库内部异常不该打挂节点
+            if not self._warned_onnx:
+                self._warned_onnx = True
+                self.get_logger().error(f'onnx 推理失败（{e}），本帧按无人处理')
+            return None
+        self._note_onnx_latency((time.monotonic() - t0) * 1000.0)
+
+        if not dets:
+            return None
+        # 多个框时取面积最大的，与另外两个后端的行为保持一致
+        x1, y1, x2, y2, _ = max(
+            dets, key=lambda t: max(0.0, t[2] - t[0]) * max(0.0, t[3] - t[1]))
+        u0 = int(max(0, min(w - 1, round(x1))))
+        v0 = int(max(0, min(h - 1, round(y1))))
+        u1 = int(max(0, min(w - 1, round(x2))))
+        v1 = int(max(0, min(h - 1, round(y2))))
+
+        # 尺寸下限与另两个后端共用：贴脸（只剩一条横带）时别把「一截腿」
+        # 当成完整的人。min_h 的来历见 __init__ 里的注释。
+        if (u1 - u0 + 1) < 2 or (v1 - v0 + 1) < self.min_h:
+            return None
+        return (u0, v0, u1, v1)
+
+    def _note_onnx_latency(self, ms):
+        """记录单帧推理耗时，让「够不够快」变成一个能看见的数。
+
+        判据来自 frame_timeout=1.5s：它要求至少 3 FPS（1.5s 内得有新帧，
+        且留出余量），所以单帧预算 333ms；希望到 8 FPS 则是 125ms。
+        不量这个的话，真机上「有点卡」只能靠感觉，而感觉会怪到相机头上。
+
+        每 200 帧报一次平均（6 FPS 下约 33 秒一条），不刷屏；超过预算时
+        立刻 warn 一次，因为那意味着跟随会开始一顿一顿。
+        """
+        self._onnx_ms.append(ms)
+        if not self._onnx_slow_warned and ms > 333.0:
+            self._onnx_slow_warned = True
+            self.get_logger().warn(
+                f'onnx 单帧推理 {ms:.0f}ms，超过 333ms 的预算'
+                '（frame_timeout=1.5s 要求 ≥3FPS）。先看是不是 '
+                'onnx_threads 被其他节点抢了 CPU，再考虑换 Hailo-8L')
+        if len(self._onnx_ms) < 200:
+            return
+        avg = sum(self._onnx_ms) / float(len(self._onnx_ms))
+        self._onnx_ms = []
+        fps = 1000.0 / avg if avg > 1e-6 else 0.0
+        self.get_logger().info(
+            f'onnx 平均推理 {avg:.0f}ms（约 {fps:.1f} FPS）')
 
     def _bbox_to_point(self, rgb, bbox, mask):
         """外接框 + 深度 -> base_link 下的 3D 点。两个后端共用这一段。"""

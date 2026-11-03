@@ -13,14 +13,30 @@
     depth_topic: /camera/depth/image_rect_raw
     info_topic: /camera/color/camera_info
 
-    # 检测后端：color（仿真占位，认橙色上衣）/ yolo（真机）。
+    # 检测后端：color（仿真占位，认橙色上衣）/ yolo（ultralytics，调试用）/
+    # onnx（onnxruntime + 320 输入，**真机用这个**）。
     # 换后端不改输出契约（/person/present + /person/position，frame=base_link）。
-    # 真机用法：pip install ultralytics，放好模型，改 backend: yolo。
     # 缺依赖时节点会报一条 error 并**自动回退到 color**，不会起不来。
+    #
+    # 为什么真机不用 yolo：Pi 5 没有 CUDA，PyTorch CPU 实测 1~2 FPS，而
+    # frame_timeout=1.5 要求 ≥3 FPS（docs/hardware_readiness.md §8.5）。
+    # onnx + 320 输入可到 6~10 FPS。导出命令：
+    #   yolo export model=yolov8n.pt format=onnx imgsz=320 opset=12
     backend: color
     yolo_model: yolov8n.pt
     yolo_conf: 0.35
     yolo_person_class: 0     # COCO person=0；自训练模型给 -1 表示不限类别
+
+    onnx_model: yolov8n_320.onnx
+    # 必须与模型的**实际**输入尺寸一致。不一致时节点拒绝使用并回退到 color ——
+    # 因为那时框能解出来、坐标却整体偏，且不报任何错。
+    onnx_size: 320
+    onnx_conf: 0.35
+    onnx_iou: 0.45
+    onnx_person_class: 0     # COCO person=0；-1 表示不限类别
+    # Pi 5 只有 4 核，10Hz 的 twist_mux 也在同一颗 CPU 上。留 2 核给控制环，
+    # 推理慢 30% 换控制环不抖，比跑满更划算（hardware_readiness.md §8.7）。
+    onnx_threads: 2
 
     # 4wd 车型 depth_sensor_pose = xyz "-0.065 0 0.255" rpy "0 0 0"
     # 见 linorobot2_description/urdf/4wd_properties.urdf.xacro

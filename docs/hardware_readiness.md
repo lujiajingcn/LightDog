@@ -40,7 +40,7 @@
 | `p4_params.yaml` | `event_retain_days` / `max_event_mb` | `30` / `512` | 按存储卡容量 | 不设保留策略时 `events/` 会一直涨到写满分区，而告警录像恰恰在半夜写 |
 | `p5_params.yaml` | `sip_ami_secret` | `''` | **与 `manager.conf` 一致的随机串** | 空 = 不外呼（`call_mode=auto` 退化成仅记录）。告警照常弹窗、事件视频照常切，只是**一个电话都不会打**，日志里只有一行「仅记录」 |
 | `p5_params.yaml` | `sip_channel_template` | `PJSIP/{number}` | 按中继/分机改 | 填错的表现是 `channel not found`：AMI 通了、电话没打出去 |
-| `p2_params.yaml` | `backend` | `color` | **`yolo`**（装好依赖后） | `color` 只认「高饱和橙色上衣」，真人穿什么都有，见 §四.1 |
+| `p2_params.yaml` | `backend` | `color` | **`onnx`**（装好 onnxruntime 后） | `color` 只认「高饱和橙色上衣」，真人穿什么都有，见 §四.1。**别用 `yolo`**：Pi 5 无 CUDA，PyTorch CPU 只有 1~2 FPS，见 §8.5 |
 | `p4_params.yaml` | `ssl_certfile` / `ssl_keyfile` | `''` | 自签或真证书路径 | 留空 = 全明文。局域网可用，但只要经过公共 WiFi 就必须开。**证书读失败时服务会拒绝启动而不是退回明文**（这是刻意的） |
 | `p4_params.yaml` | `faststart` | `false` | `true`（需 ffmpeg） | 视频的 `moov` 在文件尾，手机端边下边播要等整段下完。真机上 ffmpeg 一般都有，开了只是多一次 `-c copy` 重封装 |
 | `system_params.yaml` | `dock_pose_x/y/yaw` | `-0.50/0.00/0.00` | **按现场测** | 低电回充的导航目标是「桩前 1m」，桩位填错会导航到墙上。填错不会崩，只会永远差那么一点 |
@@ -274,9 +274,10 @@ sudo iw dev wlan0 set power_save off
 大约 **1~2 FPS**（640×640），撑不住 `frame_timeout: 1.5s` 要求的节奏（它需要
 ≥3 FPS 才算「帧是新的」，实际希望 ≥8）。三条可行路线：
 
-| 路线 | 预期 | 代价 |
+| 路线 | 预期 | 代价 / 现状 |
 |---|---|---|
-| onnxruntime / NCNN + `yolov8n` 输入 320 | 6~10 FPS | 需要导出 onnx 并改检测器里的预处理（letterbox + 320 缩放） |
+| onnxruntime + `yolov8n` 输入 320 | 6~10 FPS | **已实现**：`backend: onnx`，预处理与后处理在 `lightdog_person_detector.py`（`letterbox` / `decode_yolo_onnx` / `check_onnx_input`），有 37 项回归。导出：`yolo export model=yolov8n.pt format=onnx imgsz=320 opset=12`。**帧率是 Pi 上的预期值，尚未实测** |
+| NCNN（若 onnxruntime 仍不够快） | 与上接近 | 需要额外适配，当前实现里没有。先用 onnx 路线测一轮再决定 |
 | Hailo-8L（M.2 HAT，26 TOPS） | 30+ FPS | 要 `.hef` 模型和 HailoRT，驱动与内核版本绑定 |
 | 保持 `color` 后端 | 与仿真一致 | 只认「高饱和橙色上衣」，见 §四.1 |
 

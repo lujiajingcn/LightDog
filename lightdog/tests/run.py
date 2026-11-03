@@ -33,6 +33,7 @@ GROUPS = [
     ('test_soak', '浸泡采样：泄漏判定 / 重启检测 / 退出码语义'),
     ('test_soak_load', '浸泡载荷：流式字节判据 / 汇总退出码'),
     ('test_acceptance', '真机验收判据：零速前置必须来自真实观测'),
+    ('test_onnx_detector', 'onnx 检测后端：letterbox / 解码 / NMS / 回退'),
     ('test_consistency', '参数与版本一致性'),
 ]
 
