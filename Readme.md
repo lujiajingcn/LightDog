@@ -28,7 +28,7 @@
 
 | 需求 | 状态 | 落在哪 | 还差什么（硬件相关） |
 |---|---|---|---|
-| 可以灵活移动 | ✅ 完成（仿真）/ 🟡 待固件 | `lightdog_twist_mux` 仲裁 + `/cmd_vel_muxed`；`lightdog_mcu_bridge` 串口桥接；协议定稿 + 两侧实现 | 底盘、编码器、电机驱动；固件照 `firmware/` 的参考实现接（`make -C firmware test` 可先验 94 项） |
+| 可以灵活移动 | ✅ 完成（仿真）/ 🟡 待固件 | `lightdog_twist_mux` 仲裁 + `/cmd_vel_muxed`；`lightdog_mcu_bridge` 串口桥接；协议定稿 + 两侧实现；**固件应用层已就绪**（`firmware/app/`，PC 侧自检覆盖失联/急停/按钮/里程计） | 底盘、编码器、电机驱动；按 `firmware/port/stm32f4/` 接线并把引脚/减速比填进去（`make -C firmware test` 可先验，判据是 0 失败） |
 | 通过麦克风能听到指令 | 🟡 链路完成 | `lightdog_voice`：`/voice/command` 文本进 → 语义解析 → 调度层动作。13 类意图，含「别跟着我」「解除急停」这类高风险歧义 | 平台已定：**树莓派 5**（无 CUDA）→ ASR 走 whisper.cpp/sherpa-onnx、TTS 走 Piper，见 `docs/hardware_readiness.md` §8.5/8.6。真机只需把 ASR 输出灌进 `/voice/command`，本节点一行不用改 |
 | 通过摄像头能看见动作 | ✅ 完成（仿真） | `lightdog_person_detector` + `lightdog_fall_detector`；后端可插拔（`color` / `yolo`） | 真机换 `backend: yolo`；相机高度 0.3745m 偏低，需抬高后重标定 |
 | 可以调节 led 亮度 | 🟡 ROS 侧完成 | `/led/brightness` + 自动调光 + 手动覆盖（`/light/mode`）+ 语音控制；按时间积分的渐变 | **LED 固件**（订阅 `/led/brightness` 转 PWM） |
@@ -41,9 +41,13 @@
 图例：✅ 逻辑闭环且仿真验收 · 🟡 软件侧完成、等硬件或外部服务 · ❌ 未开工
 
 **一句话结论**：软件侧已经没有「必须等硬件才能动笔」的空白了。剩下的工作集中在
-三处 —— 算力平台选型（决定 ROS 版本和 ASR/TTS 引擎）、MCU 固件（决定安全底线）、
-以及传感器/机构的机械标定。前两项的接口契约已经写在代码和
-`docs/firmware_protocol.md` 里，硬件到位后是「接线 + 填参数」，不是「重新设计」。
+三处 —— 算力平台（已定 Pi 5，见 `docs/hardware_readiness.md` §〇）、MCU 固件、
+以及传感器/机构的机械标定。MCU 侧的**应用逻辑已经写完并有 PC 自检兜着**
+（`firmware/app/`：帧分发 / 输出决策 / 里程计 / 上报，覆盖失联、急停、物理按钮、
+恢复后第一拍零速），剩下的是按原理图填引脚与减速比 —— 那是 `port/stm32f4/`
+里的一张接线表，不是重新设计。
+
+硬件到位后是「接线 + 填参数 + 标定」，不是「从零开始写」。
 
 ## 怎么跑起来
 

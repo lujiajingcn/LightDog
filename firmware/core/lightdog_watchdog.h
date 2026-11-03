@@ -47,6 +47,25 @@ void ld_wd_tick(ld_wd_t *w, uint32_t now_ms);
 /* 允许输出 PWM 吗？（hold_zero 期间返回 0：调用方必须先发一拍零速） */
 int ld_wd_output_enabled(const ld_wd_t *w);
 
+/*
+ * 这一拍该给电机什么 —— 三态，调用方 switch 即可。
+ *
+ * **不要自己组合 `output_enabled` 和 `hold_zero`**：
+ *     if (!ld_wd_output_enabled(&w)) motor_disable();
+ *     else if (w.hold_zero) { motor_set(0,0); ld_wd_zero_applied(&w); }
+ * 看起来对，实际会死锁 —— hold_zero 期间 output_enabled 返回 0，于是走进
+ * 断使能分支，zero_applied 永远不被调用，hold_zero 永远不退，车永远不动。
+ * （实测：enabled=1 hold_zero=1 motor_enable=0，心跳计数已经到 3。）
+ *
+ * hold_zero 的正确含义是「**可以使能，但这一拍必须给零速**」，
+ * 它和「不许使能」是两件事，`output_enabled` 那个布尔量表达不了。
+ */
+#define LD_WD_OUT_DISABLE 0   /* 断使能（EN/STBY 拉低），不是输出 0 占空比 */
+#define LD_WD_OUT_ZERO    1   /* 使能，但本拍必须输出零速，下发后调 zero_applied */
+#define LD_WD_OUT_RUN     2   /* 使能，按目标速度输出 */
+
+int ld_wd_output_state(const ld_wd_t *w);
+
 /* 已经输出过那一拍零速后调用，解除 hold_zero */
 void ld_wd_zero_applied(ld_wd_t *w);
 

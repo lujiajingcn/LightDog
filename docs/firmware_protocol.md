@@ -21,6 +21,8 @@ MCU 侧负责「一旦 ROS 侧失联，立刻自己停」   ← 只有 MCU 能�
 | `lightdog/lightdog_mcu_proto.py` | ROS 侧编解码（纯标准库，宿主机可直接跑） |
 | `lightdog/lightdog_mcu_bridge.py` | 桥接节点：话题 ⟷ 串口帧 |
 | `firmware/core/*.c` | 固件侧参考实现（纯 C99，不引 HAL，PC 上可编译可测） |
+| `firmware/app/*.c` | 应用层：帧分发 / 输出决策 / 里程计 / 上报（同样不引 HAL） |
+| `firmware/port/stm32f4/` | HAL 参考实现 + 接线说明（唯一必须上车才能验的部分） |
 | `firmware/test/vectors.txt` | 黄金向量，Python 与 C **共读同一份** |
 
 电机驱动型号仍未定，那部分不影响帧格式（只影响 §2.2 里的使能脚是哪一根）。
@@ -276,7 +278,7 @@ linorobot2 四驱 skid steer 的里程计 **yaw 高估约 35%**（仿真里就�
 
 ```bash
 # PC 上（不需要 STM32；容器里有 gcc）
-make -C firmware test        # 94 项：CRC / 黄金向量 / 解析边界 / 看门狗时序
+make -C firmware test        # 两个程序：协议/看门狗 + 应用层，判据都是 0 失败
 make -C firmware cross       # 交叉验证程序；与 Python 侧逐帧比对（见下）
 
 # 宿主机上的 Python 侧

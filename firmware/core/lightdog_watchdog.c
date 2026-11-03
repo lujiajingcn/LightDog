@@ -95,6 +95,17 @@ int ld_wd_output_enabled(const ld_wd_t *w)
     return (int)(w->enabled && !w->hold_zero);
 }
 
+int ld_wd_output_state(const ld_wd_t *w)
+{
+    if (w == NULL || !w->enabled) {
+        return LD_WD_OUT_DISABLE;
+    }
+    if (w->hold_zero) {
+        return LD_WD_OUT_ZERO;
+    }
+    return LD_WD_OUT_RUN;
+}
+
 void ld_wd_zero_applied(ld_wd_t *w)
 {
     if (w == NULL) {
