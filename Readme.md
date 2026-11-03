@@ -87,4 +87,4 @@ sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv
 见 `deploy/README.md`。
 
 节点/话题/参数的细节见 `docs/` 下的阶段文档，硬件相关的坑见
-`docs/hardware_readiness.md`。
+`docs/hardware_readiness.md`，**要买什么、买几个、为什么是这个规格见 `docs/bom.md`**。
