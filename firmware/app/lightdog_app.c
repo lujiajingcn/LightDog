@@ -50,6 +50,30 @@ static float wrap_pi(float a)
     return a;
 }
 
+/* 临界区包装（F-003）：UART RX ISR、急停按钮 ISR、1kHz tick 三个上下文都会
+ * 读-改-写共享的看门狗状态（estop 与 fault 掩码）。Cortex-M 上同级/高优先级
+ * 中断能在 RMW 中间打断，导致漏置/漏清故障位、或急停与使能判定互相覆盖。这里
+ * 用 HAL 提供的开关中断把这**几条**语句保护起来。HAL 没实现时退化为本上下文
+ * 顺序执行（PC 单线程自检下等价，且各用例仍是确定性的）。
+ * 铁律：临界区里只放寄存器级快操作，绝不做 ADC / 三角函数 / uart 写这类慢活。 */
+static void app_enter_critical(ld_app_t *app)
+{
+    if (app->hal->enter_critical != NULL) {
+        app->hal->enter_critical();
+    }
+}
+
+static void app_exit_critical(ld_app_t *app)
+{
+    if (app->hal->exit_critical != NULL) {
+        app->hal->exit_critical();
+    }
+}
+
+/* 会触发断电保护的电气/热故障。ENCODER 只置位上报，不在此列。 */
+#define LD_F_SAFETY_CUTOFF \
+    ((uint16_t)(LD_F_OVERCURRENT | LD_F_UNDERVOLTAGE | LD_F_OVERTEMP))
+
 /* ---------------------------------------------------------------- 配置 / 初始化 */
 
 void ld_app_cfg_defaults(ld_app_cfg_t *cfg)
@@ -65,6 +89,13 @@ void ld_app_cfg_defaults(ld_app_cfg_t *cfg)
     cfg->battery_period_ms = 1000u;
     cfg->odom_period_ms = 50u;
     cfg->state_period_ms = 500u;
+    /* 安全阈值占位默认：务必按实机电机/电池 datasheet 再调，这里只求「接上但
+     * 不误触发」。max_current_a 取堵转裕度之外，min_voltage_v 取低于正常工作
+     * 下限的硬截止，max_temp_c 取功率级/电机的常见热截止。 */
+    cfg->safety_period_ms = 100u;
+    cfg->max_current_a = 8.0f;
+    cfg->min_voltage_v = 9.0f;
+    cfg->max_temp_c = 85.0f;
 }
 
 void ld_app_init(ld_app_t *app, const ld_hal_t *hal, const ld_app_cfg_t *cfg)
@@ -104,6 +135,7 @@ void ld_app_init(ld_app_t *app, const ld_hal_t *hal, const ld_app_cfg_t *cfg)
     app->last_battery_ms = now;
     app->last_odom_ms = now;
     app->last_state_ms = now;
+    app->last_safety_ms = now;
 
     /* 上电默认断使能：宁可多等 3 帧心跳，也不要「一上电就使能、
      * 等上位机来告诉它停」（README 铁律 3）。 */
@@ -134,9 +166,16 @@ static void send_state(ld_app_t *app)
 {
     uint8_t on[1];
     uint8_t fault[2];
-    uint16_t f = app->wd.fault;
+    uint16_t f;
+    uint8_t estop;
 
-    on[0] = (uint8_t)(app->wd.estop ? 1u : 0u);
+    /* 临界区里只做一次一致性快照；串口写在临界区外（慢，绝不能关着中断做）。 */
+    app_enter_critical(app);
+    estop = app->wd.estop;
+    f = app->wd.fault;
+    app_exit_critical(app);
+
+    on[0] = (uint8_t)(estop ? 1u : 0u);
     send_frame(app, LD_T_ESTOP_STATE, on, 1u);
 
     /* 小端 u16：低字节在前 */
@@ -231,13 +270,153 @@ static void odom_step(ld_app_t *app, uint32_t now)
     }
 }
 
+/* ---------------------------------------------------------------- 安全故障评估 */
+
+/*
+ * F-010：把协议里承诺的「过流 / 欠压 / 过温保护关 PWM」真正接到故障位与断电上。
+ * 之前 LD_F_OVERCURRENT/UNDERVOLTAGE/OVERTEMP/ENCODER 定义了却没有任何地方 set，
+ * 上位机永远只能看到 LINK_LOST 和按钮位，电气/热失控完全不上报也不处理。
+ *
+ * 只在 tick 上下文调用（它是这几个电气故障位的唯一写者；estop/按钮位在
+ * sync_estop_state 的临界区里写，二者用同一把临界区互斥）。慢操作（ADC 读）
+ * 全部留在临界区外，只有最后写 wd.fault / safety_lock 的几条语句进临界区。
+ */
+static void update_safety_faults(ld_app_t *app, uint32_t now)
+{
+    float pct = 0.0f;
+    float volt = 0.0f;
+    float amp = 0.0f;
+    float temp = 0.0f;
+    int have_batt = 0;
+    int have_temp = 0;
+    int enc_err = 0;
+    uint16_t trip;
+    uint16_t mask;
+    uint16_t old;
+
+    if (app->cfg.safety_period_ms == 0u) {
+        return;
+    }
+    if ((uint32_t)(now - app->last_safety_ms) < app->cfg.safety_period_ms) {
+        return;
+    }
+    app->last_safety_ms = now;
+
+    /* 电池：只在要做过流/欠压判断时读；读失败则本轮不据此改变任何判定 */
+    if (app->hal->battery_read != NULL &&
+        (app->cfg.max_current_a > 0.0f || app->cfg.min_voltage_v > 0.0f)) {
+        if (app->hal->battery_read(&pct, &volt, &amp) != 0) {
+            have_batt = 1;
+        }
+    }
+    /* 温度：没有该传感器就永不置 OVERTEMP（不能因为没接就误刹车） */
+    if (app->hal->temp_read != NULL && app->cfg.max_temp_c > 0.0f) {
+        if (app->hal->temp_read(&temp) != 0) {
+            have_temp = 1;
+        }
+    }
+    /* 编码器通道健康 */
+    if (app->hal->encoder_error != NULL) {
+        if (app->hal->encoder_error(0u) != 0 || app->hal->encoder_error(1u) != 0) {
+            enc_err = 1;
+        }
+    }
+
+    /* 过流：命中阈值置位，降到阈值 70% 以下才解除（防在临界点反复抖） */
+    if (have_batt && app->cfg.max_current_a > 0.0f) {
+        if (!app->oc_tripped) {
+            if (amp > app->cfg.max_current_a) {
+                app->oc_tripped = 1u;
+            }
+        } else if (amp < app->cfg.max_current_a * 0.7f) {
+            app->oc_tripped = 0u;
+        }
+    }
+    /* 欠压：只采信合理区间的电压（<0.5V 多半是毛刺或没接，不据此断电） */
+    if (have_batt && app->cfg.min_voltage_v > 0.0f && volt > 0.5f) {
+        if (!app->uv_tripped) {
+            if (volt < app->cfg.min_voltage_v) {
+                app->uv_tripped = 1u;
+            }
+        } else if (volt > app->cfg.min_voltage_v + 0.5f) {
+            app->uv_tripped = 0u;
+        }
+    }
+    /* 过温：高于上限置位，回落 5℃ 以上才解除 */
+    if (have_temp && app->cfg.max_temp_c > 0.0f) {
+        if (!app->ot_tripped) {
+            if (temp > app->cfg.max_temp_c) {
+                app->ot_tripped = 1u;
+            }
+        } else if (temp < app->cfg.max_temp_c - 5.0f) {
+            app->ot_tripped = 0u;
+        }
+    }
+
+    trip = 0u;
+    if (app->oc_tripped) {
+        trip |= LD_F_OVERCURRENT;
+    }
+    if (app->uv_tripped) {
+        trip |= LD_F_UNDERVOLTAGE;
+    }
+    if (app->ot_tripped) {
+        trip |= LD_F_OVERTEMP;
+    }
+    mask = (uint16_t)(LD_F_OVERCURRENT | LD_F_UNDERVOLTAGE | LD_F_OVERTEMP);
+
+    /* 只有下面这几条进临界区 */
+    app_enter_critical(app);
+    old = app->wd.fault;
+    ld_wd_set_fault(&app->wd, trip, 1);
+    ld_wd_set_fault(&app->wd, (uint16_t)(mask & (uint16_t)~trip), 0);
+    if (app->hal->encoder_error != NULL) {
+        ld_wd_set_fault(&app->wd, LD_F_ENCODER, enc_err);
+    }
+    app->safety_lock = (uint8_t)((app->wd.fault & LD_F_SAFETY_CUTOFF) != 0u);
+    if (app->wd.fault != old) {
+        app->state_dirty = 1u;
+    }
+    app_exit_critical(app);
+}
+
 /* ---------------------------------------------------------------- 收帧 */
+
+/* 把两个急停来源合并成看门狗的实际 estop。
+ *
+ * estop 位 = 上位机锁存 OR 物理按钮按下。这样任何一方单独解除都不会误开另一方：
+ * 原实现里按钮松开会无条件把 estop 清 0，导致「碰一下再松开物理按钮」就把上位机
+ * 的锁存急停破掉；而 handle_frame 只在「变化」时重设 estop，宿主后续重发
+ * ESTOP=1 又因为 estop_from_host 仍是 1 被判无变化，永远补不回来 —— 表现为
+ * 「急停状态下电机照样转」，是最危险的一类失效。
+ *
+ * 只在合并结果真的变化时才调 ld_wd_set_estop：它会清 hb_count，而宿主可能周期性
+ * 重发 ESTOP=0 保活，每帧都调会让恢复心跳永远攒不够（车「心跳正常但永远不动」）。
+ * 按钮故障位则独立反映「按钮此刻是否按下」，与 estop 由谁锁存无关。 */
+static void sync_estop_state(ld_app_t *app)
+{
+    uint8_t want = (uint8_t)(app->estop_from_host || app->button_pressed);
+
+    app_enter_critical(app);
+    if (want != app->wd.estop) {
+        ld_wd_set_estop(&app->wd, want ? 1 : 0, 0);
+        app->state_dirty = 1u;
+        if (want && app->hal->motor_enable != NULL) {
+            /* 急停要立刻断使能，不等下一个 tick */
+            app->hal->motor_enable(0);
+        }
+    }
+    ld_wd_set_button_fault(&app->wd, app->button_pressed ? 1 : 0);
+    app_exit_critical(app);
+}
 
 static void handle_frame(ld_app_t *app, const ld_frame_t *f, uint32_t now)
 {
     switch (f->type) {
     case LD_T_HEARTBEAT:
+        app_enter_critical(app);
         ld_wd_heartbeat(&app->wd, now);
+        app_exit_critical(app);
         /* 唯一的喂狗点。放进 while(1) 里喂，主循环卡死时照样喂 —— 等于没有看门狗。 */
         if (app->hal->iwdg_feed != NULL) {
             app->hal->iwdg_feed();
@@ -269,18 +448,9 @@ static void handle_frame(ld_app_t *app, const ld_frame_t *f, uint32_t now)
             break;
         }
 
-        /* **只在变化时**调用。ld_wd_set_estop 会把 hb_count 清零，
-         * 而上位机可能周期性重发 ESTOP=0 来保活 —— 每帧都调的话
-         * 恢复帧数永远攒不够，车会「心跳正常但永远不动」。 */
-        if ((uint8_t)on != app->estop_from_host) {
-            app->estop_from_host = (uint8_t)on;
-            ld_wd_set_estop(&app->wd, on, 0);
-            app->state_dirty = 1u;
-            if (on && app->hal->motor_enable != NULL) {
-                /* 急停要立刻断使能，不等下一个 tick */
-                app->hal->motor_enable(0);
-            }
-        }
+        app->estop_from_host = (uint8_t)on;
+        /* 合并两个来源后再落到看门狗，避免「按钮松开把宿主锁存一起清掉」。 */
+        sync_estop_state(app);
         break;
     }
 
@@ -332,6 +502,24 @@ void ld_app_tick(ld_app_t *app, uint32_t now_ms)
     }
     app->last_tick_ms = now_ms;
 
+    /* F-010：先评估电气/热故障。慢的 ADC 读全在临界区外，只有末尾写 wd.fault /
+     * safety_lock 的几条进临界区。它决定 safety_lock，下面的输出决策据此强制断使能。 */
+    update_safety_faults(app, now_ms);
+
+    /* F-003：ld_wd_tick 会对 wd.fault / estop / enabled 做读-改-写，而按钮 EXTI ISR
+     * （sync_estop_state）和 UART RX ISR（心跳 ld_wd_heartbeat）也在同一批字段上写。
+     * 把「推进看门狗 + 三态决策 + 落到电机寄存器」整段关进一个临界区，避免 ISR 在
+     * tick 判定「可以使能」与实际 motor_enable(1) 之间插入并断使能、随后又被 tick
+     * 翻回来（或漏置/漏清故障位）。临界区里全是寄存器级快操作，没有任何慢活；真正
+     * 耗时的 send_* 帧（uart_write）都留在这段之外。 */
+    app_enter_critical(app);
+
+    if (app->safety_lock) {
+        /* 过流/欠压/过温闭锁：作废使能判定并持续清零恢复计数。故障没解除期间心跳
+         * 也攒不起来，杜绝阈值临界抖动时电机一抽一抽。 */
+        ld_wd_invalidate(&app->wd);
+    }
+
     ld_wd_tick(&app->wd, now_ms);
 
     /* 三态决策，别自己组合 output_enabled + hold_zero（会死锁，
@@ -341,8 +529,8 @@ void ld_app_tick(ld_app_t *app, uint32_t now_ms)
         if (app->hal->motor_enable != NULL) {
             app->hal->motor_enable(0);
         }
-        /* 失联/急停时把目标清零：恢复后必须从零重新开始，
-         * 不能带着失联前那条速度指令冲出去。 */
+        /* 失联/急停/安全闭锁时把目标清零：恢复后必须从零重新开始，
+         * 不能带着断使能前那条速度指令冲出去。 */
         app->cmd_linear = 0.0f;
         app->cmd_angular = 0.0f;
     } else if (st == LD_WD_OUT_ZERO) {
@@ -366,6 +554,8 @@ void ld_app_tick(ld_app_t *app, uint32_t now_ms)
             app->hal->motor_set(l, r);
         }
     }
+
+    app_exit_critical(app);
 
     if (app->cfg.odom_period_ms != 0u &&
         (uint32_t)(now_ms - app->last_odom_ms) >= app->cfg.odom_period_ms) {
@@ -404,12 +594,10 @@ void ld_app_on_button(ld_app_t *app, int pressed, uint32_t now_ms)
         if (app->hal->motor_enable != NULL) {
             app->hal->motor_enable(0);
         }
-        ld_wd_set_estop(&app->wd, 1, 1);
-    } else {
-        /* 自锁按钮旋出 -> 解除。ld_wd_set_estop(0) 会把 hb_count 清零，
-         * 所以解除之后仍然要 3 帧心跳才恢复出力 —— 防止松开按钮的瞬间
-         * 按失联前的旧指令冲出去。 */
-        ld_wd_set_estop(&app->wd, 0, 1);
     }
+    /* 按钮松开只解除「按钮这一路」。若上位机仍锁存急停，estop 必须保持为 1，
+     * 否则碰一下按钮就把宿主的急停破了，且宿主重发 ESTOP=1 也补不回来。
+     * 解除后仍需重新攒 3 帧心跳才恢复出力 —— 防止松开瞬间带着旧指令冲出去。 */
+    sync_estop_state(app);
     app->state_dirty = 1u;
 }

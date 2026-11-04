@@ -72,6 +72,40 @@ static void stub_iwdg_feed(void)
     g_hal.iwdg_feeds++;
 }
 
+static void stub_enter_critical(void)
+{
+    g_hal.critical_enter++;
+    g_hal.critical_depth++;
+    if (g_hal.critical_depth > 1) {
+        /* app 层刻意不嵌套临界区；出现 >1 说明有路径没配对，测集会据此失败 */
+        g_hal.critical_nested = 1;
+    }
+}
+
+static void stub_exit_critical(void)
+{
+    g_hal.critical_exit++;
+    if (g_hal.critical_depth > 0) {
+        g_hal.critical_depth--;
+    }
+}
+
+static int stub_temp_read(float *celsius)
+{
+    if (!g_hal.temp_ok) {
+        return 0;
+    }
+    if (celsius != NULL) {
+        *celsius = g_hal.temp_c;
+    }
+    return 1;
+}
+
+static int stub_encoder_error(uint8_t side)
+{
+    return g_hal.enc_err[side ? 1 : 0];
+}
+
 static const ld_hal_t g_table = {
     stub_now_ms,
     stub_motor_enable,
@@ -80,7 +114,12 @@ static const ld_hal_t g_table = {
     stub_uart_write,
     stub_battery_read,
     stub_encoder_read,
-    stub_iwdg_feed
+    stub_iwdg_feed,
+    /* 可选段：追加到末尾，与 lightdog_hal.h 的字段顺序一一对应 */
+    stub_enter_critical,
+    stub_exit_critical,
+    stub_temp_read,
+    stub_encoder_error
 };
 
 void hal_stub_reset(void)

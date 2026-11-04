@@ -68,5 +68,22 @@ SyslogIdentifier=lightdog-@NAME@
 
 UMask=0027
 
+# ---- 沙箱（I-005）----
+# 这一组是**按最小破坏面挑的**：只挡「提权 / 越界写系统目录 / 干扰内核」这类，
+# 不碰 ROS 2 真正依赖的东西 —— DDS 要 /dev/shm 共享内存 + UDP 组播 + netlink，
+# 所以**刻意不加** RestrictAddressFamilies / MemoryDenyWriteExecute / RestrictRealtime
+# （那三条很容易让 Python 扩展或实时调度起不来，反而制造「一上沙箱节点就崩」的坑）。
+# ⚠ 本次改动没有在带 systemd 的真机上跑过验证（编写环境没有 init 系统）。上真机时
+# 若某节点起不来，先 `systemctl status` 看是哪条沙箱拦的，按需单独删对应行即可。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
 [Install]
 WantedBy=lightdog.target

@@ -154,6 +154,10 @@ class DockManager(Node):
         self.declare_parameter('align_scan_rate', 0.35)  # 看不见 marker 时的扫描角速度
         self.declare_parameter('align_timeout', 40.0)    # 对准总超时（墙钟秒）
         self.declare_parameter('cmd_vel_topic', '/cmd_vel_dock')
+        # 等 docking/undocking action server 上线的**最长墙钟秒数**。旧代码直接在
+        # tick/on_command 里 wait_for_server(timeout_sec=2.0)，那会冻结单线程执行器
+        # 最多 2 秒；现在改成非阻塞轮询 server_is_ready()，这个值只作为放弃上限。
+        self.declare_parameter('action_connect_timeout', 2.0)
 
         # ---- 仿真补丁 ----
         self.declare_parameter('sim_charging', True)
@@ -190,6 +194,8 @@ class DockManager(Node):
         self.align_max_w = float(p('align_max_w').value)
         self.align_scan_rate = float(p('align_scan_rate').value)
         self.align_timeout = float(p('align_timeout').value)
+        self.action_connect_timeout = max(
+            0.0, float(p('action_connect_timeout').value))
 
         self.sim_charging = bool(p('sim_charging').value)
         self.sim_charge_rate = float(p('sim_charge_rate').value)
@@ -243,6 +249,13 @@ class DockManager(Node):
         # 一次真正的停靠失败，也不会污染下一次回充的重试计数。
         self._dock_epoch = 0
         self._undock_epoch = 0
+        # 非阻塞 action 连接状态（P-004）：goal 已请求、但因 action server 还没
+        # 被发现而**暂未发出**。不在回调线程里 wait_for_server，而是置这个挂起标记，
+        # 交给 tick 每帧轮询 server_is_ready()，超时则按失败退回 IDLE。
+        self._pending_dock_goal = False
+        self._dock_pending_deadline = 0.0
+        self._pending_undock = False
+        self._undock_pending_deadline = 0.0
 
         # 视觉对准用的状态
         self.dock_pose = None          # 最近一次 /detected_dock_pose
@@ -374,6 +387,16 @@ class DockManager(Node):
         inhibit = (self.state in (ALIGNING, DOCKING, DOCKED, UNDOCKING)
                    or now < self._inhibit_until)
         self.pub_inhibit.publish(Bool(data=inhibit))
+
+        # 非阻塞 action 连接重试（P-004）：goal 已请求但还没真正发出（等 server
+        # 上线）。放在状态派发之前，这样挂起期间不会走下面的 DOCKING/DOCKED 分支
+        # 去重复发起；就绪或超时后 _drive_* 会清掉标记，回到正常状态机。
+        if getattr(self, '_pending_dock_goal', False):
+            self._drive_dock_goal(now)
+            return
+        if getattr(self, '_pending_undock', False):
+            self._drive_undock(now)
+            return
 
         if self.state == ALIGNING:
             self._tick_aligning(now)
@@ -537,28 +560,50 @@ class DockManager(Node):
         self.send_dock_goal()
 
     def send_dock_goal(self):
-        """真正把 DockRobot goal 发给 docking_server（对准之后调）。"""
-        if not self.dock_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().error('/dock_robot action 不可用（docking_server 没起来？）')
+        """对准完成后请求发 DockRobot goal。
+
+        **不阻塞**（P-004）：旧实现是 `wait_for_server(timeout_sec=2.0)`，跑在
+        10Hz tick / on_command 的单线程执行器里，server 没上线时整个节点冻结 2 秒
+        —— 电池/位姿/marker 回调、feedback、/dock/inhibit、指令全停。改成置挂起
+        标记 + 交给 tick 每帧轮询 server_is_ready()，到点发不出才算失败。
+        """
+        self.state = DOCKING
+        self._pending_dock_goal = True
+        self._dock_pending_deadline = time.monotonic() + self.action_connect_timeout
+        self._drive_dock_goal(time.monotonic())
+
+    def _drive_dock_goal(self, now):
+        """tick 每帧调用：server 就绪就真正发出 goal，否则等待/超时失败。"""
+        if not self._pending_dock_goal:
+            return
+        if self.dock_client.server_is_ready():
+            self._pending_dock_goal = False
+            self._dock_pending_deadline = 0.0
+            goal = DockRobot.Goal()
+            goal.use_dock_id = True
+            goal.dock_id = self.dock_id
+            goal.navigate_to_staging_pose = self.navigate_to_staging
+            goal.max_staging_time = self.max_staging_time
+
+            self.get_logger().info(
+                f'发送 DockRobot：dock_id={self.dock_id} '
+                f'navigate_to_staging={self.navigate_to_staging}')
+            self._dock_future = self.dock_client.send_goal_async(
+                goal, self.on_dock_feedback)
+            self._dock_epoch += 1
+            epoch = self._dock_epoch
+            self._dock_future.add_done_callback(
+                lambda f: self.on_dock_goal_response(f, epoch))
+            return
+        if now >= self._dock_pending_deadline:
+            self._pending_dock_goal = False
+            self._dock_pending_deadline = 0.0
+            self.get_logger().error(
+                '/dock_robot action 不可用（docking_server 没起来？）')
             self.busy = False
             self.state = IDLE
             return
-
-        self.state = DOCKING
-        goal = DockRobot.Goal()
-        goal.use_dock_id = True
-        goal.dock_id = self.dock_id
-        goal.navigate_to_staging_pose = self.navigate_to_staging
-        goal.max_staging_time = self.max_staging_time
-
-        self.get_logger().info(
-            f'发送 DockRobot：dock_id={self.dock_id} '
-            f'navigate_to_staging={self.navigate_to_staging}')
-        self._dock_future = self.dock_client.send_goal_async(goal, self.on_dock_feedback)
-        self._dock_epoch += 1
-        epoch = self._dock_epoch
-        self._dock_future.add_done_callback(
-            lambda f: self.on_dock_goal_response(f, epoch))
+        # 尚未就绪、也还没超时：留给下一帧 tick 重试，回调线程绝不阻塞。
 
     def on_dock_feedback(self, feedback_msg):
         fb = feedback_msg.feedback
@@ -621,24 +666,41 @@ class DockManager(Node):
         self.state = IDLE
 
     def start_undocking(self):
-        if self.busy:
+        if self.busy or self._pending_undock:
             return
-        if not self.undock_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().error('/undock_robot action 不可用')
-            self.state = IDLE
-            return
-        goal = UndockRobot.Goal()
-        goal.dock_type = 'simple_charging_dock'
-        goal.max_undocking_time = float(self.max_undocking_time)
-
+        # 非阻塞（P-004）：理由同 send_dock_goal —— 绝不 wait_for_server。
         self.busy = True
         self.state = UNDOCKING
-        self.get_logger().info('发起离桩')
-        self._undock_epoch += 1
-        epoch = self._undock_epoch
-        self._undock_future = self.undock_client.send_goal_async(goal)
-        self._undock_future.add_done_callback(
-            lambda f: self.on_undock_goal_response(f, epoch))
+        self._pending_undock = True
+        self._undock_pending_deadline = time.monotonic() + self.action_connect_timeout
+        self._drive_undock(time.monotonic())
+
+    def _drive_undock(self, now):
+        """tick 每帧调用：undock server 就绪就真正发出离桩 goal。"""
+        if not self._pending_undock:
+            return
+        if self.undock_client.server_is_ready():
+            self._pending_undock = False
+            self._undock_pending_deadline = 0.0
+            goal = UndockRobot.Goal()
+            goal.dock_type = 'simple_charging_dock'
+            goal.max_undocking_time = float(self.max_undocking_time)
+
+            self.get_logger().info('发起离桩')
+            self._undock_epoch += 1
+            epoch = self._undock_epoch
+            self._undock_future = self.undock_client.send_goal_async(goal)
+            self._undock_future.add_done_callback(
+                lambda f: self.on_undock_goal_response(f, epoch))
+            return
+        if now >= self._undock_pending_deadline:
+            self._pending_undock = False
+            self._undock_pending_deadline = 0.0
+            self.get_logger().error('/undock_robot action 不可用')
+            self.busy = False
+            self.state = IDLE
+            return
+        # server 还没上线、也没超时：等下一帧，回调线程不阻塞。
 
     def on_undock_goal_response(self, future, epoch):
         goal_handle = future.result()
@@ -707,6 +769,12 @@ class DockManager(Node):
 
         self._dock_goal_handle = None
         self._undock_goal_handle = None
+        # 取消/失败要连「还没发出去的 goal」一起撤掉（P-004），否则下一帧 tick
+        # 会把这条已取消的请求重新发给刚上线的 server。
+        self._pending_dock_goal = False
+        self._dock_pending_deadline = 0.0
+        self._pending_undock = False
+        self._undock_pending_deadline = 0.0
         self.pub_vel.publish(Twist())    # 对准阶段可能有残留角速度
         self._inhibit_until = now + 1.5  # 等 docking_server 真正停下来
         # 清掉仿真充电积分量：不清的话 battery_ratio() 会一直返回这个冻结值，

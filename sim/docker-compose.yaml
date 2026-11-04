@@ -11,7 +11,12 @@
 
 services:
   sim:
-    image: linorobot2:gazebo
+    # I-001：基础镜像原本写死成可变标签 linorobot2:gazebo，没有任何办法锁定 provenance。
+    # upstream.lock 把上游源码钉到了具体 commit，但镜像本身是本地构建的，重建一次标签内容
+    # 就可能悄悄变 —— 「同一条 compose 在不同机器上跑出不同东西」。改成可用 SIM_IMAGE 覆盖，
+    # 真机/CI 就应在 .env 里把 SIM_IMAGE 指到按 upstream.lock 的 commit 打标签的构建
+    # （例如 linorobot2:gazebo-f6b0bd0，或直接 registry @sha256: 摘要）。默认值保持向后兼容。
+    image: ${SIM_IMAGE:-linorobot2:gazebo}
     container_name: sim
     privileged: true
     # 以 root 跑：P3 的补丁要改 /opt/ros/jazzy/share/nav2_bringup/launch/navigation_launch.py
@@ -20,6 +25,21 @@ services:
     # 权限隔离，所以直接以 root 运行最省事。
     user: root
     network_mode: bridge
+    # I-004：以前既没有 restart 也没有 healthcheck，而 entrypoint 崩溃时退的是 0
+    # ——「容器已退出(0)」在 docker/systemd 眼里跟正常停止没区别，于是静默死亡、
+    # 无人拉起。现在 entrypoint 在监控进程(mux/sim/slam)自己挂掉时退非零，
+    # unless-stopped 就会自动重启；人为 `docker stop`(SIGTERM) 走 exit 0 且被标记
+    # 为停止，不会被重启策略复活。
+    restart: unless-stopped
+    healthcheck:
+      # 只查两个与安全最相关、且名字由我们掌控的进程在不在，不用慢的 ros2 CLI。
+      # twist_mux = /cmd_vel 的兜零仲裁者；lightdog_sim.launch = 传感/驱动链路本体。
+      test: ["CMD-SHELL", "pgrep -f lightdog_twist_mux.py >/dev/null && pgrep -f lightdog_sim.launch.py >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      # 仿真冷启动要 colcon build + gz 起世界 + SLAM，留足 90s 别把它误判成 unhealthy。
+      start_period: 90s
     ports:
       - "5900:5900"   # x11vnc
       - "6080:6080"   # noVNC

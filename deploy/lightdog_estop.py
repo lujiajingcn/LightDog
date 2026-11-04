@@ -46,13 +46,31 @@ WARN = '\033[33m'
 END = '\033[0m'
 
 
+def external_subscribers(total, own):
+    """I-006：从话题订阅总数里减掉本工具自建的订阅数，得到「外部还有几个在听」。
+
+    count_subscribers 把自己那条也算进去，不减就永远 >=1，「没有外部订阅者」
+    的告警永远不会触发（twist_mux 掉线也报不出「没人能把车停住」）。发现过程
+    还没把自建的订阅匹配上时 total 会小于 own，钳到 0，别报负数。
+    纯算术、不碰 rclpy，供离线回归直接抽出来测。
+    """
+    n = int(total) - int(own)
+    return n if n > 0 else 0
+
+
 class EstopConsole(Node):
     def __init__(self):
         super().__init__('lightdog_estop_cli')
         self.latched = None      # 话题上的锁存值
         self.mux_state = None    # mux 实际在用的闸
+        # I-006：本工具自己也是 /safety/estop 的订阅者（下面回读锁存要用），
+        # 而 count_subscribers 会把**自己这条订阅**也算进去。所以外部有没有人
+        # 在听，必须从计数里减掉自己建的订阅数，否则 subs 永远 >=1、
+        # 「没有订阅者」的告警是死代码（twist_mux 没起也报不出「没人停得下车」）。
+        self.own_estop_subs = 0
         self.pub = self.create_publisher(Bool, ESTOP_TOPIC, SAFETY_QOS)
         self.create_subscription(Bool, ESTOP_TOPIC, self._on_estop, SAFETY_QOS)
+        self.own_estop_subs += 1
         self.create_subscription(String, MUX_STATE_TOPIC,
                                  self._on_mux, 10)
 
@@ -104,9 +122,11 @@ def main():
                   f'（解开锁之前请确认车周围没人）')
             return 3
 
-        subs = node.count_subscribers(ESTOP_TOPIC)
+        # I-006：减掉本工具自建的那条订阅，才反映「外部还有没有人在听」。
+        subs = external_subscribers(node.count_subscribers(ESTOP_TOPIC),
+                                    node.own_estop_subs)
         if subs == 0:
-            print(f'{WARN}!{END} /safety/estop 当前没有订阅者 '
+            print(f'{WARN}!{END} /safety/estop 当前没有**外部**订阅者 '
                   f'—— twist_mux 可能没在跑，这次设置**不会**让车停下来')
 
         # 发。连发几次覆盖发现窗口，但真正的保证是后面的回读。

@@ -251,6 +251,15 @@ class Recorder(Node):
         self.session = int(time.time())
         self._load_index()
 
+        self._lock = threading.Lock()
+        # clips / clips.jsonl 的专属锁。刻意与 self._lock（保护 self.cur 帧缓冲）
+        # 分开：self._lock 在图像回调里 30Hz 抢占，绝不能被「追加索引 + 写文件 /
+        # 清理时逐个 os.remove」这种慢 I/O 长时间占住，否则回调排队丢帧。
+        # 三个线程共享 self.clips：写盘线程 append、定时器线程 _gc 增删、
+        # 事件合成线程与状态发布读取——全部走这把锁互斥（P-001）。
+        # 必须在下面启动写盘线程之前建好：worker 一被唤醒就可能调 _append_index。
+        self._clips_lock = threading.Lock()
+
         # 写入串行化：图像回调只负责攒帧，编码在单独线程里做，
         # 否则真机 30Hz 下编码会把回调堵死、直接丢帧。
         #
@@ -264,7 +273,6 @@ class Recorder(Node):
         self._flush_thread = threading.Thread(target=self._flush_worker, daemon=True)
         self._flush_thread.start()
 
-        self._lock = threading.Lock()
         # [(ros_t, jpeg_bytes), ...] 当前段的帧。
         #
         # 刻意存**编码后的 JPEG** 而不是原始 BGR：640x480x3 = 900KB/帧，
@@ -373,12 +381,16 @@ class Recorder(Node):
         return rec
 
     def _append_index(self, rec):
-        self.clips.append(rec)
-        try:
-            with open(self.index_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
-        except Exception as e:
-            self.get_logger().warn(f'写索引失败：{e}')
+        # 写盘线程调用。self.clips 与 clips.jsonl 一起在这把锁下更新：
+        # 与定时器线程的 _gc（会原地增删 self.clips 并重写 clips.jsonl）互斥，
+        # 否则「append 到一半被 _rewrite_index 覆盖」会让索引丢行或错位。
+        with self._clips_lock:
+            self.clips.append(rec)
+            try:
+                with open(self.index_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            except Exception as e:
+                self.get_logger().warn(f'写索引失败：{e}')
 
     # ---------- 帧回调 ----------
 
@@ -668,7 +680,7 @@ class Recorder(Node):
         # 等写盘队列排空（后置窗口刚 flush 的那段可能还在编码）
         self._flush_q.join()
 
-        with self._lock:
+        with self._clips_lock:
             clips = list(self.clips)
         # 只取本会话的段：ROS 时间在重启后会回零，跨会话比较 t0/t1 是没有意义的
         # （见 __init__ 里 session 的注释）。
@@ -677,15 +689,25 @@ class Recorder(Node):
                 and c.get('t1', 0.0) >= ctx['t_from'] and c.get('t0', 0.0) <= ctx['t_to']]
         hits.sort(key=lambda c: c.get('seq', 0))
 
-        # 事件 id 用墙钟时间戳，人能一眼看出「几点几分」；同秒多条时加序号
+        # 事件 id 用墙钟时间戳，人能一眼看出「几点几分」；同秒多条时加序号。
+        # 用「不带 exist_ok 的 makedirs + 捕获 FileExistsError 递增重试」原子占位：
+        # 本函数跑在每个事件的组装线程上，若先 exists 判断再创建，同秒同类事件
+        # （如手动事件 + 跌倒告警）会双双通过检查、落进同一目录互相覆盖
+        # video.mp4/meta.json，丢掉一段取证视频。让「目录创建成功」本身充当占位
+        # 才是原子的；每次重试 eid 都变，不会在同一名上死循环。
         base = time.strftime('%Y%m%d_%H%M%S', time.localtime(ctx['wall']))
-        eid = 'evt_%s_%s' % (base, ctx['type'])
-        k = 1
-        while os.path.exists(os.path.join(self.events_dir, eid)):
-            eid = 'evt_%s_%s_%d' % (base, ctx['type'], k)
-            k += 1
-        out_dir = os.path.join(self.events_dir, eid)
-        os.makedirs(out_dir, exist_ok=True)
+        k = 0
+        while True:
+            if k == 0:
+                eid = 'evt_%s_%s' % (base, ctx['type'])
+            else:
+                eid = 'evt_%s_%s_%d' % (base, ctx['type'], k)
+            out_dir = os.path.join(self.events_dir, eid)
+            try:
+                os.makedirs(out_dir)          # 已存在会抛 FileExistsError
+                break
+            except FileExistsError:
+                k += 1
         self.n_events += 1
 
         meta = {
@@ -858,30 +880,31 @@ class Recorder(Node):
         """
         if not self.clips:
             return
-        now = time.time()
-        removed = 0
+        with self._clips_lock:
+            now = time.time()
+            removed = 0
 
-        # 1) 时间维度
-        keep = []
-        for c in self.clips:
-            old = (now - c.get('wall', now)) > self.retain_sec
-            if old and len(self.clips) - removed > self.min_segments:
+            # 1) 时间维度
+            keep = []
+            for c in self.clips:
+                old = (now - c.get('wall', now)) > self.retain_sec
+                if old and len(self.clips) - removed > self.min_segments:
+                    self._drop_clip(c)
+                    removed += 1
+                else:
+                    keep.append(c)
+            self.clips = keep
+
+            # 2) 容量维度
+            total = sum(c.get('bytes', 0) for c in self.clips)
+            while total > self.max_disk_mb * 1024 * 1024 and len(self.clips) > 1:
+                c = self.clips.pop(0)
+                total -= c.get('bytes', 0)
                 self._drop_clip(c)
                 removed += 1
-            else:
-                keep.append(c)
-        self.clips = keep
 
-        # 2) 容量维度
-        total = sum(c.get('bytes', 0) for c in self.clips)
-        while total > self.max_disk_mb * 1024 * 1024 and len(self.clips) > 1:
-            c = self.clips.pop(0)
-            total -= c.get('bytes', 0)
-            self._drop_clip(c)
-            removed += 1
-
-        if removed:
-            self._rewrite_index()
+            if removed:
+                self._rewrite_index()
 
     def _drop_clip(self, clip):
         p = self._clip_path(clip)
@@ -896,7 +919,11 @@ class Recorder(Node):
         return os.path.join(self.clips_dir, clip['file'])
 
     def _rewrite_index(self):
-        """索引是 append-only 的，清理后重写成一个小文件，避免无限增长。"""
+        """索引是 append-only 的，清理后重写成一个小文件，避免无限增长。
+
+        **调用方必须已持有 self._clips_lock**：这里读 self.clips 并原子替换
+        clips.jsonl，锁不可重入（_gc 已在锁内调用本函数），故本函数自己不加锁。
+        """
         tmp = self.index_path + '.part'
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
@@ -1012,7 +1039,8 @@ class Recorder(Node):
         with self._lock:
             cur_n = len(self.cur)
             cur_t0 = self.cur_t0
-        clips = list(self.clips)
+        with self._clips_lock:
+            clips = list(self.clips)
         total = sum(c.get('bytes', 0) for c in clips)
         last_fps = clips[-1].get('fps', 0.0) if clips else 0.0
         age = (now - self.latest_t) if self.latest_t is not None else -1.0

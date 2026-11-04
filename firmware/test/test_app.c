@@ -152,6 +152,33 @@ static int tx_has(uint8_t type)
     return 0;
 }
 
+/* 从 TX 里取第一帧 LD_T_FAULT 的 u16 载荷（小端）；没有则返回 -1。
+ * F-010 用它确认故障位真的上了线，而不只是停在内部 wd.fault 里。 */
+static int tx_fault_u16(void)
+{
+    uint32_t i = 0;
+
+    while (i + 6u <= g_hal.tx_len) {
+        if (g_hal.tx[i] == LD_SYNC0 && g_hal.tx[i + 1u] == LD_SYNC1) {
+            uint8_t len = g_hal.tx[i + 2u];
+            if (g_hal.tx[i + 3u] == LD_T_FAULT && len >= 2u) {
+                return (int)g_hal.tx[i + 4u] | ((int)g_hal.tx[i + 5u] << 8);
+            }
+            i += 6u + (uint32_t)len;
+        } else {
+            i++;
+        }
+    }
+    return -1;
+}
+
+/* 攒够心跳并跑到可以出力（不清 tx，供需要检查上报的用例先复位 tx_len）*/
+static void run_enabled(void)
+{
+    warmup_cmd(0.3f, 0.0f);
+    tick_by(10);
+}
+
 /* ---------------------------------------------------------------- 用例 */
 
 static void test_power_on_is_disabled(void)
@@ -315,6 +342,45 @@ static void test_button_release_unlocks_but_needs_heartbeats(void)
     CHECK(g_hal.motor_on == 1, "解除后攒够 3 帧应恢复");
 }
 
+/*
+ * F-001 回归：上位机锁存急停期间，有人碰一下再松开物理按钮，
+ * 绝不能把宿主的急停一起解除掉（原实现里按钮松开会无条件清 estop，
+ * 而宿主重发 ESTOP=1 又因 estop_from_host 仍为 1 被判无变化，永远补不回来）。
+ * 同时钉住「按钮故障位只反映按钮本身、与 estop 来源解耦」。
+ */
+static void test_button_release_does_not_defeat_host_estop(void)
+{
+    boot();
+    warmup_cmd(0.3f, 0.0f);
+    tick_by(10);
+    CHECK(g_hal.motor_on == 1, "前提：应该能动");
+
+    estop(1);
+    CHECK(g_app.wd.estop == 1, "上位机急停后 estop 必须为 1");
+
+    ld_app_on_button(&g_app, 1, g_t);
+    ld_app_on_button(&g_app, 0, g_t);
+
+    CHECK(g_app.wd.estop == 1,
+          "按钮松开后只要上位机仍锁存急停，estop 必须保持 1");
+    CHECK((g_app.wd.fault & LD_F_ESTOP_BUTTON) == 0,
+          "按钮已松开，按钮故障位应清除（与 estop 来源无关）");
+
+    hb_tick();
+    hb_tick();
+    hb_tick();
+    hb_tick();
+    CHECK(g_hal.motor_on == 0,
+          "上位机急停未解除时，攒再多心跳也不该恢复出力");
+
+    estop(0);
+    CHECK(g_app.wd.estop == 0, "两个来源都解除后 estop 才应为 0");
+    hb_tick();
+    hb_tick();
+    hb_tick();
+    CHECK(g_hal.motor_on == 1, "宿主解除并攒够 3 帧后应恢复");
+}
+
 static void test_cmd_vel_is_clamped(void)
 {
     boot();
@@ -463,6 +529,171 @@ static void test_heartbeat_is_the_only_iwdg_feed(void)
     CHECK(g_hal.iwdg_feeds == feeds + 1, "每帧合法心跳喂一次");
 }
 
+/*
+ * F-010 回归：协议里承诺的「过流/欠压/过温保护关 PWM」必须真的接通——
+ * 命中阈值→置故障位→强制断使能（内部闭锁）→经迟滞解除后仍需重新攒心跳。
+ * ENCODER 只置位上报、不断电（计数异常不该把车锁死在原地）。
+ */
+static void test_overcurrent_trips_and_cuts_power(void)
+{
+    boot();
+    run_enabled();
+    CHECK(g_hal.motor_on == 1, "前提：应该能动");
+
+    /* 电流超阈值 → 下一个安全周期置 OVERCURRENT 并强制断使能 */
+    g_hal.amp = 10.0f;                 /* > max_current_a(8) */
+    g_hal.tx_len = 0;
+    tick_by(150);                      /* 跨过 safety_period(100) 触发评估 */
+    CHECK((g_app.wd.fault & LD_F_OVERCURRENT) != 0, "过流必须置 OVERCURRENT 位");
+    CHECK(g_app.safety_lock == 1, "过流必须进入安全闭锁");
+    CHECK(g_hal.motor_on == 0, "安全闭锁必须强制断使能");
+    CHECK(tx_has(LD_T_FAULT), "过流要上报 FAULT 帧");
+    CHECK((tx_fault_u16() & LD_F_OVERCURRENT) != 0, "FAULT 帧载荷要带上过流位");
+
+    /* 迟滞：仍高于释放阈值(0.7*8=5.6)时不解除 */
+    g_hal.amp = 6.0f;
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_OVERCURRENT) != 0, "未降到释放阈值前不能解除");
+    CHECK(g_hal.motor_on == 0, "仍闭锁时不能恢复出力");
+
+    /* 降到 70% 以下清故障位；但仍需重新攒 3 帧心跳才出力 */
+    g_hal.amp = 5.0f;
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_OVERCURRENT) == 0, "降到释放阈值后应清 OVERCURRENT");
+    CHECK(g_app.safety_lock == 0, "故障解除后应退出闭锁");
+    CHECK(g_hal.motor_on == 0, "刚解除不能立刻出力，要重新攒心跳");
+
+    hb_tick();
+    hb_tick();
+    hb_tick();
+    CHECK(g_hal.motor_on == 1, "解除后重新攒够 3 帧应恢复出力");
+}
+
+static void test_undervoltage_trips_and_hysteresis(void)
+{
+    boot();
+    run_enabled();
+    CHECK(g_hal.motor_on == 1, "前提：应该能动");
+
+    g_hal.volt = 7.0f;                 /* < min_voltage_v(9)，且 >0.5 可信 */
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_UNDERVOLTAGE) != 0, "欠压必须置位");
+    CHECK(g_app.safety_lock == 1, "欠压必须闭锁");
+    CHECK(g_hal.motor_on == 0, "欠压闭锁必须断使能");
+
+    g_hal.volt = 9.2f;                 /* 未升到 min+0.5=9.5，迟滞保持 */
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_UNDERVOLTAGE) != 0, "未回到释放阈值前不解除");
+
+    g_hal.volt = 9.7f;                 /* > 9.5 释放 */
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_UNDERVOLTAGE) == 0, "电压回升到释放阈值应清欠压");
+    CHECK(g_app.safety_lock == 0, "退出闭锁");
+}
+
+static void test_undervoltage_ignores_implausible_voltage(void)
+{
+    int i;
+
+    boot();
+    run_enabled();
+    /* 读到 0.3V 多半是没接/毛刺，不能据此判欠压而误断电 */
+    g_hal.volt = 0.3f;
+    for (i = 0; i < 12; i++) {
+        hb_tick();                     /* 持续心跳，跨过若干安全评估周期 */
+    }
+    CHECK((g_app.wd.fault & LD_F_UNDERVOLTAGE) == 0,
+          "不合理低压(<0.5V)不该误判欠压");
+    CHECK(g_hal.motor_on == 1, "不该因毛刺电压断电");
+}
+
+static void test_overtemp_trips_and_hysteresis(void)
+{
+    boot();
+    run_enabled();
+    CHECK(g_hal.motor_on == 1, "前提：应该能动");
+
+    g_hal.temp_ok = 1;
+    g_hal.temp_c = 90.0f;              /* > max_temp_c(85) */
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_OVERTEMP) != 0, "过温必须置位");
+    CHECK(g_app.safety_lock == 1, "过温必须闭锁");
+    CHECK(g_hal.motor_on == 0, "过温闭锁必须断使能");
+
+    g_hal.temp_c = 82.0f;             /* 仍 > (85-5=80)，迟滞保持 */
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_OVERTEMP) != 0, "未回落 5℃ 前不解除");
+
+    g_hal.temp_c = 79.0f;             /* < 80 释放 */
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_OVERTEMP) == 0, "回落后清过温");
+    CHECK(g_app.safety_lock == 0, "退出闭锁");
+}
+
+static void test_overtemp_needs_sensor(void)
+{
+    boot();
+    run_enabled();
+    /* temp_ok=0（没有该传感器）：即便阈值>0 也永不置 OVERTEMP */
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_OVERTEMP) == 0, "无温度传感器不该误报过温");
+    CHECK(g_app.safety_lock == 0, "无传感器不该闭锁");
+    CHECK(g_hal.motor_on == 1, "不该因缺传感器断电");
+}
+
+static void test_encoder_fault_reports_but_keeps_running(void)
+{
+    boot();
+    run_enabled();
+    g_hal.enc_err[0] = 1;             /* 左编码器故障 */
+    g_hal.tx_len = 0;
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_ENCODER) != 0, "编码器故障要置 ENCODER 位");
+    CHECK(g_app.safety_lock == 0, "编码器故障只上报，不断电闭锁");
+
+    hb_tick();
+    hb_tick();
+    hb_tick();
+    CHECK(g_hal.motor_on == 1, "编码器坏了车仍应能按指令出力");
+    CHECK(tx_has(LD_T_FAULT), "编码器故障要上报");
+    CHECK((tx_fault_u16() & LD_F_ENCODER) != 0, "FAULT 帧要带编码器位");
+
+    g_hal.enc_err[0] = 0;
+    tick_by(150);
+    CHECK((g_app.wd.fault & LD_F_ENCODER) == 0, "编码器恢复后应清位");
+}
+
+/*
+ * F-003 契约：共享看门狗状态的读-改-写必须落在成对、且不嵌套的临界区里。
+ * hal_stub 的 enter/exit 会记录配对、深度与嵌套。app 层刻意不嵌套——若某条路径
+ * 没配对（漏 exit）或把临界区套起来（嵌套），这里都会失败。
+ */
+static void test_critical_sections_are_balanced(void)
+{
+    boot();
+    warmup_cmd(0.3f, 0.0f);
+    tick_by(10);
+    estop(1);
+    ld_app_on_button(&g_app, 1, g_t);
+    ld_app_on_button(&g_app, 0, g_t);
+    estop(0);
+    g_hal.amp = 12.0f;                /* 走一遍安全闭锁路径 */
+    tick_by(150);
+    g_hal.amp = 0.5f;
+    tick_by(150);
+    hb_tick();
+    hb_tick();
+    hb_tick();
+
+    CHECK(g_hal.critical_enter > 0, "确实进入过临界区（HAL 指针应已接上）");
+    CHECK(g_hal.critical_enter == g_hal.critical_exit,
+          "临界区必须成对（enter=%d exit=%d）",
+          g_hal.critical_enter, g_hal.critical_exit);
+    CHECK(g_hal.critical_depth == 0, "用例结束时不能停在临界区内（漏了 exit）");
+    CHECK(g_hal.critical_nested == 0,
+          "临界区不得嵌套（会破坏不可重入假设）");
+}
+
 int main(void)
 {
     test_power_on_is_disabled();
@@ -475,6 +706,7 @@ int main(void)
     test_button_cuts_enable_and_sets_fault();
     test_host_cannot_clear_while_button_held();
     test_button_release_unlocks_but_needs_heartbeats();
+    test_button_release_does_not_defeat_host_estop();
     test_cmd_vel_is_clamped();
     test_led_brightness_is_clamped();
     test_diff_drive_signs();
@@ -486,6 +718,13 @@ int main(void)
     test_unknown_frame_type_is_ignored();
     test_bad_crc_does_not_feed_watchdog();
     test_heartbeat_is_the_only_iwdg_feed();
+    test_overcurrent_trips_and_cuts_power();
+    test_undervoltage_trips_and_hysteresis();
+    test_undervoltage_ignores_implausible_voltage();
+    test_overtemp_trips_and_hysteresis();
+    test_overtemp_needs_sensor();
+    test_encoder_fault_reports_but_keeps_running();
+    test_critical_sections_are_balanced();
 
     printf("%d 项检查，%d 项失败\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

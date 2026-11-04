@@ -694,10 +694,25 @@ class CommandDialer:
     def _run(self, job):
         result = DialResult(job.number, job.name, job.tag, outcome=FAILED)
         try:
-            cmd = self.template.format(
-                phone=job.number, name=job.name, attempt=job.attempt)
-            # shlex 切分 + 不走 shell：号码/姓名是外部输入
-            r = subprocess.run(shlex.split(cmd), capture_output=True,
+            # 先 shlex 切模板、再逐 token 替换占位符。顺序反了（先 format 再
+            # shlex）会让外部输入参与命令行结构本身：姓名含不成对引号时
+            # shlex.split 直接抛 ValueError 被吞成 FAILED、这通电话根本打不出去；
+            # 含空格/引号还会把一段姓名撑成多个 argv。反过来切分后替换，号码/
+            # 姓名永远各自落在单个 argv 元素里，既不撑破边界也不被拆成额外参数。
+            subs = {
+                '{phone}': str(job.number),
+                '{name}': str(job.name),
+                '{attempt}': str(job.attempt),
+            }
+            argv = []
+            for tok in shlex.split(self.template):
+                for key, val in subs.items():
+                    tok = tok.replace(key, val)
+                argv.append(tok)
+            if not argv:
+                raise ValueError('call_command 为空，无法外呼')
+            # 绝不 shell=True：号码/姓名是外部输入
+            r = subprocess.run(argv, capture_output=True,
                                timeout=self.timeout)
             if r.returncode == 0:
                 result.outcome = PLACED

@@ -24,11 +24,23 @@ typedef struct {
     float volt;
     float amp;
 
+    /* 可选能力（F-010）：温度与编码器健康，默认关闭 */
+    int temp_ok;          /* 0=没有该传感器/读失败 → 永不置 OVERTEMP */
+    float temp_c;
+    int enc_err[2];       /* 非 0 = 该侧编码器故障 */
+
+    /* 临界区可控开关（F-003）：enter/exit 是否接了实现 */
+    int critical_enabled;
+
     /* 记录 */
     int enable_calls;
     int disable_calls;
     int iwdg_feeds;
     int enc_reads;
+    int critical_enter;
+    int critical_exit;
+    int critical_depth;   /* 当前嵌套深度，正常应在 0/1 之间 */
+    int critical_nested;  /* 曾出现过 >1 的嵌套（app 层刻意不嵌套，应为 0） */
     uint8_t tx[HAL_STUB_TX_MAX];
     uint32_t tx_len;
     uint32_t tx_frames;

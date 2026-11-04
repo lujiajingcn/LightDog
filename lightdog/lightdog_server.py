@@ -731,6 +731,25 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.urlparse(self.path).query
         return urllib.parse.parse_qs(q, keep_blank_values=True)
 
+    def _safe_path(self):
+        """把 URL 查询串里的访问令牌掩掉再拿去打日志。
+
+        self.path 带着 `?token=SECRET`，异常路径要把它写进 ROS logger（→journald），
+        不掩就是把访问令牌落进系统日志。访问日志(log_message)本就没打，异常日志也得
+        同样谨慎。解析万一出错，宁可返回占位串也不要吐原始 path。"""
+        try:
+            parts = urllib.parse.urlsplit(self.path)
+            if not parts.query:
+                return parts.path
+            q = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+            if 'token' in q:
+                q['token'] = ['***']
+            newq = urllib.parse.urlencode(q, doseq=True)
+            return urllib.parse.urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, newq, parts.fragment))
+        except Exception:
+            return '<path-redacted>'
+
     def _authed(self):
         tok = self.node.token
         if not tok:
@@ -876,7 +895,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            self.node.get_logger().error(f'GET {self.path} 异常：{e}')
+            self.node.get_logger().error(f'GET {self._safe_path()} 异常：{e}')
             try:
                 self._err(500, str(e))
             except Exception:
@@ -1033,7 +1052,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            self.node.get_logger().error(f'{method} {self.path} 异常：{e}')
+            self.node.get_logger().error(f'{method} {self._safe_path()} 异常：{e}')
             try:
                 self._err(500, str(e))
             except Exception:
@@ -1253,9 +1272,25 @@ def main(args=None):
     httpd.daemon_threads = True
     httpd.node = node
 
-    # 可选 TLS。证书有问题时**直接不启动**：宁可没有画面，也不要悄悄退化成
-    # 明文（那等于把「以为已经加密」这个错觉卖给用户）。
-    if node.ssl_certfile and node.ssl_keyfile:
+    # 可选 TLS，三态处理：
+    #   cert 和 key 都空   -> 明文启动（仿真默认，允许）
+    #   cert 和 key 都有   -> 加载证书启用 HTTPS
+    #   只有其中一个       -> 配置写错，**拒绝启动**。绝不接受「配了 cert 忘了
+    #   key」悄悄退化成明文——那等于把「以为已经加密」这个错觉卖给用户，
+    #   与「证书有问题时宁可没画面，也不要悄悄退化成明文」的原则一致。
+    has_cert = bool(node.ssl_certfile)
+    has_key = bool(node.ssl_keyfile)
+    if has_cert != has_key:
+        httpd.server_close()
+        node.get_logger().fatal(
+            f'ssl_certfile 与 ssl_keyfile 必须同时提供'
+            f'（当前 cert={"有" if has_cert else "无"}、'
+            f'key={"有" if has_key else "无"}），拒绝以明文启动')
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        return 2
+    if has_cert and has_key:
         import ssl
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1275,7 +1310,7 @@ def main(args=None):
     spin_thread.start()
 
     node.get_logger().info(f'监听 {node.host}:{node.port}')
-    scheme = 'https' if (node.ssl_certfile and node.ssl_keyfile) else 'http'
+    scheme = 'https' if (has_cert and has_key) else 'http'
     if node.token:
         node.get_logger().info(
             f'手机访问：{scheme}://{node._lan_ip()}:{node.port}/?token={node.token}')

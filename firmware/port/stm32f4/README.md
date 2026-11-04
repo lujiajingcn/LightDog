@@ -16,7 +16,7 @@ STM32 HAL）。真正编译它要用 CubeMX 生成的工程。
 | **UART2** | 115200 8N1，**DMA TX（Normal，不是 Circular）**，开 UART 全局中断 | 开中断才能拿到 DMA 发送完成回调；Circular 会掩盖「发到哪了」 |
 | **TIM1** | 4 路 PWM（CH1/CH1N、CH2/CH2N、CH3/CH3N、CH4/CH4N），**20kHz**，ARR=8400 | 20kHz 在可听域外；ARR 要和 `LD_PWM_PERIOD` 一致 |
 | **TIM3 / TIM4** | Encoder Mode（TI1 and TI2），**4 倍频** | 每转计数 = 线数 × 4 × 减速比，必须与 `ticks_per_rev` 一致 |
-| **ADC1** | 电池分压通道，12 位 | 分压比写错的表现是「电量永远 100%」或「刚充满就报 0%」 |
+| **ADC1** | **3 通道 Scan + ContinuousConvMode + 循环 DMA**（顺序：电池分压→电流→温度 NTC），12 位 | `ld_app_tick` 在 1kHz 中断里跑，绝不能再忙等 ADC；DMA 持续把最新值刷进缓存，读只取快照（见代码里 F-002）。分压/增益写错的表现是「电量永远 100%」或「刚充满就报 0%」 |
 | **IWDG** | 预分频 + 重载，**超时 1s** | 见下面「IWDG 超时不要设太短」 |
 | **GPIO 输出** | `MOTOR_EN`、`LEFT_DIR`、`RIGHT_DIR`、`LED` | `MOTOR_EN` **硬件上必须下拉** |
 | **GPIO 输入** | 急停按钮，**上升沿 + 下降沿都触发** | 自锁按钮：按下锁住、旋出解除，两个沿都要知道 |
@@ -110,6 +110,14 @@ int main(void)
     cfg.wheel_base_m   = 0.300f;
     cfg.ticks_per_rev  = 1560.0f;    /* 线数 x4 x 减速比 */
 
+    /* 安全阈值（F-010）：务必按实机电机/电池/功率级 datasheet 填，不要抄默认。
+     * 命中即断使能（内部闭锁），恢复要跨过迟滞阈值并重新攒 3 帧心跳。
+     * 设成 <=0 关闭对应单项；max_temp_c 需要有温度通道（ADC 第 3 路）才有意义。 */
+    cfg.safety_period_ms = 100u;     /* 安全评估周期 */
+    cfg.max_current_a    = 8.0f;     /* 堵转裕度之外的过流阈值 */
+    cfg.min_voltage_v    = 9.0f;     /* 欠压硬截止 */
+    cfg.max_temp_c       = 85.0f;    /* 功率级/电机热截止 */
+
     ld_app_init(&g_app, lightdog_hal_stm32f4(), &cfg);
 
     HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_rx_buf, sizeof(g_rx_buf));
@@ -141,7 +149,36 @@ int main(void)
 
 ---
 
-## 五、这个参考实现没验证什么
+## 五、安全链路在真机上怎么落地
+
+1. **F-003（临界区）**：`ld_app_tick`（1kHz 定时器中断）、`ld_app_rx`（UART RX
+   中断）、`ld_app_on_button`（按钮 EXTI 中断）三个上下文都会读-改-写同一份看门狗
+   状态（`estop` / `fault` 掩码 / `enabled`）。app 层现在把这些 RMW 包进 HAL 的
+   `enter_critical`/`exit_critical`；本文件用 PRIMASK 保存/恢复的小栈实现它们，
+   临界区里只有寄存器级快操作，绝不含 ADC / 三角函数 / uart 写。
+
+2. **F-009（TX ring）**：`tx_head`/`tx_tail`/`tx_busy` 已被声明为 `volatile`，入队
+   那段（head 快照 → memcpy → 推进 head → 置 busy）整段进临界区，防止发送完成中断
+   从中间打断，看到半更新的指针或把 `busy=1` 重排到 `HAL_UART_Transmit_DMA` 之后。
+
+3. **F-010（安全故障位）**：过流 / 欠压 / 过温现在真的会被置位并强制断使能（等于
+   一次内部急停），带迟滞解除，解除后仍要重新攒 3 帧心跳才出力。温度来自 ADC 第 3
+   路经 `temp_read` 取；通道没接（恒 0）时 `temp_read` 返回 0，绝不据此误置 OVERTEMP。
+   ENCODER 位只上报、**不断电**（一次计数异常不该把车锁死在原地）。
+
+4. **编码器健康由板级喂**：port 暴露一个非静态钩子，任何检测手段检测到异常就调它：
+
+   ```c
+   /* side: 0=左 1=右；err 非 0=故障。定时器溢出/换相错误中断、
+    * 「指令在动但计数长期不动」的堵转看门狗、SSI/增量线信号丢失诊断都可以调。 */
+   void lightdog_hal_report_encoder_error(uint8_t side, int err);
+   ```
+
+   没有这类检测时标志恒 0，`hal_encoder_error` 返回 0，ENCODER 位不会被误置。
+
+---
+
+## 六、这个参考实现没验证什么
 
 如实列出，别当成已验收：
 

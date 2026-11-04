@@ -41,8 +41,25 @@ void ld_wd_heartbeat(ld_wd_t *w, uint32_t now_ms);
  * 仅用于**上报**：物理按钮还必须在硬件上直接断开驱动使能。 */
 void ld_wd_set_estop(ld_wd_t *w, int on, int from_button);
 
+/* 单独设置/清除「按钮急停」故障位，不改变 estop 判定本身。
+ * 多来源急停下 estop 位是各来源的逻辑或，而按钮位只反映「按钮此刻是否按下」，
+ * 两者会解耦（例如上位机锁存急停时按钮被按下又松开：estop 保持 1，按钮位归 0），
+ * 所以按钮位需要一个独立入口，不能让调用方直接改 fault。 */
+void ld_wd_set_button_fault(ld_wd_t *w, int on);
+
+/* 设置/清除任意故障位（LD_F_OVERCURRENT / UNDERVOLTAGE / OVERTEMP / ENCODER）。
+ * 把共享 fault 掩码的读-改-写集中在这一个函数里，调用方不必各自拼 |= / &= ~，
+ * 也就只需要在**一处**加临界区保护（见 app 层对它的包裹）。
+ * on 为真置位、为假清位，mask 可以是一次操作的多个位。 */
+void ld_wd_set_fault(ld_wd_t *w, uint16_t mask, int on);
+
 /* 主循环里每轮调一次（建议 100Hz 以上，否则 300ms 判定会有 10ms 级抖动） */
 void ld_wd_tick(ld_wd_t *w, uint32_t now_ms);
+
+/* 强制把「已使能」判定作废并清零恢复计数：下一次要重新攒够 RECOVER_FRAMES 帧
+ * 心跳、且第一拍先出零速才能再出力。用于安全故障（过流/欠压/过温）闭锁期间，
+ * 保证故障解除的瞬间不会带着旧指令直接冲出去。不改动 estop 与故障位本身。 */
+void ld_wd_invalidate(ld_wd_t *w);
 
 /* 允许输出 PWM 吗？（hold_zero 期间返回 0：调用方必须先发一拍零速） */
 int ld_wd_output_enabled(const ld_wd_t *w);

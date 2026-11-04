@@ -649,6 +649,43 @@ class CommandTest(unittest.TestCase):
         self.assertNotIn('shell', rec['kw'])
         self.assertFalse(r.answered, '命令通道拿不到是否接听，不能冒充「已接通」')
 
+    def test_name_with_quote_and_space_is_single_arg(self):
+        # P-002 回归：姓名含空格 + 不成对引号。旧实现「先 format 再 shlex」会让
+        # shlex.split 在这里抛 ValueError（引号不成对），整通电话静默 FAILED——
+        # 恰恰是救命外呼最不能发生的失败。改成「先切模板再替换」后，姓名必须
+        # 原样待在单个 argv 元素里，外呼照常成功。
+        import subprocess
+        rec = {}
+
+        def fake_run(argv, **kw):
+            rec['argv'] = argv
+
+            class R:
+                returncode = 0
+                stderr = b''
+            return R()
+
+        orig = subprocess.run
+        subprocess.run = fake_run
+        try:
+            d = LC.CommandDialer('dialer --to {phone} --name {name}')
+            d.dial('1001', '张 "阿姨', attempt=1)
+            r = None
+            for _ in range(100):
+                got = d.poll()
+                if got:
+                    r = got[0]
+                    break
+                time.sleep(0.02)
+        finally:
+            subprocess.run = orig
+        self.assertIsNotNone(r)
+        self.assertEqual(r.outcome, LC.PLACED,
+                         '含引号/空格的姓名不该让整通外呼失败')
+        self.assertEqual(rec['argv'],
+                         ['dialer', '--to', '1001', '--name', '张 "阿姨'],
+                         '姓名必须原样占一个 argv，不被拆成多段')
+
     def test_failure_carries_rc(self):
         import subprocess
 

@@ -58,6 +58,30 @@ void ld_wd_set_estop(ld_wd_t *w, int on, int from_button)
     }
 }
 
+void ld_wd_set_button_fault(ld_wd_t *w, int on)
+{
+    if (w == NULL) {
+        return;
+    }
+    if (on) {
+        w->fault |= LD_F_ESTOP_BUTTON;
+    } else {
+        w->fault &= (uint16_t)~LD_F_ESTOP_BUTTON;
+    }
+}
+
+void ld_wd_set_fault(ld_wd_t *w, uint16_t mask, int on)
+{
+    if (w == NULL) {
+        return;
+    }
+    if (on) {
+        w->fault |= mask;
+    } else {
+        w->fault &= (uint16_t)~mask;
+    }
+}
+
 void ld_wd_tick(ld_wd_t *w, uint32_t now_ms)
 {
     uint8_t fresh;
@@ -85,6 +109,16 @@ void ld_wd_tick(ld_wd_t *w, uint32_t now_ms)
     if (!w->enabled) {
         w->hold_zero = 0;
     }
+}
+
+void ld_wd_invalidate(ld_wd_t *w)
+{
+    if (w == NULL) {
+        return;
+    }
+    w->enabled = 0;
+    w->hb_count = 0;
+    w->hold_zero = 0;
 }
 
 int ld_wd_output_enabled(const ld_wd_t *w)

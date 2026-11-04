@@ -66,7 +66,11 @@ cleanup() {
 }
 # TERM/INT 覆盖 `docker stop` / Ctrl+C；EXIT 兜住「某个 launch 自己挂了」
 # 之后的正常退出路径。CLEANED 保证只跑一次。
-trap cleanup TERM INT EXIT
+# I-004：STOPPING 只在收到终止信号时置位（EXIT 那次 cleanup 不置），用来区分
+# 「人为 stop（正常退出 0）」和「被监控进程自己挂了（异常，退非零让编排重启）」。
+STOPPING=0
+trap 'STOPPING=1; cleanup' TERM INT
+trap cleanup EXIT
 
 # 1) 上游唯一必需的补丁（幂等；失败则直接退出，不带着坏配置继续）
 echo "=== Patching upstream ==="
@@ -225,11 +229,21 @@ echo "  System: PID ${SYS_PID:-未启动} (log /tmp/system.log)"
 echo "  LED log: /tmp/lightdog_led.log (via ros2 launch)"
 echo ""
 
-# `|| true` 不是可有可无的：脚本开头是 `set -e`，而 `wait -n` 会返回
-# **先退出的那个子进程的退出码**。任何一个 launch 以非零退出时，这一行会让
-# shell 当场退出 —— 后面的清理代码一行都不执行，于是所有节点变成孤儿，
-# 下次 `docker restart` 起来后两份节点同时抢话题。清理现在交给 trap，
-# 这里只需要「等到有事发生」。
-wait -n $SIM_PID $SLAM_PID || true
-echo "A process exited, shutting down..."
-exit 0
+# I-004：等到「有事发生」。监控集合里必须包含 twist_mux —— 它是 /cmd_mux 的
+# 安全仲裁者，掉了就没有人兜零，比 sim/slam 挂掉更该惊动编排。`wait -n` 返回
+# **先退出的那个子进程的退出码**；用 `|| rc=$?` 兜住 `set -e`，别在这一行就掀脚本。
+rc=0
+wait -n $MUX_PID $SIM_PID $SLAM_PID || rc=$?
+
+# 收尾交给 trap EXIT 里的 cleanup（递归杀进程树），这里只决定退出码。
+if [ "$STOPPING" = "1" ]; then
+  echo "Received stop signal — shutting down cleanly."
+  exit 0
+fi
+
+# 不是人为 stop，就是被监控进程自己挂了（mux / sim / slam 之一）。
+# 以前这里 `|| true; exit 0`：崩溃被当成正常退出码 0，`docker restart`/systemd
+# 的 on-failure 策略根本不会触发，运维端只看到「容器已退出(0)」= 静默死亡。
+# 现在退非零，如实报「出事了」，配合 compose 的 restart 策略才会自动拉回。
+echo "A monitored process exited unexpectedly (rc=$rc) — signaling failure."
+exit 1

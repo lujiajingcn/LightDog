@@ -35,6 +35,43 @@ extern TIM_HandleTypeDef  htim4;       /* 右编码器 */
 extern ADC_HandleTypeDef  hadc1;
 extern IWDG_HandleTypeDef hiwdg;
 
+/* ---------------------------------------------------------------- 临界区（F-003）*/
+
+/*
+ * Cortex-M 上屏蔽/恢复中断的最小实现，供 app 层把「共享看门狗状态(estop/fault)
+ * 的读-改-写」和 UART RX ISR / 按钮 EXTI ISR 互斥。app 层刻意不嵌套临界区，但这里
+ * 仍做成 PRIMASK 保存/恢复的小栈：既支持偶发嵌套，又保证「进来时若本已关中断，
+ * 出去不会误把中断打开」。临界区只包几条寄存器级语句，绝不涵盖 ADC/DMA/串口写。
+ */
+#define LD_CRIT_MAX 4u
+static volatile uint32_t crit_pmask[LD_CRIT_MAX];
+static volatile uint32_t crit_depth = 0;
+
+static void hal_enter_critical(void)
+{
+    uint32_t save = __get_PRIMASK();
+    __disable_irq();
+    if (crit_depth < LD_CRIT_MAX) {
+        crit_pmask[crit_depth] = save;
+    }
+    crit_depth++;
+}
+
+static void hal_exit_critical(void)
+{
+    uint32_t save = 0u;
+
+    if (crit_depth == 0u) {
+        /* 不配对保护：宁可维持现状，也不要凭一个多余的 exit 打开中断 */
+        return;
+    }
+    crit_depth--;
+    if (crit_depth < LD_CRIT_MAX) {
+        save = crit_pmask[crit_depth];
+    }
+    __set_PRIMASK(save);
+}
+
 /* ---------------------------------------------------------------- 时间 */
 
 static uint32_t hal_now_ms(void)
@@ -174,35 +211,54 @@ typedef struct {
 } tx_slot_t;
 
 static tx_slot_t tx_q[LD_TX_QUEUE_FRAMES];
-static uint8_t tx_head = 0;
-static uint8_t tx_tail = 0;
-static uint8_t tx_busy = 0;
+/* F-009：head/tail/busy 被两个上下文共享 —— 主循环的 hal_uart_write 改 head，
+ * UART 发送完成 DMA 中断的 lightdog_hal_tx_complete 改 tail/busy。不加 volatile，
+ * 编译器可能把 busy 判定缓存在寄存器、或把 `tx_busy=1` 重排到 HAL_UART_Transmit_DMA
+ * 之后，导致「入队了但没人启动发送」或「完成中断读到陈旧 head 误判队列空而丢帧」。
+ * 单字节队列指针在 Cortex-M 上是原子的读写，临界区只用于把 head/busy 两者保持一致。 */
+static volatile uint8_t tx_head = 0;
+static volatile uint8_t tx_tail = 0;
+static volatile uint8_t tx_busy = 0;
 
 static int hal_uart_write(const uint8_t *buf, uint32_t len)
 {
     uint8_t next;
+    uint8_t head;
     tx_slot_t *slot;
+    int start = 0;
 
     if (buf == NULL || len == 0u || len > LD_FRAME_MAX) {
         return 0;
     }
+
+    /* 入队整段做在临界区里：head/busy 的一致性不能被发送完成中断从中间打断。
+     * 里面只有 memcpy 到固定槽 + 两个字节指针运算，几微秒级，可接受。 */
+    hal_enter_critical();
 
     if (tx_busy) {
         next = (uint8_t)((tx_head + 1u) % LD_TX_QUEUE_FRAMES);
         if (next == tx_tail) {
             /* 队列满：丢**当前**这一帧而不是覆盖旧帧。旧帧已经在排队的
              * 大概率是上次的状态上报，丢了更难查。 */
+            hal_exit_critical();
             return 0;
         }
     }
 
-    slot = &tx_q[tx_head];
+    head = tx_head;
+    slot = &tx_q[head];
     memcpy(slot->buf, buf, len);
     slot->len = (uint16_t)len;
-    tx_head = (uint8_t)((tx_head + 1u) % LD_TX_QUEUE_FRAMES);
+    tx_head = (uint8_t)((head + 1u) % LD_TX_QUEUE_FRAMES);
 
     if (!tx_busy) {
         tx_busy = 1;
+        start = 1;              /* DMA 启动放到临界区外，但 busy 已在锁内置位 */
+    }
+
+    hal_exit_critical();
+
+    if (start) {
         (void)HAL_UART_Transmit_DMA(&huart2, tx_q[tx_tail].buf,
                                     tx_q[tx_tail].len);
     }
@@ -224,30 +280,56 @@ void lightdog_hal_tx_complete(void)
     (void)HAL_UART_Transmit_DMA(&huart2, tx_q[tx_tail].buf, tx_q[tx_tail].len);
 }
 
-/* ---------------------------------------------------------------- 电池 */
+/* ---------------------------------------------------------------- 电池 / 温度 */
+
+/*
+ * F-002：绝不在 tick（1kHz 上下文）里做阻塞式 ADC。
+ *
+ * 旧写法 HAL_ADC_Start + HAL_ADC_PollForConversion(2ms) 是忙等：单次转换+轮询
+ * 最坏把 CPU 顶住约 2ms，控制环抖动直接到 ms 级，还会挤掉 UART 收到的字节
+ * （而 F-010 之后电池读被安全评估以 ~10Hz 频繁调用，等于把这个坑放大 10 倍）。
+ * 正确做法：hadc1 配成 Scan + ContinuousConvMode + DMA 循环搬运，一开播就持续
+ * 把三个通道刷进 adc_raw，读的时候只取最新一拍的缓存 —— 全程零等待。
+ */
+#define LD_ADC_CH_NUM 3u
+/* [0]=电池分压 [1]=电流 [2]=温度 NTC；顺序必须与 CubeMX 里的扫描序列一致 */
+static volatile uint16_t adc_raw[LD_ADC_CH_NUM] __attribute__((aligned(4)));
+static uint8_t adc_started = 0;
+
+static void adc_ensure_started(void)
+{
+    if (adc_started) {
+        return;
+    }
+    /* 需要 hadc1 在 CubeMX 里配好：多通道 Scan、ContinuousConvMode、DMA 循环。 */
+    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_raw, LD_ADC_CH_NUM) == HAL_OK) {
+        adc_started = 1;
+    }
+}
+
+/* 换算系数按实际分压电阻/分流器/热敏电阻改，写错的表现是「电量永远 100%」
+ * 或「刚充满就报 0%」（后者会误触发回充）。 */
+#define LD_VREF          3.3f
+#define LD_ADC_FULLSCALE 4095.0f
+#define LD_BAT_DIV       4.0f                 /* 分压比 4:1 -> x4 */
+#define LD_AMPS_PER_VOLT 0.0f                 /* 电流通道增益；没接保持 0=不判过流 */
 
 static int hal_battery_read(float *pct, float *volt, float *amp)
 {
-    /* ADC 读分压；电流用 INA219/INA226 的话走 I2C，这里给的是 ADC 版本。
-     * 换算系数必须按实际分压电阻算，写错的表现是「电量永远 100%」
-     * 或「刚充满就报 0%」——后者会误触发回充。 */
-    uint32_t raw = 0;
-    float v_ref = 3.3f;
+    uint16_t rv;
+    uint16_t rc;
     float v_bat;
 
-    (void)amp;
-    if (HAL_ADC_Start(&hadc1) != HAL_OK) {
+    adc_ensure_started();
+    if (!adc_started) {
+        /* ADC 起不来就这拍不报：上层会跳过，绝不报 0% 去误触发回充 */
         return 0;
     }
-    if (HAL_ADC_PollForConversion(&hadc1, 2) != HAL_OK) {
-        HAL_ADC_Stop(&hadc1);
-        return 0;
-    }
-    raw = HAL_ADC_GetValue(&hadc1);
-    HAL_ADC_Stop(&hadc1);
 
-    /* 分压比 4:1 -> 电池电压 = adc 电压 x 4 */
-    v_bat = ((float)raw / 4095.0f) * v_ref * 4.0f;
+    rv = adc_raw[0];              /* 单次 16 位读，DMA 只会整体刷新，取到的是某拍的快照 */
+    rc = adc_raw[1];
+
+    v_bat = ((float)rv / LD_ADC_FULLSCALE) * LD_VREF * LD_BAT_DIV;
     if (volt != NULL) {
         *volt = v_bat;
     }
@@ -264,8 +346,31 @@ static int hal_battery_read(float *pct, float *volt, float *amp)
         *pct = p;
     }
     if (amp != NULL) {
-        *amp = 0.0f;               /* 没有电流采样就报 0，别瞎猜 */
+        /* 有电流采样时按增益换算；没接（增益 0）就报 0，OVERCURRENT 不会据此误触发 */
+        *amp = ((float)rc / LD_ADC_FULLSCALE) * LD_VREF * LD_AMPS_PER_VOLT;
     }
+    return 1;
+}
+
+static int hal_temp_read(float *celsius)
+{
+    uint16_t rt;
+
+    if (celsius == NULL) {
+        return 0;
+    }
+    adc_ensure_started();
+    if (!adc_started) {
+        return 0;
+    }
+    rt = adc_raw[2];
+    if (rt == 0u) {
+        /* 通道没接（恒 0）当作「没有该传感器」：返回 0，上层不会据此置 OVERTEMP，
+         * 避免「没装热敏电阻却误刹车」。 */
+        return 0;
+    }
+    /* NTC 换算高度依赖具体热敏电阻 B 值与分压，这里给线性示意，务必按 datasheet 替换 */
+    *celsius = ((float)rt / LD_ADC_FULLSCALE) * LD_VREF * 100.0f;
     return 1;
 }
 
@@ -297,6 +402,24 @@ static int32_t hal_encoder_read(uint8_t side)
     return enc_total[i];
 }
 
+/*
+ * 编码器通道健康（F-010 的 ENCODER 位来源）：本函数只读一个由外部置位的标志。
+ * 谁置位由板级决定 —— 定时器溢出/换相错误中断、看门狗式「指令在动但计数长期不动」
+ * 的堵转检测、SSI/增量线的信号丢失诊断等，检测到异常时调用
+ * lightdog_hal_report_encoder_error()。没有这类硬件检测时标志恒 0，ENCODER 位不会
+ * 被误置（也就不会因为一次计数抖动把车锁死）。 */
+static volatile uint8_t enc_err_flag[2] = { 0, 0 };
+
+void lightdog_hal_report_encoder_error(uint8_t side, int err)
+{
+    enc_err_flag[side ? 1u : 0u] = err ? 1u : 0u;
+}
+
+static int hal_encoder_error(uint8_t side)
+{
+    return (int)enc_err_flag[side ? 1u : 0u];
+}
+
 /* ---------------------------------------------------------------- 看门狗 */
 
 static void hal_iwdg_feed(void)
@@ -317,7 +440,13 @@ static const ld_hal_t g_lightdog_hal = {
     hal_uart_write,
     hal_battery_read,
     hal_encoder_read,
-    hal_iwdg_feed
+    hal_iwdg_feed,
+    /* 可选段（顺序必须与 lightdog_hal.h 一致）：接上后 F-003 的临界区与
+     * F-010 的过温/编码器健康在真机上才真正生效。 */
+    hal_enter_critical,
+    hal_exit_critical,
+    hal_temp_read,
+    hal_encoder_error
 };
 
 const ld_hal_t *lightdog_hal_stm32f4(void)

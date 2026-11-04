@@ -28,7 +28,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness import (  # noqa: E402
-    Clock, Log, Msg, Pub, bind, extract_class, extract_const, extract_funcs,
+    Clock, Log, Msg, Pub, Twist, bind, extract_class, extract_const, extract_funcs,
     extract_methods, source_of,
 )
 
@@ -685,6 +685,260 @@ class TestRecorderWritePressure(unittest.TestCase):
         self.assertEqual(r._dropped_segments, 1, '丢弃没记账，手机端看不到')
         seqs = [r._flush_q.get_nowait()['seq'] for _ in range(2)]
         self.assertEqual(seqs, [1, 2], '丢的不是最老的段（录像应该保最近的）')
+
+
+# ---------------------------------------------------------------- P-001 clips 竞态
+
+def make_clips_recorder(tmpdir):
+    """只装配 clips 索引相关方法的 Recorder 假件（P-001 回归用）。
+
+    _append_index 由「写盘线程」调用，_gc 由「定时器线程」调用，二者共享
+    self.clips 与 clips.jsonl。旧实现无锁：gc 在 `for c in self.clips` 遍历时
+    append 会让它抛 RuntimeError，或 `self.clips = keep` 覆盖掉刚 append 的段。
+    """
+    r = type('Recorder', (), {})()
+    r.clips = []
+    r._clips_lock = threading.Lock()
+    r.clips_dir = tmpdir
+    r.index_path = os.path.join(tmpdir, 'clips.jsonl')
+    r.session = 1
+    r.retain_sec = 0.0          # 让时间维度 gc 每次都清空（最大化 rebind 交错）
+    r.min_segments = 0
+    r.max_disk_mb = 1e12        # 关掉容量维度，只测并发安全
+    r.get_logger = lambda: Log()
+    bind(r, extract_methods(
+        REC, 'Recorder',
+        {'_append_index', '_gc', '_clip_path', '_drop_clip', '_rewrite_index'},
+        ns={'os': os, 'json': json, 'time': time}))
+    return r
+
+
+class TestRecorderClipsRace(unittest.TestCase):
+
+    def test_concurrent_append_and_gc_is_safe(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        r = make_clips_recorder(d)
+        errs = []
+        stop = threading.Event()
+        n_workers, per_worker = 4, 200
+
+        def worker(base):
+            try:
+                for i in range(per_worker):
+                    seq = base * per_worker + i
+                    rec = {'file': 'seg_%06d.mp4' % seq, 'seq': seq,
+                           't0': float(seq), 't1': float(seq) + 1,
+                           'wall': time.time(), 'frames': 1, 'fps': 1.0,
+                           'bytes': 10, 'session': r.session}
+                    r._append_index(rec)
+            except Exception as e:                      # noqa: BLE001
+                errs.append(e)
+
+        def gc_loop():
+            try:
+                while not stop.is_set():
+                    r._gc()
+                    time.sleep(0.001)
+            except Exception as e:                      # noqa: BLE001
+                errs.append(e)
+
+        ts = [threading.Thread(target=worker, args=(k,)) for k in range(n_workers)]
+        g = threading.Thread(target=gc_loop)
+        g.start()
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        stop.set()
+        g.join()
+
+        self.assertEqual(errs, [], f'clips 并发访问抛异常：{errs!r}')
+
+        # 静置后单线程收敛一次：内存列表与磁盘索引必须一一对应（旧代码会错位/丢行）。
+        r._gc()
+        with open(r.index_path, encoding='utf-8') as f:
+            lines = [ln for ln in f if ln.strip()]
+        self.assertEqual(len(lines), len(r.clips),
+                         'clips.jsonl 行数与 self.clips 长度不一致（并发写串了）')
+        # 每一行都必须是合法 JSON 且带 file（半行=交错写坏文件的证据）。
+        for ln in lines:
+            rec = json.loads(ln)
+            self.assertTrue(rec.get('file'), '索引行缺 file，疑似被并发写破坏')
+
+
+# ---------------------------------------------------------------- P-004 阻塞回调
+
+IDLE, ALIGNING, DOCKING, DOCKED, UNDOCKING = (
+    'IDLE', 'ALIGNING', 'DOCKING', 'DOCKED', 'UNDOCKING')
+
+
+class _NoWaitClient:
+    """假 ActionClient：wait_for_server 一旦被调用就判失败（P-004 的核心）。
+
+    server_is_ready() 由测试控制；send_goal_async 记录发出的 goal。
+    """
+
+    def __init__(self, ready=False):
+        self.ready = ready
+        self.sent = []
+        self.wait_called = False
+
+    def wait_for_server(self, timeout_sec=None):
+        self.wait_called = True
+        raise AssertionError(
+            '回调线程里调用了 wait_for_server —— 会冻结单线程执行器最多 2s')
+
+    def server_is_ready(self):
+        return self.ready
+
+    def send_goal_async(self, goal, feedback_cb=None):
+        self.sent.append(goal)
+
+        class _F:
+            def add_done_callback(self, cb):
+                pass
+        return _F()
+
+
+class _Goal:
+    def __init__(self):
+        self.use_dock_id = False
+        self.dock_id = ''
+        self.navigate_to_staging_pose = False
+        self.max_staging_time = 0.0
+        self.dock_type = ''
+        self.max_undocking_time = 0.0
+
+
+class _Robot:
+    Goal = _Goal
+
+
+def make_action_dock(dock_ready=False, undock_ready=False):
+    d = type('DockManager', (), {})()
+    d.state = IDLE
+    d.busy = False
+    d.retries = 0
+    d.max_retries = 3
+    d.auto_dock = True
+    d.cooldown_until = 0.0
+    d.retry_until = 0.0
+    d.retry_cooldown = 10.0
+    d.cancel_cooldown = 120.0
+    d._inhibit_until = 0.0
+    d.low_since = None
+    d._last_tick_ros = None
+    d.dock_id = 'dock_1'
+    d.navigate_to_staging = True
+    d.max_staging_time = 30.0
+    d.max_undocking_time = 30.0
+    d.action_connect_timeout = 2.0
+    d.sim_charging = False
+    d._dock_epoch = 0
+    d._undock_epoch = 0
+    d._dock_goal_handle = None
+    d._undock_goal_handle = None
+    d._dock_future = None
+    d._undock_future = None
+    d._pending_dock_goal = False
+    d._dock_pending_deadline = 0.0
+    d._pending_undock = False
+    d._undock_pending_deadline = 0.0
+    d.dock_client = _NoWaitClient(ready=dock_ready)
+    d.undock_client = _NoWaitClient(ready=undock_ready)
+    d.pub_ratio = Pub()
+    d.pub_state = Pub()
+    d.pub_inhibit = Pub()
+    d.pub_vel = Pub()
+    d.log = Log()
+    d.clock = Clock()
+    d.get_clock = lambda: d.clock
+    d.get_logger = lambda: d.log
+    d.battery_ratio = lambda: 0.5
+    d.on_dock_feedback = lambda m: None
+    d.on_dock_goal_response = lambda f, e: None
+    d.on_undock_goal_response = lambda f, e: None
+    ns = {'time': time, 'DockRobot': _Robot, 'UndockRobot': _Robot,
+          'Float32': Msg, 'String': Msg, 'Bool': Msg, 'Twist': Twist,
+          'IDLE': IDLE, 'ALIGNING': ALIGNING, 'DOCKING': DOCKING,
+          'DOCKED': DOCKED, 'UNDOCKING': UNDOCKING}
+    bind(d, extract_methods(
+        DOCK, 'DockManager',
+        {'tick', 'send_dock_goal', '_drive_dock_goal', 'start_undocking',
+         '_drive_undock', 'cancel', '_log_cancel'}, ns=ns))
+    return d
+
+
+class TestDockNonBlockingConnect(unittest.TestCase):
+
+    def test_send_dock_goal_never_calls_wait_for_server(self):
+        d = make_action_dock(dock_ready=False)
+        d.busy = True
+        # 旧代码这里会 wait_for_server(2.0) -> _NoWaitClient 抛断言。新代码不应抛。
+        d.send_dock_goal()
+        self.assertFalse(d.dock_client.wait_called,
+                         'send_dock_goal 仍在阻塞等 server（会冻结回调线程）')
+        self.assertTrue(d._pending_dock_goal, 'server 没就绪时应转入挂起')
+        self.assertEqual(d.state, DOCKING)
+        self.assertEqual(d.dock_client.sent, [], 'server 没就绪不该发 goal')
+
+    def test_pending_dock_sends_once_server_appears(self):
+        d = make_action_dock(dock_ready=False)
+        d.busy = True
+        d.send_dock_goal()
+        d._drive_dock_goal(now=time.monotonic())      # 仍未就绪
+        self.assertTrue(d._pending_dock_goal)
+        self.assertEqual(d.dock_client.sent, [])
+        # server 上线：下一帧 tick 应真正发出，并清挂起
+        d.dock_client.ready = True
+        d.tick()
+        self.assertFalse(d._pending_dock_goal, '就绪后应清掉挂起标记')
+        self.assertEqual(len(d.dock_client.sent), 1, '就绪后应发出 DockRobot goal')
+        self.assertEqual(d.state, DOCKING)
+        self.assertTrue(d.busy)
+
+    def test_dock_gives_up_after_deadline(self):
+        d = make_action_dock(dock_ready=False)
+        d.busy = True
+        d.send_dock_goal()
+        d._dock_pending_deadline = time.monotonic() - 0.1   # 假装已超时
+        d.tick()
+        self.assertFalse(d._pending_dock_goal)
+        self.assertEqual(d.state, IDLE, '超时后应退回 IDLE')
+        self.assertFalse(d.busy)
+        self.assertEqual(d.dock_client.sent, [])
+
+    def test_undock_pending_and_timeout(self):
+        d = make_action_dock(undock_ready=False)
+        d.start_undocking()
+        self.assertFalse(d.undock_client.wait_called,
+                         'start_undocking 仍在阻塞等 server')
+        self.assertTrue(d._pending_undock)
+        self.assertEqual(d.state, UNDOCKING)
+        self.assertTrue(d.busy, '挂起期间 busy 应为真，防重复发起')
+        d.undock_client.ready = True
+        d.tick()
+        self.assertFalse(d._pending_undock)
+        self.assertEqual(len(d.undock_client.sent), 1)
+
+        # 超时分支
+        d2 = make_action_dock(undock_ready=False)
+        d2.start_undocking()
+        d2._undock_pending_deadline = time.monotonic() - 0.1
+        d2.tick()
+        self.assertEqual(d2.state, IDLE)
+        self.assertFalse(d2.busy)
+
+    def test_cancel_clears_pending_request(self):
+        d = make_action_dock(dock_ready=False)
+        d.busy = True
+        d.send_dock_goal()
+        self.assertTrue(d._pending_dock_goal)
+        d.cancel()
+        self.assertFalse(d._pending_dock_goal,
+                         '取消后挂起 goal 必须清掉，否则下一帧会复活已取消的流程')
+        self.assertEqual(d.dock_client.sent, [])
 
 
 # ---------------------------------------------------------------- 告警命令

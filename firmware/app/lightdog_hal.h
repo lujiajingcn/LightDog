@@ -49,6 +49,24 @@ typedef struct {
      * **只允许在收到合法心跳时调用**（见 lightdog_app.c 的 handle_frame）。
      * 放进 while(1) 里喂，主循环卡死时照样喂，等于没有看门狗。 */
     void (*iwdg_feed)(void);
+
+    /* ---- 以下为可选项，NULL 表示该能力不存在，上层自动跳过 ---- */
+
+    /* 临界区：短暂屏蔽中断，用来把「共享看门狗状态（estop / fault 掩码）」的
+     * 读-改-写做成原子，防止 UART ISR / 按钮 ISR / 1kHz tick 三个上下文互相
+     * 打断（见 F-003）。务必**成对、且只包住最少的几条语句**——里面不要做
+     * ADC、三角函数、 uart 写这类慢操作，否则等于把中断关了几十微秒丢串口字节。
+     * 允许被嵌套调用前先自查：app 层刻意不嵌套。 */
+    void (*enter_critical)(void);
+    void (*exit_critical)(void);
+
+    /* 读板载温度（摄氏度）。返回 0 表示这次读失败或没有该传感器
+     * （上层不会据此置 OVERTEMP，避免传感器没接就误刹车）。 */
+    int (*temp_read)(float *celsius);
+
+    /* 编码器通道健康检查。side: 0=左 1=右。返回非 0 表示该侧编码器故障
+     * （如定时器溢出、信号丢失）。没有该能力时置 NULL，ENCODER 位不会被自动置位。 */
+    int (*encoder_error)(uint8_t side);
 } ld_hal_t;
 
 #endif /* LIGHTDOG_HAL_H */

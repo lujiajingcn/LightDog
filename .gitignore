@@ -20,5 +20,12 @@ linorobot2/
 ## P4 录像数据（存储卡的宿主副本：clips/ events/ snapshots/ contacts.json）
 data/
 
+## 环境变量 / 令牌：真机里 .env 会填 LIGHTDOG_TOKEN 等敏感值，不入库。
+## 提交 .env.example 作为模板；.env 本身被忽略（见 sim/.env.example）。
+.env
+*/.env
+!.env.example
+!*/.env.example
+
 ## WorkBuddy 本地工作区数据（memory、临时脚本、上游副本），不入库
 .workbuddy/

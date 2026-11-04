@@ -43,6 +43,16 @@ typedef struct {
     /* 急停/故障状态的重发周期。串口没有 DDS 的 TRANSIENT_LOCAL，
      * 丢一帧就是丢了，所以必须周期重发而不是只发变化。 */
     uint16_t state_period_ms;
+
+    /* ---- 安全阈值（F-010：把协议里「过流/欠压/过温保护关 PWM」真正接上）----
+     * OVERCURRENT / UNDERVOLTAGE / OVERTEMP 命中时 tick 会强制断使能（等于一次
+     * 内部急停），故障恢复并经迟滞解除后，仍需重新攒够 3 帧心跳才恢复出力。
+     * ENCODER 只置位上报、不断电（编码器坏了车还能停，不至于因一次计数异常锁死）。
+     * 阈值 <=0 表示该项检查关闭；safety_period_ms=0 表示整体关闭。 */
+    uint16_t safety_period_ms;   /* 安全评估周期（建议 ~100ms） */
+    float    max_current_a;      /* 电流超过即过流 */
+    float    min_voltage_v;      /* 电压低于即欠压 */
+    float    max_temp_c;         /* 温度高于即过温（需要 hal.temp_read） */
 } ld_app_cfg_t;
 
 typedef struct {
@@ -60,6 +70,13 @@ typedef struct {
     uint8_t estop_from_host;   /* 上位机最近一次下发的要求 */
     uint8_t button_pressed;    /* 物理按钮当前状态（按下时上位机不能解除） */
     uint8_t state_dirty;       /* 急停/故障有变化，下一拍立刻上报 */
+
+    /* 安全故障（F-010）运行时状态 */
+    uint8_t  safety_lock;      /* 电气/热故障触发的内部断使能闭锁 */
+    uint8_t  oc_tripped;       /* 过流迟滞锁存：置位后需降到释放阈值才解除 */
+    uint8_t  uv_tripped;       /* 欠压迟滞锁存 */
+    uint8_t  ot_tripped;       /* 过温迟滞锁存 */
+    uint32_t last_safety_ms;   /* 上次安全评估时刻 */
 
     /* 里程计 */
     float odom_x;

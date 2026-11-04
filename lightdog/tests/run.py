@@ -27,6 +27,7 @@ GROUPS = [
     ('test_p3', 'P3 回充状态机'),
     ('test_robustness', '真机健壮性：外部输入 / 传感器失效 / 充电确认'),
     ('test_system', '系统层：模式仲裁 / 语音语义 / 急停闸'),
+    ('test_infra', '部署工具回归：急停 CLI 订阅者计数（外部 vs 自发）'),
     ('test_call', '外呼通道：AMI 协议 / 结果语义 / ack 挂断'),
     ('test_mcu_proto', '下位机协议：帧编解码 / 解析边界 / 黄金向量'),
     ('test_mcu_bridge', '下位机桥接：钳位 / 急停闸 / 速度保持窗口'),
