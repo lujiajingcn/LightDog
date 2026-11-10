@@ -17,6 +17,11 @@ P1~P4 解决的是"机器人看得见、走得动、记得下、传得出"，被
 
 第 3 条里"留视频"这件事由 P4 完成，P5 只发一条消息。这个分工是刻意的，见 §3.3。
 
+> **当前硬件路线**：本项目已选普通彩色相机（见 `docs/bom.md` §二），没有深度图。
+> 下面这套 RGB-D 判据在仿真里仍完整可跑，但真机上 P5 感知层**明确停用**：
+> `fall-det` 不启动；若启动了，`depth_mode: 'off'` 会让它持续发 `unknown`。
+> 接毫米波雷达时由雷达节点直接发布 `/fall/state`，状态机不用改。
+
 ---
 
 ## 二、拓扑
@@ -190,7 +195,7 @@ alert_manager ──AMI 5038(明文,只绑 127.0.0.1)──> Asterisk ──SIP�
 
 | 文件 | 作用 |
 |---|---|
-| `lightdog/lightdog_fall_detector.py` | 感知层：RGB-D → `/fall/state` |
+| `lightdog/lightdog_fall_detector.py` | 感知层：RGB-D → `/fall/state`（普通相机下 `depth_mode: 'off'`，只发 `unknown`） |
 | `lightdog/lightdog_alert_manager.py` | 决策层：两级确认状态机 |
 | `lightdog/config/p5_params.yaml` | 全部阈值与时间参数（含每条的理由） |
 | `lightdog/launch/lightdog_p5.launch.py` | 起上面两个节点 |

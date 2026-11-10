@@ -91,6 +91,9 @@
     align_scan_rate: 0.50     # 看不见 marker 时的扫描角速度（sim time），约 12.6s 一圈
     align_timeout: 150.0      # 墙钟秒；软件渲染实时因子约 0.25x，转一圈要 50-60s 墙钟
     cmd_vel_topic: /cmd_vel_dock
+    # 等 docking/undocking action server 上线的最长墙钟秒数。代码走非阻塞
+    # 轮询 server_is_ready()，这个值只是放弃上限，不会冻结执行器。
+    action_connect_timeout: 2.0
 
     # 仿真补丁：Gazebo 的 LinearBatteryPlugin 只放电不充电，不打开这个就
     # 永远等不到"充满"，状态机后半段（DOCKED -> UNDOCKING）没法验证。

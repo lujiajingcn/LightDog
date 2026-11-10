@@ -42,6 +42,16 @@
     depth_timeout: 1.0
     publish_debug: true
 
+    # 深度来源：on（默认，深度相机在位）/ off（普通彩色相机）。
+    # 本节点**没有单目降级路径**：z_p95 就是逐像素深度反投影出来的，
+    # 没有深度就算不出离地高度。off 时不订阅深度、持续发
+    # /fall/state=unknown，绝不静默装死，也不会误报 standing/lying。
+    # ⚠️ 值必须加引号：YAML 1.1 把裸写的 on/off 当成布尔，
+    #    `depth_mode: off` 会变成 False，停用就静默失效了。
+    # 真机走普通相机路线时改成 'off'，并在 deploy/nodes.conf 里把
+    # fall-det 设成 no；接毫米波雷达后让雷达节点直接发布 /fall/state。
+    depth_mode: 'on'
+
 /lightdog_alert_manager:
   ros__parameters:
     use_sim_time: true

@@ -35,6 +35,7 @@ GROUPS = [
     ('test_soak_load', '浸泡载荷：流式字节判据 / 汇总退出码'),
     ('test_acceptance', '真机验收判据：零速前置必须来自真实观测'),
     ('test_onnx_detector', 'onnx 检测后端：letterbox / 解码 / NMS / 回退'),
+    ('test_monocular', '普通相机路线：depth_mode 三态 / 按后端选单目高度 / P5 不静默'),
     ('test_consistency', '参数与版本一致性'),
 ]
 

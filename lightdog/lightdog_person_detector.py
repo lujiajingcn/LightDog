@@ -41,9 +41,17 @@ LightDog 人体检测器（P2 / 场景 1）
 
 ## 输入
 
-    /camera/color/image_raw          sensor_msgs/Image   640x480 @30Hz
-    /camera/depth/image_rect_raw     sensor_msgs/Image   与彩色图同尺寸
-    /camera/color/camera_info        sensor_msgs/CameraInfo（取 fx / cx）
+    /camera/color/image_raw          sensor_msgs/Image   640x480 @30Hz（必需）
+    /camera/depth/image_rect_raw     sensor_msgs/Image   与彩色图同尺寸（可选，
+                                      depth_mode=off 时不订阅）
+    /camera/color/camera_info        sensor_msgs/CameraInfo（取 fx / cx，必需）
+
+## 深度是可选的
+
+`depth_mode` 三态：auto（有就用、没有退回单目）/ on（必须有，拿不到判无人）/
+off（普通相机，不订阅深度）。单目时距离由 `mono_height_* / 像素高度` 估算，
+按检测后端自动选参考高度 —— color 框橙色上衣用 0.62m，onnx/yolo 框整个人用
+1.70m。用错的比例是 2.7 倍，见 docs/bom.md §二「常数陷阱」。
 
 ## 相机安装
 
@@ -330,6 +338,43 @@ def check_onnx_input(shape, want_size):
     return None
 
 
+def normalize_depth_mode(raw):
+    """把 depth_mode 收敛成 auto / on / off，返回 (mode, 错误说明或 None)。
+
+    auto：有深度就用，拿不到就退回单目（兼容仿真和旧配置）
+    on  ：必须有深度，拿不到判无人 —— 防止 align_depth 没开时静默降级
+    off ：普通相机，根本不建深度订阅
+    YAML 1.1 会把裸写的 on/off/yes/no 解析成 bool，所以配置里必须给值加引号；
+    这里显式识别 bool 并报出原因，否则「写了 off 却没生效」会变成静默故障。
+    """
+    if isinstance(raw, bool):
+        return 'auto', (f'YAML 裸写 on/off 会被解析成布尔 {raw!r}；'
+                        "请给值加引号，例如 depth_mode: 'off'")
+    mode = str(raw).strip().lower()
+    if mode in ('auto', 'on', 'off'):
+        return mode, None
+    return 'auto', f'未知 depth_mode={raw!r}（只认 auto / on / off），按 auto 运行'
+
+
+def resolve_mono_height(backend, h_color, h_person):
+    """按检测后端选单目测距的参考高度（米）；非法值返回 None。
+
+    z = H * fx / px_h 里的 H 必须等于「框里实际看到的那段高度」：
+      color 后端只框橙色上衣（约 0.62m）
+      onnx / yolo 后端框的是整个人（约 1.70m）
+    用错会按 0.62/1.70 ≈ 36% 的比例把人算近，而且 range_min 会放行 ——
+    表现成「跟得太近」，不报错。所以按后端自动选，不让人去记这件事。
+    """
+    h = h_color if backend == 'color' else h_person
+    try:
+        h = float(h)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(h) or h <= 0.0:
+        return None
+    return h
+
+
 class PersonDetector(Node):
 
     def __init__(self):
@@ -397,8 +442,24 @@ class PersonDetector(Node):
         # 在真机上 1.5s 还没新帧就说明管线已经死了。
         self.declare_parameter('frame_timeout', 1.5)
         # 深度图单独判：彩色在出帧、深度掉了，是最常见的半失效状态。
-        # 这时不要拿旧深度配新彩色，退回「躯干高度/像素高度」粗估。
+        # 这时不要拿旧深度配新彩色，退回「参考高度/像素高度」粗估。
         self.declare_parameter('depth_timeout', 1.0)
+
+        # ---- 深度来源 ----
+        # auto（默认）：有深度就用，超时或压根没有就退回单目，不报错。
+        # on  ：声明必须有深度。拿不到就判无人并报错 —— 真机 D435 的
+        #       align_depth 没开时会悄悄降级成「跟得太近」，这条能把它喊出来。
+        # off ：普通彩色相机。不建深度订阅，启动日志明确写出测距精度等级。
+        self.declare_parameter('depth_mode', 'auto')
+
+        # ---- 单目测距的参考高度（米）----
+        # z = H * fx / px_h。H 必须等于检测框里**实际看到**的那段高度：
+        #   mono_height_color  : color 后端只框橙色上衣，约 0.62m
+        #   mono_height_person : onnx/yolo 框整个人，约 1.70m
+        # 真机上按使用者的实际身高标定 mono_height_person。这两个值是
+        # 单目测距唯一的精度来源，见 docs/bom.md §二「常数陷阱」。
+        self.declare_parameter('mono_height_color', 0.62)
+        self.declare_parameter('mono_height_person', 1.70)
 
         p = self.get_parameter
         self.cam_off = list(p('camera_offset').value)
@@ -436,6 +497,22 @@ class PersonDetector(Node):
                 f'未知 backend={self.backend!r}（只认 color / yolo / onnx），'
                 '按 color 运行')
             self.backend = 'color'
+
+        # backend 到这里才最终确定（上面可能因加载失败回退到 color），
+        # 所以参考高度必须**在这之后**选，否则 onnx 加载失败时会拿 1.70
+        # 去配 color 的橙色上衣框，距离直接偏 2.7 倍。
+        self.depth_mode, err = normalize_depth_mode(p('depth_mode').value)
+        if err is not None:
+            self.get_logger().error(err)
+        self.mono_height = resolve_mono_height(
+            self.backend, p('mono_height_color').value,
+            p('mono_height_person').value)
+        if self.mono_height is None:
+            self.mono_height = 0.62 if self.backend == 'color' else 1.70
+            self.get_logger().error(
+                'mono_height_* 必须是正数，已回退到 %.2fm' % self.mono_height)
+        self._warned_depth_required = False
+
         self.h_min, self.h_max = p('h_min').value, p('h_max').value
         self.s_min = float(p('s_min').value)
         self.v_min = float(p('v_min').value)
@@ -476,8 +553,9 @@ class PersonDetector(Node):
 
         self.create_subscription(
             Image, p('rgb_topic').value, self._on_rgb, sensor_qos)
-        self.create_subscription(
-            Image, p('depth_topic').value, self._on_depth, sensor_qos)
+        if self.depth_mode != 'off':
+            self.create_subscription(
+                Image, p('depth_topic').value, self._on_depth, sensor_qos)
         self.create_subscription(
             CameraInfo, p('info_topic').value, self._on_info, sensor_qos)
 
@@ -489,11 +567,20 @@ class PersonDetector(Node):
 
         self.get_logger().info(
             'LightDog person detector ready: '
-            f'backend={self.backend} '
+            f'backend={self.backend} depth_mode={self.depth_mode} '
+            f'mono_height={self.mono_height:.2f}m '
             f'H=[{self.h_min:.3f},{self.h_max:.3f}] S>{self.s_min} V>{self.v_min} '
             f'range=[{self.rng_min},{self.rng_max}]m '
             f'aspect_min={self.aspect_min} min_h={self.min_h}px '
             f'frame_timeout={self.frame_timeout:.1f}s')
+        if self.depth_mode == 'off':
+            self.get_logger().warn(
+                '单目模式（depth_mode=off）：距离由 %.2fm 参考高度估算，'
+                '精度约 ±10~20cm，不是深度相机的 ±2cm。'
+                '按实际身高标定 mono_height_person' % self.mono_height)
+        elif self.depth_mode == 'on':
+            self.get_logger().info(
+                'depth_mode=on：深度不可用时判无人，不会静默改用单目')
 
     # ---------- 后端加载 ----------
 
@@ -886,34 +973,49 @@ class PersonDetector(Node):
             f'onnx 平均推理 {avg:.0f}ms（约 {fps:.1f} FPS）')
 
     def _bbox_to_point(self, rgb, bbox, mask):
-        """外接框 + 深度 -> base_link 下的 3D 点。两个后端共用这一段。"""
+        """外接框 + 深度（或单目粗估）-> base_link 下的 3D 点。各后端共用。"""
         h, w, _ = rgb.shape
         u0, v0, u1, v1 = bbox
 
         # 距离：掩码像素上的深度中位数（避开背景深度把目标拉远）
         z = None
-        dmsg = self.depth
-        # 深度也要判新鲜度：彩色在出帧、深度掉了的时候，拿旧深度配新彩色
-        # 会把人物的位置算到上一次的位置上（人走动时表现为「距离粘住」）。
-        if (dmsg is not None
-                and (time.monotonic() - self.depth_wall) <= self.depth_timeout):
-            d = image_to_depth(dmsg)
-            if d is not None and d.shape == (h, w):
-                sub_d = d[v0:v1 + 1, u0:u1 + 1]
-                if mask is not None:
-                    # 颜色后端：只统计「人身上」的像素，避开框内的背景深度
-                    vals = sub_d[mask[v0:v1 + 1, u0:u1 + 1]]
-                else:
-                    # 模型后端没有掩膜：用整框（框比人略大，中位数仍然稳）
-                    vals = sub_d.reshape(-1)
-                vals = vals[np.isfinite(vals) & (vals > 0.05)]
-                if vals.size >= 20:
-                    z = float(np.median(vals))
+        if self.depth_mode != 'off':
+            dmsg = self.depth
+            # 深度也要判新鲜度：彩色在出帧、深度掉了的时候，拿旧深度配新彩色
+            # 会把人物的位置算到上一次的位置上（人走动时表现为「距离粘住」）。
+            if (dmsg is not None
+                    and (time.monotonic() - self.depth_wall) <= self.depth_timeout):
+                d = image_to_depth(dmsg)
+                if d is not None and d.shape == (h, w):
+                    sub_d = d[v0:v1 + 1, u0:u1 + 1]
+                    if mask is not None:
+                        # 颜色后端：只统计「人身上」的像素，避开框内的背景深度
+                        vals = sub_d[mask[v0:v1 + 1, u0:u1 + 1]]
+                    else:
+                        # 模型后端没有掩膜：用整框（框比人略大，中位数仍然稳）
+                        vals = sub_d.reshape(-1)
+                    vals = vals[np.isfinite(vals) & (vals > 0.05)]
+                    if vals.size >= 20:
+                        z = float(np.median(vals))
+
+        if z is None and self.depth_mode == 'on':
+            # 声明了必须有深度却拿不到 —— 不能悄悄用单目顶上。真机
+            # align_depth 没开时深度尺寸不符会走到这里；放行单目的话，运维
+            # 以为自己在用 ±2cm 的精度，实际是 ±12cm，且日志一片安静。
+            if not self._warned_depth_required:
+                self._warned_depth_required = True
+                self.get_logger().error(
+                    'depth_mode=on 但深度图不可用（没收到 / 超时 / 尺寸不符），'
+                    '本帧判无人。检查 align_depth 与 depth_topic')
+            return None
+        if z is not None:
+            self._warned_depth_required = False
 
         if z is None:
-            # 深度缺失时用「躯干高度/像素高度」粗估，仅用于不中断闭环
+            # 单目：z = 参考高度 * fx / 像素高度。H 按后端自动选，见
+            # resolve_mono_height —— 写死 0.62 会在换 onnx 后端时把人算近 2.7 倍。
             px_h = max(1, v1 - v0 + 1)
-            z = 0.62 * self.fx / float(px_h)
+            z = self.mono_height * self.fx / float(px_h)
 
         if not (self.rng_min <= z <= self.rng_max):
             if self.publish_debug:

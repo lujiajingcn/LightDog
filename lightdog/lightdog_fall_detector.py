@@ -3,7 +3,7 @@
 LightDog P5：跌倒检测（姿态判定）
 
     订阅 /camera/color/image_raw        sensor_msgs/Image
-    订阅 /camera/depth/image_rect_raw   sensor_msgs/Image
+    订阅 /camera/depth/image_rect_raw   sensor_msgs/Image（depth_mode=off 时不订阅）
     订阅 /camera/color/camera_info      sensor_msgs/CameraInfo
     发布 /fall/state        std_msgs/String   standing | lying | absent | unknown
     发布 /fall/z_p95        std_msgs/Float32  人体点云离地高度的 95 分位（米）
@@ -110,6 +110,24 @@ def image_to_depth(msg: Image):
     return None
 
 
+def normalize_fall_mode(raw):
+    """把 depth_mode 收敛成 on / off，返回 (mode, 错误说明或 None)。
+
+    off 不是「跳过检测」，而是「明确宣告本节点不可用」：持续发 unknown，
+    让告警状态机知道「我看不见」，而不是让 /fall/state 彻底沉默。
+
+    YAML 1.1 会把裸写的 on/off 解析成 bool（off -> False），那样停用会
+    静默失效。所以配置里必须给值加引号，这里也对 bool 给出明确诊断。
+    """
+    if isinstance(raw, bool):
+        return 'on', (f'YAML 裸写 on/off 会被解析成布尔 {raw!r}；'
+                      "请给值加引号，例如 depth_mode: 'off'")
+    mode = str(raw).strip().lower()
+    if mode in ('on', 'off'):
+        return mode, None
+    return 'on', f'未知 depth_mode={raw!r}（只认 on / off），按 on 运行'
+
+
 class FallDetector(Node):
 
     def __init__(self):
@@ -153,6 +171,11 @@ class FallDetector(Node):
         self.declare_parameter('frame_timeout', 1.5)
         self.declare_parameter('depth_timeout', 1.0)
         self.declare_parameter('publish_debug', True)
+        # on  ：深度相机在位，正常跑 z_p95（默认）
+        # off ：普通彩色相机 / 已改由外部传感器（如毫米波雷达）接管 /fall/state。
+        #       本节点不订阅深度，持续发 unknown，绝不静默装死。
+        #       这个节点**没有单目降级路径** —— z_p95 本身就要逐像素深度。
+        self.declare_parameter('depth_mode', 'on')
 
         p = self.get_parameter
         self.cam_off = list(p('camera_offset').value)
@@ -170,6 +193,10 @@ class FallDetector(Node):
         self.frame_timeout = float(p('frame_timeout').value)
         self.depth_timeout = float(p('depth_timeout').value)
         self.publish_debug = bool(p('publish_debug').value)
+        self.depth_mode, err = normalize_fall_mode(p('depth_mode').value)
+        if err is not None:
+            self.get_logger().error(err)
+        self._warned_no_depth = False
 
         # 光心离地高度 = base_link 高度 + 相机在 base_link 上的 z 偏移
         self.cam_z_floor = self.base_h + float(self.cam_off[2])
@@ -196,7 +223,9 @@ class FallDetector(Node):
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(Image, str(p('rgb_topic').value), self._on_rgb, sensor_qos)
-        self.create_subscription(Image, str(p('depth_topic').value), self._on_depth, sensor_qos)
+        if self.depth_mode != 'off':
+            self.create_subscription(
+                Image, str(p('depth_topic').value), self._on_depth, sensor_qos)
         self.create_subscription(CameraInfo, str(p('info_topic').value), self._on_info, sensor_qos)
 
         self.pub_state = self.create_publisher(String, '/fall/state', 10)
@@ -209,9 +238,15 @@ class FallDetector(Node):
         self.create_timer(1.0 / max(1.0, float(p('rate').value)), self._tick)
 
         self.get_logger().info(
-            f'LightDog fall detector ready: camera_z={self.cam_z_floor:.3f}m '
+            f'LightDog fall detector ready: depth_mode={self.depth_mode} '
+            f'camera_z={self.cam_z_floor:.3f}m '
             f'lying(z_p95<{self.lying_top_max:.2f}) stand(z_p95>{self.stand_top_min:.2f}) '
             f'min_pts={self.min_points}')
+        if self.depth_mode == 'off':
+            self.get_logger().error(
+                '跌倒检测已停用（depth_mode=off）：普通相机算不出 z_p95。'
+                '本节点将持续发布 /fall/state=unknown，不会误报 standing/lying。'
+                '接外部传感器时直接让它发布 /fall/state 即可，无需改本节点')
 
     # ---------- 回调 ----------
 
@@ -236,9 +271,23 @@ class FallDetector(Node):
     # ---------- 主循环 ----------
 
     def _tick(self):
-        if self.rgb is None or self.depth is None:
+        # depth_mode=off：普通相机算不了 z_p95。这里**必须持续发 unknown**，
+        # 不能 return —— 原来是 `if self.depth is None: return`，结果是节点
+        # 健康地跑着、systemd 显示 active、/fall/state 一条消息都不发，
+        # 告警状态机连「传感器坏了」和「人好好的」都分不出来。
+        if self.depth_mode == 'off':
+            self._emit_unknown()
             return
-        if self.fx is None:
+
+        if self.depth is None and not self._warned_no_depth:
+            self._warned_no_depth = True
+            self.get_logger().error(
+                'depth_mode=on 但一次深度图都没收到：普通相机？align_depth 没开？'
+                'depth_topic 写错？跌倒检测改发 unknown。'
+                '若无深度相机请设 depth_mode: off')
+        if self.rgb is None or self.depth is None or self.fx is None:
+            # 缺输入是「我看不见」，不是「没人」，必须发 unknown。
+            self._emit_unknown()
             return
 
         now_mono = time.monotonic()

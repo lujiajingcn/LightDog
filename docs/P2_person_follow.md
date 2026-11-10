@@ -37,7 +37,7 @@
 
 | 节点 | 职责 | 输入 | 输出 |
 |---|---|---|---|
-| `lightdog_person_detector` | 在画面里找到人，算出前向距离与左右偏移 | 相机 RGB-D + camera_info | `/person/present`、`/person/position`、`/person/debug_image` |
+| `lightdog_person_detector` | 在画面里找到人，算出前向距离与左右偏移 | 彩色图 + camera_info（深度可选，见 `docs/bom.md` §二） | `/person/present`、`/person/position`、`/person/debug_image` |
 | `lightdog_light_auto` | 有人亮、人走后延迟渐灭 | `/person/present` | `/led/brightness` |
 | `lightdog_follower` | 朝人走、保持 1.2m | `/person/position`、`/person/present` | `/cmd_vel_follow` |
 | `lightdog_twist_mux` | `/cmd_vel` 多源仲裁（**常驻，不属于 P2**） | `/cmd_vel_smoothed`、`/cmd_vel_follow`、`/cmd_vel_dock` | `/cmd_vel_muxed`、`/cmd_vel_mux_state` |

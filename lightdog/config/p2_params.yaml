@@ -73,7 +73,24 @@
     # 超过这个时间没有新帧就报"无人"并停止发位置 —— 否则相机冻帧/掉线后
     # 会拿最后一帧反复判"有人"，跟随器朝着画面里的幽灵一直开。
     frame_timeout: 1.5
-    depth_timeout: 1.0     # 深度单独判；超时退回"躯干高度/像素高度"粗估
+    depth_timeout: 1.0     # 深度单独判；超时退回"参考高度/像素高度"粗估
+
+    # ---- 深度来源（普通相机路线看这里）----
+    # auto（默认，仿真/深度相机通用）：有深度就用，超时或没有就退回单目。
+    # on  ：声明必须有深度。拿不到就判无人并报错，防止 align_depth 没开时
+    #       静默降级成「跟得太近」。D435 用户建议设 'on'（带引号）。
+    # off ：普通彩色相机。不订阅深度话题，启动日志明确写出单目精度等级。
+    # ⚠️ 值必须加引号：YAML 1.1 把裸写的 on/off/yes/no 当成布尔，
+    #    `depth_mode: off` 会变成 False，节点会报错并回退到 auto。
+    # **真机走普通相机路线时改成 'off'**。
+    depth_mode: 'auto'
+
+    # 单目测距 z = H * fx / px_h 里的参考高度 H（米）。按后端自动选，
+    # 不需要手动切换：color 只框橙色上衣用下面第一个，onnx/yolo 框整人用第二个。
+    # 真机按使用者的实际身高标定 mono_height_person；写错会按比例把人算近，
+    # 而 range_min 会放行 —— 见 docs/bom.md §二「常数陷阱」。
+    mono_height_color: 0.62
+    mono_height_person: 1.70
 
 /lightdog_light_auto:
   ros__parameters:
