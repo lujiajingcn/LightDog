@@ -29,9 +29,16 @@
 #define LD_MAX_WHEEL_MPS     0.75f
 
 extern UART_HandleTypeDef huart2;
-extern TIM_HandleTypeDef  htim1;       /* 4 路互补 PWM */
+extern TIM_HandleTypeDef  htim1;       /* 4 路互补 PWM，CH1~CH4 全给两个轮子 */
+extern TIM_HandleTypeDef  htim2;       /* 主灯 PWM：必须独立于 TIM1 */
 extern TIM_HandleTypeDef  htim3;       /* 左编码器 */
 extern TIM_HandleTypeDef  htim4;       /* 右编码器 */
+
+/* LED 专用定时器通道。TIM1 的四个通道已被左右轮 H 桥占满，
+ * 早先 hal_led_set 写 TIM1_CH4 等于把「灯亮度」和「右轮占空比」
+ * 写进同一个比较寄存器：开灯到 1.0 会把右轮拉满，右轮一动灯就闪。 */
+#define LD_LED_TIM       htim2
+#define LD_LED_CHANNEL   TIM_CHANNEL_1
 extern ADC_HandleTypeDef  hadc1;
 extern IWDG_HandleTypeDef hiwdg;
 
@@ -193,7 +200,7 @@ static void hal_led_set(float b)
     if (duty > LD_PWM_PERIOD) {
         duty = LD_PWM_PERIOD;
     }
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, duty);
+    __HAL_TIM_SET_COMPARE(&LD_LED_TIM, LD_LED_CHANNEL, duty);
 }
 
 /* ---------------------------------------------------------------- 串口 */

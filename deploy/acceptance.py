@@ -258,6 +258,11 @@ class Report:
         self.rows = []
         self.quick = quick
         self.t0 = time.monotonic()
+        # 完整清单的编号。--only 只跑子集时，没跑的条目既不进 rows 也不算
+        # 通过 —— 但旧实现只按 rows 判定，于是「只跑了 1 条且通过」会打印
+        # 「全部通过，可以上车」。
+        self.expected = set()
+        self.only = set()
 
     def add(self, no, title, status, detail, evidence=''):
         self.rows.append({'no': no, 'title': title, 'status': status,
@@ -278,6 +283,10 @@ class Report:
         return [r for r in self.rows
                 if r['status'] == SKIP and r['no'] not in allow_skip]
 
+    def missing(self):
+        """压根没执行的条目编号（--only 过滤掉的那些）。"""
+        return sorted(self.expected - {r['no'] for r in self.rows})
+
     def verdict(self, allow_skip):
         """三档，且**跳过也算没走完**。
 
@@ -287,7 +296,7 @@ class Report:
         """
         if self.count(FAIL):
             return 1
-        if self.count(MANUAL) or self.unacked_skips(allow_skip):
+        if self.missing() or self.count(MANUAL) or self.unacked_skips(allow_skip):
             return 2
         return 0
 
@@ -306,6 +315,11 @@ class Report:
         head = (f'**结论：{n_pass} 通过 / {n_fail} 失败 / '
                 f'{n_man} 待人工 / {n_skip} 跳过**')
         lines += [head, '']
+
+        if self.missing():
+            lines += [f'> **本次只执行了 {len(self.rows)}/{len(self.expected)} 条**：'
+                      f'未跑的编号 {self.missing()} 不是「通过」，'
+                      '这份报告不能作为验收签字依据。', '']
 
         if n_fail:
             lines += ['> 有未通过项，**车不能上车**。逐条看下方证据。', '']
@@ -512,6 +526,10 @@ def check_3(p, rep, args):
     n0 = p.beat_n
     faults = []
     kicks = []
+    # 只看「没冒出非零速度」会把「一条消息都没收到」当成零速稳定。
+    # zero_cmd() 早就修过同类假绿，check_3 这条独立循环漏了。
+    cmd_n = 0
+    last_cmd_at = None
     t_end = time.monotonic() + secs
     while time.monotonic() < t_end:
         rclpy.spin_once(p, timeout_sec=0.1)
@@ -519,11 +537,15 @@ def check_3(p, rep, args):
         if any(k in st.lower() for k in ('fault', 'lost', 'error')):
             faults.append(st)
         if p.cmd is not None and p.fresh('cmd', 1.0):
+            if p.cmd_at != last_cmd_at:
+                cmd_n += 1
+                last_cmd_at = p.cmd_at
             if abs(p.cmd.linear.x) > 1e-3 or abs(p.cmd.angular.z) > 1e-3:
                 kicks.append(f'{time.monotonic() - t_end + secs:.0f}s: '
                              f'v={p.cmd.linear.x:.3f}')
     hz = (p.beat_n - n0) / secs
-    ev = [f'心跳 {hz:.1f} Hz（{p.beat_n - n0} 条 / {secs}s）']
+    ev = [f'心跳 {hz:.1f} Hz（{p.beat_n - n0} 条 / {secs}s）',
+          f'速度出口样本 {cmd_n} 条']
 
     if faults:
         ev += [f'故障状态：{faults[0]}'] 
@@ -538,6 +560,11 @@ def check_3(p, rep, args):
     if hz < 5:
         rep.add(3, '待命不误触发', FAIL, f'心跳只有 {hz:.1f} Hz，会误触发看门狗',
                 '\n'.join(ev))
+        return
+    if cmd_n < 3:
+        rep.add(3, '待命不误触发', FAIL,
+                f'只观测到 {cmd_n} 条速度出口消息：无法判定「零速稳定」，'
+                '检查 /cmd_vel_muxed 是否有人发布', '\n'.join(ev))
         return
     note = '（--quick 缩短了时长）' if args.quick else ''
     rep.add(3, '待命不误触发', PASS,
@@ -997,6 +1024,8 @@ def main():
     rclpy.init()
     p = Probe()
     rep = Report(args.quick)
+    rep.expected = set(CHECKS)
+    rep.only = set(want)
     try:
         p.pump(2.0)
         if not preflight(p, rep, args):
@@ -1051,6 +1080,11 @@ def finish(rep, ctx, args, allow_skip):
     elif rc == 1:
         print(f'{R}有未通过项，车不能上车{E}')
     else:
+        missing = rep.missing()
+        if missing:
+            print(f'{Y}清单没走完{E}：只跑了 {len(rep.rows)}/{len(rep.expected)} 条，'
+                  f'未执行 {"、".join("#" + str(n) for n in missing)} '
+                  '—— 这不是「全部通过」')
         left = rep.unacked_skips(allow_skip)
         if left:
             print(f'{Y}有 {len(left)} 条根本没测到{E}：'

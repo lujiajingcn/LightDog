@@ -621,7 +621,7 @@ async function loadEvents() {
           <div class="item-title">${esc(ev.label || ev.type)}</div>
           <div class="item-sub">${fmtTime(ev.wall)}${dur ? ' · ' + dur : ''}${hasVideo ? '' : ' · 无视频'}</div>
         </div>
-        <span class="item-tag ${tagClass(ev.type)}">${ev.type}</span>
+        <span class="item-tag ${tagClass(ev.type)}">${esc(ev.type)}</span>
       </div>`;
     }).join('');
 

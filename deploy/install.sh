@@ -68,7 +68,9 @@ fi
 if [ -z "$RUN_USER" ]; then
   RUN_USER="${SUDO_USER:-$(id -un)}"
 fi
-RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+# 查不到用户时 getent 返回 2，pipefail + set -e 会让这条赋值直接终止脚本，
+# 下一行的友好报错永远打不出来。吞掉管道的非零退出码，交给下面的判空。
+RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6 || true)"
 [ -n "$RUN_HOME" ] || die "查不到用户 $RUN_USER 的 home"
 
 if [ -z "$WS_ARG" ]; then

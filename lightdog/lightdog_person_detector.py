@@ -526,8 +526,8 @@ class PersonDetector(Node):
         self.depth_timeout = float(p('depth_timeout').value)
         self.lost_timeout = float(p('lost_timeout').value)
 
-        self.fx = self.cx = None
-        self.cy = None
+        self.fx = self.fy = None
+        self.cx = self.cy = None
         self.rgb = None
         self.depth = None
         self.last_seen = None
@@ -687,10 +687,13 @@ class PersonDetector(Node):
         # 只用 len() 判空。
         if msg.k is None or len(msg.k) < 9:
             return
-        fx = float(msg.k[0])
-        if not math.isfinite(fx) or fx <= 0.0:
+        fx, fy = float(msg.k[0]), float(msg.k[4])
+        if not (math.isfinite(fx) and fx > 0.0
+                and math.isfinite(fy) and fy > 0.0):
             return
-        self.fx = fx
+        # 竖直像素必须用 fy。真实标定出来的相机 fx 与 fy 通常不等，
+        # 全用 fx 会让单目测距和 y_cam 反投影按 fy/fx 的比例系统性偏差。
+        self.fx, self.fy = fx, fy
         self.cx = float(msg.k[2])
         self.cy = float(msg.k[5])
 
@@ -1012,10 +1015,11 @@ class PersonDetector(Node):
             self._warned_depth_required = False
 
         if z is None:
-            # 单目：z = 参考高度 * fx / 像素高度。H 按后端自动选，见
-            # resolve_mono_height —— 写死 0.62 会在换 onnx 后端时把人算近 2.7 倍。
+            # 单目：z = 参考高度 * fy / 像素高度。px_h 是竖直像素，必须用 fy；
+            # H 按后端自动选（见 resolve_mono_height）—— 写死 0.62 会在换 onnx
+            # 后端时把人算近 2.7 倍。
             px_h = max(1, v1 - v0 + 1)
-            z = self.mono_height * self.fx / float(px_h)
+            z = self.mono_height * self.fy / float(px_h)
 
         if not (self.rng_min <= z <= self.rng_max):
             if self.publish_debug:
@@ -1026,7 +1030,7 @@ class PersonDetector(Node):
         u_c = 0.5 * (u0 + u1)
         v_c = 0.5 * (v0 + v1)
         x_cam = (u_c - self.cx) / self.fx * z
-        y_cam = (v_c - self.cy) / self.fx * z
+        y_cam = (v_c - self.cy) / self.fy * z
 
         x_base = z + self.cam_off[0]
         y_base = -x_cam + self.cam_off[1]

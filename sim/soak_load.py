@@ -77,6 +77,10 @@ class Load(object):
         self.stop = False
         self.node = None
         self.pubs = {}
+        # 没有 --no-ros 就意味着三条 ROS 载荷**必须真的发出去**。
+        # 原先 rclpy 导入失败 / 发布器没建起来时 pub() 直接 return，
+        # stat 里一条 ROS 记录都没有，却照样汇总成「载荷执行正常」。
+        self.ros_required = not getattr(args, 'no_ros', False)
 
     # ---------------- 记账
 
@@ -234,21 +238,33 @@ class Load(object):
     # ---------------- ROS
 
     def start_ros(self):
-        if rclpy is None or self.node is not None:
+        if not self.ros_required:
+            self.mark('HTTP-only 模式（--no-ros）：ROS 三条载荷本次不执行')
             return
-        rclpy.init()
-        self.node = rclpy.create_node('soak_load')
-        for topic in ('/voice/command', '/light/mode', '/alert/command'):
-            self.pubs[topic] = self.node.create_publisher(String, topic, 10)
+        if rclpy is None:
+            self.fail('ROS-init', 'rclpy 不可用，三条 ROS 载荷一条都没执行')
+            return
+        if self.node is not None:
+            return
+        try:
+            rclpy.init()
+            self.node = rclpy.create_node('soak_load')
+            for topic in ('/voice/command', '/light/mode', '/alert/command'):
+                self.pubs[topic] = self.node.create_publisher(String, topic, 10)
+        except Exception as e:                              # noqa: BLE001
+            self.fail('ROS-init', e)
 
     def pub(self, topic, text, settle=0.4):
         """发一条并 spin 一会儿。不 spin 就等于发完立刻析构，消息可能没出去。"""
         p = self.pubs.get(topic)
         if p is None:
+            if self.ros_required:
+                self.fail('ROS:' + topic, '发布器不可用，这条载荷没有执行')
             return
         m = String()
         m.data = text
         p.publish(m)
+        self.ok('ROS:' + topic)
         t_end = time.monotonic() + settle
         while time.monotonic() < t_end:
             rclpy.spin_once(self.node, timeout_sec=0.05)
@@ -264,7 +280,9 @@ class Load(object):
         self.get('/api/v1/alarms')
 
         self.mark('SSE 长连接 8s 后 RST')
-        self.stream('SSE', '/api/v1/events/stream', 8.0, 1 << 20, rst=True)
+        # 8 秒里至少应有首包 + 若干次心跳；只收 1 字节也算成功是假绿
+        self.stream('SSE', '/api/v1/events/stream', 8.0, 1 << 20,
+                    rst=True, min_bytes=32)
 
         self.mark('MJPEG 读 4s 后 RST')
         # 至少一帧的开头：4 秒里一个字节都没有，说明推流线程已经死了

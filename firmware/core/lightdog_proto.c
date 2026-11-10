@@ -89,9 +89,11 @@ int ld_parser_push(ld_parser_t *p, const uint8_t *data, size_t len,
     int count = 0;
     size_t i;
 
-    if (p == NULL || data == NULL || len == 0) {
+    if (p == NULL || (data == NULL && len > 0u)) {
         return 0;
     }
+    /* len==0 是合法的「把上次没交付完的帧继续吐出来」调用，
+     * 见 ld_app_rx 的排空循环。 */
     if (len > (size_t)(LD_PARSER_BUF - p->n)) {
         /* 缓冲装不下：整段丢弃，等下一次 SYNC 重新对齐。
          * 宁可丢帧也不能覆盖还没解析的字节（那会把半帧变成错帧）。 */
@@ -99,8 +101,10 @@ int ld_parser_push(ld_parser_t *p, const uint8_t *data, size_t len,
         p->n = 0;
         return 0;
     }
-    memcpy(&p->buf[p->n], data, len);
-    p->n = (uint16_t)(p->n + len);
+    if (len > 0u) {
+        memcpy(&p->buf[p->n], data, len);
+        p->n = (uint16_t)(p->n + len);
+    }
 
     for (;;) {
         uint16_t sync_at = 0xFFFFu;
@@ -151,7 +155,14 @@ int ld_parser_push(ld_parser_t *p, const uint8_t *data, size_t len,
             drop_front(p, 2);
             continue;
         }
-        if (out != NULL && count < max_out) {
+        if (out != NULL && count >= max_out) {
+            /* 输出槽满了就把这一帧**留在缓冲里**，等下一次 push 再交付。
+             * 原实现仍执行 p->frames++ / drop_front，帧被静默消费却没人
+             * 处理：一次 DMA 空闲中断收到 5 个以上合法帧时，第 5 帧起
+             * 全部消失，其中若是心跳就既没喂狗也没刷新时间戳。 */
+            break;
+        }
+        if (out != NULL) {
             out[count].type = p->buf[3];
             out[count].len = plen;
             if (plen > 0) {

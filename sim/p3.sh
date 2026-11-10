@@ -178,8 +178,11 @@ case "$cmd" in
     v="${2:-}"
     if [ -z "$v" ]; then echo "用法: bash sim/p3.sh battery 0.15 | off" >&2; exit 1; fi
     if [ "$v" = "off" ]; then
-      # 发一个过期值：dock_manager 的 sim_battery_timeout（5s）过后会自动回落到真实电池
-      echo "注入值会在 5 秒后自动失效（sim_battery_timeout），无需额外操作"
+      # 原来只打印一句话就退出：后台的 `ros2 topic pub` 还在持续发新鲜值，
+      # 要等最多 65s 才停，dock_manager 根本不会回落到真实电池。
+      # 模式里写 [r]os2 是为了不让 pkill 匹配到承载这条命令的 shell 自己。
+      ros "pkill -f '[r]os2 topic pub -r 1 -t 60 /dock/sim_battery_ratio' >/dev/null 2>&1 || true"
+      echo "已停止电量注入，sim_battery_timeout（5s）后回落到真实电池"
       exit 0
     fi
     # -t 60 数的是**消息条数**，不是秒数。这台机器 `-r 1` 实际只能跑到 2~3Hz，

@@ -14,7 +14,7 @@ BUILD   := build
 
 .PHONY: all test cross app clean
 
-all: $(BUILD)/test_proto $(BUILD)/test_app
+all: $(BUILD)/test_proto $(BUILD)/test_app $(BUILD)/cross_stream
 
 $(BUILD)/test_proto: core/lightdog_proto.c core/lightdog_watchdog.c test/test_proto.c
 	@mkdir -p $(BUILD)
@@ -32,7 +32,9 @@ $(BUILD)/test_app: core/lightdog_proto.c core/lightdog_watchdog.c \
 
 app: $(BUILD)/lightdog_app.o
 
-test: $(BUILD)/test_proto $(BUILD)/test_app
+# cross_stream 也进 test：至少保证它编译得过，不会「协议改了、交叉验证程序
+# 悄悄烂掉却没人发现」。逐帧比对由 lightdog/tests/test_mcu_proto.py 驱动。
+test: $(BUILD)/test_proto $(BUILD)/test_app $(BUILD)/cross_stream
 	./$(BUILD)/test_proto test/vectors.txt
 	./$(BUILD)/test_app
 

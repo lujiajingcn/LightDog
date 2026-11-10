@@ -91,6 +91,13 @@ def image_to_rgb(msg: Image):
             return None
         a = buf[:h * w * 3].reshape(h, w, 3)
         return a.copy() if enc == 'rgb8' else a[:, :, ::-1].copy()
+    # 很多 USB / RealSense 驱动给的是 4 通道。与 P2 检测器保持同一套解码，
+    # 否则同一路图像 P2 看得见、P5 却一条 /fall/state 都不发。
+    if enc in ('rgba8', 'bgra8'):
+        if buf.size < h * w * 4:
+            return None
+        a = buf[:h * w * 4].reshape(h, w, 4)[:, :, :3]
+        return a.copy() if enc == 'rgba8' else a[:, :, ::-1].copy()
     return None
 
 
@@ -120,7 +127,11 @@ def normalize_fall_mode(raw):
     静默失效。所以配置里必须给值加引号，这里也对 bool 给出明确诊断。
     """
     if isinstance(raw, bool):
-        return 'on', (f'YAML 裸写 on/off 会被解析成布尔 {raw!r}；'
+        # 裸写 off -> False。这里必须按布尔值映射，不能一律返回 'on'：
+        # 前者只是「配置写法待修」，后者会把运维明确要求的停用反转成启用，
+        # 节点开始等一台根本不存在的深度相机。
+        mode = 'on' if raw else 'off'
+        return mode, (f'YAML 裸写 on/off 会被解析成布尔 {raw!r}，已按 {mode} 运行；'
                       "请给值加引号，例如 depth_mode: 'off'")
     mode = str(raw).strip().lower()
     if mode in ('on', 'off'):
@@ -215,6 +226,7 @@ class FallDetector(Node):
         self._warned_stall = False
         self._warned_shape = False
         self._warned_depth = False
+        self._warned_decode = False
         self._last_state = None       # 上一次的结论，无新帧时重发
         self._last_z = None
         self._last_spread = None
@@ -330,7 +342,21 @@ class FallDetector(Node):
         rgb = image_to_rgb(self.rgb)
         dep = image_to_depth(self.depth)
         if rgb is None or dep is None:
+            # 解码失败和「没收到图」一样是「看不见」，必须发 unknown。
+            # 原先这里直接 return：节点健康、systemd active，但 /fall/state
+            # 一条都不发，告警状态机分不清「没人」和「传感器坏了」。
+            if not self._warned_decode:
+                self._warned_decode = True
+                self.get_logger().error(
+                    f'图像编码无法解码（rgb={getattr(self.rgb, "encoding", "?")} '
+                    f'depth={getattr(self.depth, "encoding", "?")}）。'
+                    '彩色只认 rgb8/bgr8/rgba8/bgra8，深度只认 32fc1/16uc1/mono16；'
+                    '跌倒检测改发 unknown')
+            self._emit_unknown()
             return
+        if self._warned_decode:
+            self._warned_decode = False
+            self.get_logger().info('图像编码恢复可解码，跌倒检测继续')
 
         # 深度图和彩色图必须同尺寸。仿真里 gz 的 rgbd_camera 是对齐的；
         # 真机 RealSense 的 /camera/depth/image_rect_raw 默认 848x480，与彩色

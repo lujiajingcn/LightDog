@@ -67,6 +67,7 @@ class SerialLink:
         self.baud = int(baud)
         self.log = log or (lambda *a, **k: None)
         self.fd = None
+        self._warned_full = False
 
     @property
     def open(self):
@@ -118,15 +119,35 @@ class SerialLink:
         self.fd = None
 
     def write(self, data):
+        """返回 True=整帧写完 / False=链路坏 / None=暂时写不出去。
+
+        fd 是 O_NONBLOCK：os.write 可能只写一半，也可能抛 EAGAIN。
+        不检查返回值就把「写了 3 个字节」当成功，固件会收到残缺帧；
+        把 EAGAIN 当链路故障去重连，则每 2 秒白白清一次缓冲。
+        """
         if self.fd is None:
             return False
-        try:
-            os.write(self.fd, data)
-            return True
-        except OSError as e:
-            self.log(f'串口写失败：{e}')
-            self.close()
-            return False
+        view = memoryview(data)
+        while view:
+            try:
+                n = os.write(self.fd, view)
+            except BlockingIOError:
+                # 输出缓冲满，串口还活着。帧可能已经写出去一截，绝不能整帧
+                # 重发（那会让固件看到两个 SYNC）；丢掉剩余字节，让解析器在
+                # 下一帧 SYNC 处重新同步，同时只报一次日志。
+                if not self._warned_full:
+                    self._warned_full = True
+                    self.log('串口输出缓冲满：本拍丢弃剩余字节，不重连')
+                return None
+            except OSError as e:
+                self.log(f'串口写失败：{e}')
+                self.close()
+                return False
+            if n <= 0:
+                return None
+            view = view[n:]
+        self._warned_full = False
+        return True
 
     def read(self, max_bytes=256):
         """返回 bytes；链路坏了返回 None（和「这一拍没有数据」区分开）。"""
@@ -308,8 +329,12 @@ class McuBridge(Node):
         self.link.close()
 
     def _send(self, frame):
-        if self.link.write(frame):
+        r = self.link.write(frame)
+        if r is True:
             return True
+        if r is None:
+            # 缓冲满：这一拍没发出去，但链路没坏，不要触发重连。
+            return False
         self._link_lost('串口写失败')
         return False
 

@@ -689,12 +689,24 @@ class Mission(Node):
         fut.add_done_callback(lambda f: self._on_nav_accepted(f, epoch, tag))
 
     def _on_nav_accepted(self, future, epoch, tag):
-        if epoch != self._nav_epoch:
-            return
         try:
             handle = future.result()
         except Exception as e:            # 服务端在发送中途消失
-            self._nav_failed(epoch, f'发送异常：{e}')
+            if epoch == self._nav_epoch:
+                self._nav_failed(epoch, f'发送异常：{e}')
+            return
+        if epoch != self._nav_epoch:
+            # goal 在「发出去」到「响应回来」之间被 _cancel_nav 取消了，
+            # 那时还没有 handle 可 cancel。但 Nav2 已经接受并在执行这个目标：
+            # 不显式取消，它会继续发 /cmd_vel_smoothed，车朝旧目标开走。
+            # dock_manager 对同样的竞态就是这么处理的。
+            if handle is not None and handle.accepted:
+                self.get_logger().info(
+                    f'过期的导航目标 [{tag}] 已被接受，立即取消')
+                try:
+                    handle.cancel_goal_async()
+                except Exception:
+                    pass
             return
         if handle is None or not handle.accepted:
             self._nav_failed(epoch, 'goal 被拒绝')

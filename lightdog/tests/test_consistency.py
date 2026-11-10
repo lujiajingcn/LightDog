@@ -140,12 +140,24 @@ class TestVersions(unittest.TestCase):
 
     def test_launch_params_files_exist(self):
         missing = []
+        hits = 0
         for path in glob.glob(os.path.join(PKG, 'launch', '*.py')):
             with open(path, encoding='utf-8') as f:
                 src = f.read()
-            for ref in re.findall(r"['\"]config/([A-Za-z0-9_]+\.yaml)['\"]", src):
+            # 两种写法都要认：
+            #   'config/xxx.yaml'
+            #   PathJoinSubstitution([pkg, 'config', 'xxx.yaml'])
+            # 原实现只匹配第一种，而六个 launch 全是第二种 —— 正则恒返回空，
+            # 检查从未真正跑过。
+            refs = re.findall(r"['\"]config/([A-Za-z0-9_]+\.yaml)['\"]", src)
+            refs += re.findall(
+                r"['\"]config['\"]\s*,\s*['\"]([A-Za-z0-9_]+\.yaml)['\"]", src)
+            hits += len(refs)
+            for ref in refs:
                 if not os.path.exists(os.path.join(CONFIG_DIR, ref)):
                     missing.append(f'{os.path.basename(path)} 引用了不存在的 config/{ref}')
+        self.assertGreater(hits, 0,
+                           '一个 yaml 引用都没抓到：正则又和 launch 的写法脱节了')
         self.assertEqual(missing, [], '\n'.join(missing))
 
 

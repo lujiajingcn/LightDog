@@ -56,10 +56,12 @@ iOS Safari 播 `<video>` 会先发 `Range: bytes=0-1` 探一下，服务端回 `
 import hmac
 import json
 import os
+import re
 import select
 import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -555,7 +557,13 @@ class LightDogServer(Node):
                         if k in m:
                             item[k] = m[k]
                     if 't0' in m and 't1' in m:
-                        item['duration'] = round(float(m['t1']) - float(m['t0']), 2)
+                        # 索引文件是别人（recorder / 掉电 / 手工）写的，一处坏值
+                        # 不能把 /clips 和 /status 一起打成 500。
+                        try:
+                            item['duration'] = round(
+                                float(m['t1']) - float(m['t0']), 2)
+                        except (TypeError, ValueError):
+                            pass
                 out.append(item)
         except FileNotFoundError:
             pass
@@ -696,11 +704,27 @@ class LightDogServer(Node):
             return [], str(e)
         return [], None
 
+    # 两部手机同时点保存时，固定的 contacts.json.part 会被两个请求交叉写，
+    # 其中一个 os.replace 还会撞上 FileNotFoundError。锁 + 每次独立的临时文件。
+    _contacts_lock = threading.Lock()
+
     def save_contacts(self, contacts):
-        tmp = self.contacts_path + '.part'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'contacts': contacts}, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.contacts_path)
+        with self._contacts_lock:
+            d = os.path.dirname(os.path.abspath(self.contacts_path))
+            fd, tmp = tempfile.mkstemp(prefix='.contacts-', suffix='.tmp', dir=d)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump({'contacts': contacts}, f,
+                              ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.contacts_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
 
 # ======================================================================
@@ -716,6 +740,10 @@ class Handler(BaseHTTPRequestHandler):
     # 请求体上限。联系人列表最多 16 条、事件请求就几十字节，1MB 已经宽得离谱；
     # 不设的话一个 Content-Length: 999999999 就能把进程内存吃干。
     MAX_BODY = 1 << 20
+
+    # 声明了 Content-Length 却一直不发完的慢速 POST 会永久占住一个线程 + fd。
+    # 只在读 body 期间加超时，SSE / MJPEG 这些长连接不受影响。
+    BODY_TIMEOUT = 10.0
 
     # ---- 基础设施 ----
 
@@ -1025,12 +1053,31 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
-            n = int(self.headers.get('Content-Length') or 0)
-            if n > self.MAX_BODY:
+            # BaseHTTPRequestHandler 不解码 chunked。不读就回响应的话，剩余
+            # 字节会留在 rfile 里被 keep-alive 当成下一个请求解析。
+            if (self.headers.get('Transfer-Encoding') or '').strip():
+                self.close_connection = True
+                return self._err(400, 'chunked body not supported')
+            try:
+                n = int(self.headers.get('Content-Length') or 0)
+            except ValueError:
+                self.close_connection = True
+                return self._err(400, 'bad Content-Length')
+            if n < 0 or n > self.MAX_BODY:
                 # 先把连接处理掉再回错误，否则剩余字节会被当成下一个请求
                 self.close_connection = True
                 return self._err(413, 'body too large')
-            raw = self.rfile.read(n) if n > 0 else b''
+            self.connection.settimeout(self.BODY_TIMEOUT)
+            try:
+                raw = self.rfile.read(n) if n > 0 else b''
+            except (socket.timeout, OSError):
+                self.close_connection = True
+                return self._err(408, 'body read timeout')
+            finally:
+                try:
+                    self.connection.settimeout(None)
+                except OSError:
+                    pass
             if not path.startswith('/api/'):
                 return self._err(404, 'no such endpoint')
             if not self._authed():
@@ -1195,6 +1242,11 @@ class Handler(BaseHTTPRequestHandler):
             phone = str(c.get('phone', '')).strip()[:32]
             if not phone:
                 continue
+            # 号码会原样拼进 AMI 报文头（字段以 CRLF 分隔）。放进一个
+            # \r\n 就能插入任意 Action，例如向任意号码 Originate。
+            # 电话号码只认数字和 + - ( ) 空格，其余一律回 400，不静默改写。
+            if not re.fullmatch(r'[0-9+()\-\s]{1,32}', phone):
+                return self._err(400, 'bad phone: digits and +()- only')
             clean.append({'name': name or '紧急联系人', 'phone': phone,
                           'primary': bool(c.get('primary', not clean))})
         try:

@@ -67,9 +67,11 @@ typedef struct {
     float cmd_angular;
 
     float led_brightness;
-    uint8_t estop_from_host;   /* 上位机最近一次下发的要求 */
-    uint8_t button_pressed;    /* 物理按钮当前状态（按下时上位机不能解除） */
-    uint8_t state_dirty;       /* 急停/故障有变化，下一拍立刻上报 */
+    /* 这三个字段由 UART RX ISR / 按钮 EXTI ISR 写、由 1kHz tick 读。
+     * volatile 只保证编译器每次真的去内存取，互斥仍靠 app_enter_critical。 */
+    volatile uint8_t estop_from_host;   /* 上位机最近一次下发的要求 */
+    volatile uint8_t button_pressed;    /* 物理按钮当前状态（按下时上位机不能解除） */
+    volatile uint8_t state_dirty;       /* 急停/故障有变化，下一拍立刻上报 */
 
     /* 安全故障（F-010）运行时状态 */
     uint8_t  safety_lock;      /* 电气/热故障触发的内部断使能闭锁 */

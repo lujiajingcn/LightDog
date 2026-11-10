@@ -395,9 +395,12 @@ static void update_safety_faults(ld_app_t *app, uint32_t now)
  * 按钮故障位则独立反映「按钮此刻是否按下」，与 estop 由谁锁存无关。 */
 static void sync_estop_state(ld_app_t *app)
 {
-    uint8_t want = (uint8_t)(app->estop_from_host || app->button_pressed);
+    uint8_t want;
 
     app_enter_critical(app);
+    /* 两个急停来源的合并必须在临界区里取快照：在区外算好再进去，
+     * 更高优先级的按钮 ISR 可能刚好改掉其中一个来源，拿到过期组合。 */
+    want = (uint8_t)(app->estop_from_host || app->button_pressed);
     if (want != app->wd.estop) {
         ld_wd_set_estop(&app->wd, want ? 1 : 0, 0);
         app->state_dirty = 1u;
@@ -417,14 +420,16 @@ static void handle_frame(ld_app_t *app, const ld_frame_t *f, uint32_t now)
         app_enter_critical(app);
         ld_wd_heartbeat(&app->wd, now);
         app_exit_critical(app);
-        /* 唯一的喂狗点。放进 while(1) 里喂，主循环卡死时照样喂 —— 等于没有看门狗。 */
-        if (app->hal->iwdg_feed != NULL) {
-            app->hal->iwdg_feed();
-        }
+        /* **这里绝不喂 IWDG**。ld_app_rx 跑在 UART RX ISR 里，而控制环在
+         * ld_app_tick（1kHz）。若在这里喂，控制环整个卡死时心跳中断照样
+         * 响应、狗照样被喂，IWDG 就完全失效 —— 车会保持最后一次使能
+         * 和占空比一直跑。喂狗点唯一在 ld_app_tick 末尾，见那里的注释。 */
         break;
 
     case LD_T_CMD_VEL:
-        if (f->len >= 8u) {
+        /* 与 Python 侧 decode_* 一致：长度必须**精确相等**。>= 会让固件
+         * 执行一个上位机视为非法的帧（多出来的字节被静默忽略）。 */
+        if (f->len == 8u) {
             app->cmd_linear = clampf(get_f32(&f->payload[0]),
                                      -app->cfg.max_linear_mps,
                                      app->cfg.max_linear_mps);
@@ -437,7 +442,7 @@ static void handle_frame(ld_app_t *app, const ld_frame_t *f, uint32_t now)
 
     case LD_T_ESTOP: {
         int on;
-        if (f->len < 1u) {
+        if (f->len != 1u) {
             break;
         }
         on = f->payload[0] ? 1 : 0;
@@ -455,7 +460,7 @@ static void handle_frame(ld_app_t *app, const ld_frame_t *f, uint32_t now)
     }
 
     case LD_T_LED:
-        if (f->len >= 4u) {
+        if (f->len == 4u) {
             app->led_brightness = clampf(get_f32(&f->payload[0]), 0.0f, 1.0f);
             if (app->hal->led_set != NULL) {
                 app->hal->led_set(app->led_brightness);
@@ -481,10 +486,19 @@ void ld_app_rx(ld_app_t *app, const uint8_t *buf, uint32_t len)
     }
     now = (app->hal->now_ms != NULL) ? app->hal->now_ms() : app->last_tick_ms;
 
-    n = ld_parser_push(&app->parser, buf, (size_t)len, frames, 4);
-    for (i = 0; i < n; i++) {
-        app->frames_ok++;
-        handle_frame(app, &frames[i], now);
+    /* 一次 DMA 空闲中断可能带来多于 4 个合法帧。解析器在输出槽满时会把
+     * 剩余帧留在缓冲里，这里必须循环排空，否则它们要等下一次 UART 数据
+     * 到来才被处理 —— 心跳晚 100ms 就会被判失联。 */
+    for (;;) {
+        n = ld_parser_push(&app->parser, buf, (size_t)len, frames, 4);
+        for (i = 0; i < n; i++) {
+            app->frames_ok++;
+            handle_frame(app, &frames[i], now);
+        }
+        if (n <= 0) {
+            break;
+        }
+        len = 0u;                 /* 后续只消化缓冲里剩下的帧 */
     }
     app->frames_bad = app->parser.crc_errors + app->parser.len_errors;
 }
@@ -496,6 +510,8 @@ void ld_app_tick(ld_app_t *app, uint32_t now_ms)
     int st;
     float l;
     float r;
+    uint8_t feed_ok;
+    uint8_t send_state_now;
 
     if (app == NULL || app->hal == NULL) {
         return;
@@ -521,6 +537,14 @@ void ld_app_tick(ld_app_t *app, uint32_t now_ms)
     }
 
     ld_wd_tick(&app->wd, now_ms);
+
+    /* 唯一的 IWDG 喂狗点：必须满足「控制环这一拍完整跑到了这里」+「心跳新鲜」。
+     * 前者保证主循环/1kHz tick 卡死时没人喂狗 -> 1s 内复位 -> 上电默认断使能；
+     * 后者保证上位机 kill -9 之后即使控制环还在空转也会复位。
+     * 急停与安全闭锁期间心跳仍在，继续喂狗是**故意的**：反复复位会把 RAM 里
+     * 的急停/故障闭锁状态清掉，反而更危险。300ms 失联与三态决策已经断使能。 */
+    feed_ok = (uint8_t)(app->wd.have_hb &&
+        ((uint32_t)(now_ms - app->wd.last_hb_ms) < LD_WD_TIMEOUT_MS));
 
     /* 三态决策，别自己组合 output_enabled + hold_zero（会死锁，
      * 见 lightdog_watchdog.h 里那段说明）。 */
@@ -555,7 +579,21 @@ void ld_app_tick(ld_app_t *app, uint32_t now_ms)
         }
     }
 
+    /* state_dirty 的读-改-写也要在临界区内：按钮 ISR 可能在「判完 dirty
+     * 之后、清 0 之前」置位，那一拍的状态变化就永远丢一次立即上报。 */
+    send_state_now = (uint8_t)(app->state_dirty ||
+        (app->cfg.state_period_ms != 0u &&
+         (uint32_t)(now_ms - app->last_state_ms) >= app->cfg.state_period_ms));
+    if (send_state_now) {
+        app->state_dirty = 0u;
+        app->last_state_ms = now_ms;
+    }
+
     app_exit_critical(app);
+
+    if (feed_ok && app->hal->iwdg_feed != NULL) {
+        app->hal->iwdg_feed();
+    }
 
     if (app->cfg.odom_period_ms != 0u &&
         (uint32_t)(now_ms - app->last_odom_ms) >= app->cfg.odom_period_ms) {
@@ -571,11 +609,7 @@ void ld_app_tick(ld_app_t *app, uint32_t now_ms)
         send_battery(app);
     }
 
-    if (app->state_dirty ||
-        (app->cfg.state_period_ms != 0u &&
-         (uint32_t)(now_ms - app->last_state_ms) >= app->cfg.state_period_ms)) {
-        app->state_dirty = 0u;
-        app->last_state_ms = now_ms;
+    if (send_state_now) {
         send_state(app);
     }
 }

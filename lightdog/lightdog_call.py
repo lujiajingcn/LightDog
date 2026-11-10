@@ -122,6 +122,10 @@ class AmiClient:
         self._sock = None
         self._buf = b''
         self._seq = 0
+        # 读 Action 响应时先到的 Event 不能扔：async Originate 的
+        # OriginateResponse 完全可能在 Response 之前到达。暂存下来给
+        # wait_event/channels 消费，否则那一通会白等到超时。
+        self._events = []
 
     # -- 连接 ---------------------------------------------------------
 
@@ -132,6 +136,7 @@ class AmiClient:
         except OSError as e:
             raise AmiError(f'连不上 AMI {self.host}:{self.port}：{e}') from e
         self._buf = b''
+        self._events = []
         # 不专门去读 banner（`Asterisk Call Manager/5.0.3`）：
         # 它是不带空行结尾的单行，单独读会引入「到底有没有 banner」的分支。
         # 解析器会跳过没有冒号的行，banner 自然被忽略。
@@ -196,6 +201,12 @@ class AmiClient:
             if not self._fill(deadline):
                 continue
 
+    def _next_message(self, deadline):
+        """先消费暂存的 Event，没有再上 socket 读。"""
+        if self._events:
+            return self._events.pop(0)
+        return self._read_message(deadline)
+
     def _peek_deadline(self, timeout):
         return time.monotonic() + (self.timeout if timeout is None else float(timeout))
 
@@ -203,6 +214,13 @@ class AmiClient:
         """发一个 Action，读回它的 Response（途中的 Event 丢弃）。"""
         if self._sock is None:
             raise AmiError('AMI 未连接')
+        # AMI 报文字段以 CRLF 分隔。号码 / 分机名是手机端可编辑的，混进一个
+        # \r\n 就能在报文里插进第二个 Action（例如向任意号码 Originate）。
+        # 上游已经过滤过联系人，这里再做一次纵深防御：谁绕过 HTTP 直接调
+        # originate() 也注入不进来。
+        for k, v in fields.items():
+            if any(c in str(k) + str(v) for c in ('\r', '\n')):
+                raise AmiError(f'AMI 字段含换行，拒绝发送：{k!r}')
         body = ''.join(f'{k}: {v}\r\n' for k, v in fields.items()) + '\r\n'
         try:
             self._sock.sendall(body.encode('utf-8'))
@@ -211,7 +229,7 @@ class AmiClient:
         return self._read_response(self._peek_deadline(timeout))
 
     def _read_response(self, deadline):
-        """读到一条**带 `response` 字段**的消息为止，途中的 Event 直接丢掉。
+        """读到一条**Action 响应**为止，途中的 Event 直接丢掉。
 
         AMI 在同一条 TCP 上把「响应」和「事件」交错着发。刚登录、或者上一次
         外呼的 Hangup 事件恰好排在前面时，第一条消息就是个 Event。原实现把它
@@ -220,9 +238,19 @@ class AmiClient:
 
         这类误诊比直接报错难查得多：运维会去 manager.conf 里翻半天，
         而真正的问题是「读消息时没分辨类型」。
+
+        只判 `'response' in msg` 还不够：`OriginateResponse` 这类 Event 自己就带
+        `Response: Success/Failure` 头。Asterisk 把事件和 Action 响应同批送回来时，
+        它会被误当成响应返回，随后 `wait_event('originateresponse')` 等一个已经被
+        吃掉的事件直到超时。区分标志是 Event 一定有 `event` 字段，而 Action 的
+        响应没有。被让过去的 Event **暂存**，不能丢：async Originate 的结果事件
+        可能就排在它自己的 Action 响应前面。
         """
         while True:
             msg = self._read_message(deadline)
+            if 'event' in msg:
+                self._events.append(msg)
+                continue
             if 'response' in msg:
                 return msg
 
@@ -231,7 +259,7 @@ class AmiClient:
         deadline = self._peek_deadline(timeout)
         event = event.lower()
         while True:
-            msg = self._read_message(deadline)
+            msg = self._next_message(deadline)
             if msg.get('event', '').lower() != event:
                 continue
             got = msg.get('actionid', '')
@@ -291,7 +319,7 @@ class AmiClient:
         found = []
         deadline = self._peek_deadline(self.timeout)
         while True:
-            msg = self._read_message(deadline)
+            msg = self._next_message(deadline)
             ev = msg.get('event', '').lower()
             if ev == 'coreshowchannelscomplete':
                 break

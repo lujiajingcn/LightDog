@@ -27,7 +27,10 @@ trap 'rm -f "$TMP" "$TMP.8k.wav"' EXIT
 if command -v piper >/dev/null 2>&1; then
   MODEL="${PIPER_MODEL:-}"
   if [ -z "$MODEL" ]; then
-    MODEL="$(find /usr/share/piper /opt/piper "$HOME" -name 'zh_CN-*.onnx' 2>/dev/null | head -1)"
+    # set -euo pipefail 下，find 遇到不存在的搜索根会返回 1，head -1 提前
+    # 退出还会让 find 吃 SIGPIPE(141)。任一情况都会让这条赋值直接终止脚本，
+    # 连下面「找不到模型」的提示都打不出来。用 || true 兜住整条管道。
+    MODEL="$(find /usr/share/piper /opt/piper "$HOME" -name 'zh_CN-*.onnx' 2>/dev/null | head -1 || true)"
   fi
   [ -n "$MODEL" ] || {
     echo "找不到中文 Piper 模型（zh_CN-*.onnx）。" >&2

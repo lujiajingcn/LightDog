@@ -604,6 +604,7 @@ def report(path, min_duration):
     dur = a['dur']
     leaks = []
     warns = []
+    inconclusive = 0
     # 一分钟以内的数据无论如何都不给绿灯：`--min-duration 0` 是给人调试用的，
     # 而「观测 0.6 秒 → 未发现泄漏」这种结论比没有结论危险得多。
     floor_secs = max(min_duration, 60.0)
@@ -636,6 +637,8 @@ def report(path, min_duration):
         for key, label in (('rss', '内存'), ('threads', '线程'),
                            ('fds', 'fd 总数'), ('fd_sock', 'socket'),
                            ('fd_file', '文件'), ('fd_anon', 'eventfd/epoll')):
+            if p[key]['verdict'] == INCONCLUSIVE:
+                inconclusive += 1
             if p[key]['verdict'] == LEAK:
                 leaks.append('%s 的%s持续增长：%+.1f（%.1f/小时，量程%s）'
                              % (p['name'], label, p[key]['growth'],
@@ -715,6 +718,9 @@ def report(path, min_duration):
                          % (mb(sy0['mem_avail_kb']), mb(sy1['mem_avail_kb']),
                             drop * 100))
 
+    if inconclusive:
+        warns.append('%d 个指标只有不到 6 拍，判不出趋势（judge 返回 INCONCLUSIVE）'
+                     % inconclusive)
     for line in warns:
         print('    提示  ' + line)
     for line in leaks:
@@ -724,6 +730,11 @@ def report(path, min_duration):
     if leaks:
         print('结论：发现 %d 个问题（rc=1）' % len(leaks))
         return 1
+    if inconclusive:
+        print('结论：%d 个指标采样不足 6 拍，判不出增长趋势，'
+              '**不构成「无泄漏」的结论**（rc=2）' % inconclusive)
+        print('      时间跨度够长 ≠ 拍数够：缩短 --interval 或延长 --duration 后重跑。')
+        return 2
     if dur < floor_secs:
         print('结论：本次观测 %.1f 分钟 < %.0f 分钟，**不构成「无泄漏」的结论**（rc=2）'
               % (dur / 60.0, floor_secs / 60.0))

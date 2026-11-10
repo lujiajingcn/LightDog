@@ -15,6 +15,7 @@ STM32 HAL）。真正编译它要用 CubeMX 生成的工程。
 |---|---|---|
 | **UART2** | 115200 8N1，**DMA TX（Normal，不是 Circular）**，开 UART 全局中断 | 开中断才能拿到 DMA 发送完成回调；Circular 会掩盖「发到哪了」 |
 | **TIM1** | 4 路 PWM（CH1/CH1N、CH2/CH2N、CH3/CH3N、CH4/CH4N），**20kHz**，ARR=8400 | 20kHz 在可听域外；ARR 要和 `LD_PWM_PERIOD` 一致 |
+| **TIM2** | CH1 PWM，主灯亮度 | **不能和 TIM1_CH4 共用**：那是右轮 IN2，两者会互相覆盖比较寄存器 |
 | **TIM3 / TIM4** | Encoder Mode（TI1 and TI2），**4 倍频** | 每转计数 = 线数 × 4 × 减速比，必须与 `ticks_per_rev` 一致 |
 | **ADC1** | **3 通道 Scan + ContinuousConvMode + 循环 DMA**（顺序：电池分压→电流→温度 NTC），12 位 | `ld_app_tick` 在 1kHz 中断里跑，绝不能再忙等 ADC；DMA 持续把最新值刷进缓存，读只取快照（见代码里 F-002）。分压/增益写错的表现是「电量永远 100%」或「刚充满就报 0%」 |
 | **IWDG** | 预分频 + 重载，**超时 1s** | 见下面「IWDG 超时不要设太短」 |
@@ -24,13 +25,20 @@ STM32 HAL）。真正编译它要用 CubeMX 生成的工程。
 
 ### IWDG 超时不要设太短
 
-心跳是 10Hz（100ms 一帧），IWDG 只在**收到合法心跳**时喂。所以：
+心跳是 10Hz（100ms 一帧），IWDG 由 `ld_app_tick` 在**控制环完整跑完一拍、
+且心跳仍新鲜**时喂（`firmware/app/lightdog_app.c` 里唯一的喂狗点）。所以：
 
-- 超时设 200ms → 丢一帧心跳就复位 MCU，车会莫名其妙重启；
+- 超时设 200ms → 丢几帧心跳就复位 MCU，车会莫名其妙重启；
 - 超时设 1s → 连丢 10 帧才复位，正常丢包不受影响。
 
+**绝不能在 UART RX ISR 里喂狗**：`ld_app_rx` 跑在接收中断里，主循环/1kHz
+tick 卡死时它照样被心跳唤醒。那样 IWDG 永远不会超时，而电机保持最后一次
+EN=1 和占空比一直出力 —— 这是最危险的一类失效。
+
 复位是**第二层**兜底：300ms 失联已经由 `lightdog_watchdog` 断使能了，
-IWDG 只在「主循环整个卡死、连 watchdog 判定都跑不到」时才动手。
+IWDG 只在「控制环整个卡死、连 watchdog 判定都跑不到」时才动手。
+急停 / 过流闭锁期间只要心跳还在就继续喂狗，是故意的：反复复位会清掉 RAM
+里的闭锁状态，而上电默认断使能并不能替代「谁锁的、什么时候解」。
 
 ---
 
@@ -45,7 +53,7 @@ IWDG 只在「主循环整个卡死、连 watchdog 判定都跑不到」时才�
 | LEFT_DIR / RIGHT_DIR | PB1 / PB2 | 方向脚（若 H 桥用 IN1/IN2 正交驱动则不需要） |
 | TIM3_CH1/CH2 | PA6 / PA7 | 左编码器 A/B |
 | TIM4_CH1/CH2 | PB6 / PB7 | 右编码器 A/B |
-| LED PWM | PE14 或独立 TIM | 主灯亮度 |
+| LED PWM | PA5（`TIM2_CH1`） | 主灯亮度，**必须独立定时器**；TIM1 四个通道已全给轮子，共用比较寄存器会让开灯把右轮拉满 |
 | 电池 ADC | PA0 | 分压后输入，**不超过 3.3V** |
 | 急停按钮 | PC13 | 一端接 GND，另一端上拉；按下为低 |
 

@@ -483,16 +483,25 @@ static void test_state_is_resent_periodically(void)
     g_hal.tx_len = 0;
     tick_by(10);
     CHECK(tx_has(LD_T_ESTOP_STATE), "启动后应立即上报一次急停状态");
-    /* 串口没有 DDS 的 TRANSIENT_LOCAL，丢一帧就是丢了，所以要周期重发 */
-    CHECK(g_app.cfg.state_period_ms > 0u, "重发周期必须非 0");
+
+    /* 串口没有 DDS 的 TRANSIENT_LOCAL，丢一帧就是丢了，所以要周期重发。
+     * 原先这里只 CHECK(cfg.state_period_ms > 0) —— 那是默认常量，恒真；
+     * 把周期判断整段删掉这条用例照样绿。必须真的跨过周期再验一帧。 */
+    g_hal.tx_len = 0;
+    g_hal.tx_frames = 0;
+    tick_by(10);
+    CHECK(!tx_has(LD_T_ESTOP_STATE), "状态没变化时不该每拍都发");
+    tick_by(g_app.cfg.state_period_ms + 1u);
+    CHECK(tx_has(LD_T_ESTOP_STATE), "跨过 state_period_ms 必须周期重发");
 }
 
 static void test_unknown_frame_type_is_ignored(void)
 {
     uint8_t pl[2] = { 0x11, 0x22 };
-    uint32_t before = g_app.frames_ok;
+    uint32_t before;
 
     boot();
+    before = g_app.frames_ok;          /* 必须在 boot() 之后取：ld_app_init 会清零 */
     feed(0x7Fu, pl, 2);
     CHECK(g_app.frames_ok == before + 1u, "未知类型也应算作收到的合法帧");
     CHECK(g_app.wd.estop == 0, "未知类型不能改变急停状态");
@@ -511,22 +520,77 @@ static void test_bad_crc_does_not_feed_watchdog(void)
 
     feeds = g_hal.iwdg_feeds;
     raw(buf, (uint32_t)n);
+    tick_by(10);
     CHECK(g_hal.iwdg_feeds == feeds,
-          "CRC 错的帧不能喂 IWDG（否则链路坏了看门狗还以为一切正常）");
+          "CRC 错的帧不能建立心跳，控制环也就不该喂 IWDG");
     CHECK(g_app.frames_bad >= 1u, "CRC 错要计入统计");
 }
 
-static void test_heartbeat_is_the_only_iwdg_feed(void)
+static void test_iwdg_is_fed_by_control_loop_only(void)
 {
     int feeds;
 
     boot();
     feeds = g_hal.iwdg_feeds;
     tick_by(1000);
-    CHECK(g_hal.iwdg_feeds == feeds, "tick 里不能喂 IWDG（主循环卡死等于没看门狗）");
+    CHECK(g_hal.iwdg_feeds == feeds, "没有心跳就不该喂狗");
 
     hb();
-    CHECK(g_hal.iwdg_feeds == feeds + 1, "每帧合法心跳喂一次");
+    CHECK(g_hal.iwdg_feeds == feeds,
+          "UART RX ISR 里不能喂 IWDG：控制环卡死时 RX 中断照样响应，等于没有看门狗");
+
+    tick_by(10);
+    CHECK(g_hal.iwdg_feeds == feeds + 1,
+          "控制环完整跑完一拍 + 心跳新鲜，才喂一次");
+
+    /* 心跳断流后立刻停喂：1s 内 IWDG 会复位，复位上电默认断使能。 */
+    feeds = g_hal.iwdg_feeds;
+    tick_by(400);
+    CHECK(g_hal.iwdg_feeds == feeds, "心跳超时后必须停止喂狗");
+    CHECK(g_hal.motor_on == 0, "心跳超时后必须断使能");
+}
+
+/* 一次 DMA 空闲中断送进来多于输出槽数量的合法帧，必须一个都不丢。 */
+static void test_many_frames_in_one_rx_are_all_handled(void)
+{
+    uint8_t stream[LD_FRAME_MAX * 8];
+    uint8_t one[LD_FRAME_MAX];
+    uint8_t pl[8] = { 0 };
+    size_t total = 0;
+    size_t n;
+    int k;
+
+    boot();
+    n = ld_encode(LD_T_CMD_VEL, pl, 8, one, sizeof(one));
+    CHECK(n > 0, "编码失败");
+    for (k = 0; k < 6; k++) {
+        memcpy(&stream[total], one, n);
+        total += n;
+    }
+    raw(stream, (uint32_t)total);
+    CHECK(g_app.frames_ok == 6u, "6 个合法帧必须全部交付（实得 %u）",
+          (unsigned)g_app.frames_ok);
+    CHECK(g_app.cmd_frames == 6u, "6 条 CMD_VEL 必须全部生效（实得 %u）",
+          (unsigned)g_app.cmd_frames);
+}
+
+/* 与 Python decode_* 对齐：长度不精确相等的帧一律拒绝。 */
+static void test_wrong_payload_length_is_rejected(void)
+{
+    uint8_t buf[LD_FRAME_MAX];
+    uint8_t pl[9] = { 0 };
+    size_t n;
+
+    boot();
+    n = ld_encode(LD_T_CMD_VEL, pl, 9, buf, sizeof(buf));
+    CHECK(n > 0, "编码失败");
+    raw(buf, (uint32_t)n);
+    CHECK(g_app.cmd_frames == 0u, "LEN=9 的 CMD_VEL 必须被拒绝（Python 侧也会返回 None）");
+
+    n = ld_encode(LD_T_LED, pl, 8, buf, sizeof(buf));
+    CHECK(n > 0, "编码失败");
+    raw(buf, (uint32_t)n);
+    CHECK(g_hal.led == 0.0f, "LEN=8 的 LED 帧必须被拒绝");
 }
 
 /*
@@ -717,7 +781,9 @@ int main(void)
     test_state_is_resent_periodically();
     test_unknown_frame_type_is_ignored();
     test_bad_crc_does_not_feed_watchdog();
-    test_heartbeat_is_the_only_iwdg_feed();
+    test_iwdg_is_fed_by_control_loop_only();
+    test_many_frames_in_one_rx_are_all_handled();
+    test_wrong_payload_length_is_rejected();
     test_overcurrent_trips_and_cuts_power();
     test_undervoltage_trips_and_hysteresis();
     test_undervoltage_ignores_implausible_voltage();

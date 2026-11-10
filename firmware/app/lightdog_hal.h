@@ -46,8 +46,10 @@ typedef struct {
     int32_t (*encoder_read)(uint8_t side);
 
     /* 喂独立看门狗 IWDG。
-     * **只允许在收到合法心跳时调用**（见 lightdog_app.c 的 handle_frame）。
-     * 放进 while(1) 里喂，主循环卡死时照样喂，等于没有看门狗。 */
+     * **只允许由 ld_app_tick 在「控制环完整跑完一拍 + 心跳新鲜」时调用**。
+     * 绝不能在 UART RX ISR / handle_frame 里喂：控制环卡死后 RX 中断照样
+     * 响应，狗照样被喂，IWDG 就形同虚设（车保持最后一次使能一直跑）。
+     * 放进 while(1) 里无条件喂同样是错的。 */
     void (*iwdg_feed)(void);
 
     /* ---- 以下为可选项，NULL 表示该能力不存在，上层自动跳过 ---- */

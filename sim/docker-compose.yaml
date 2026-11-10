@@ -32,9 +32,10 @@ services:
     # 为停止，不会被重启策略复活。
     restart: unless-stopped
     healthcheck:
-      # 只查两个与安全最相关、且名字由我们掌控的进程在不在，不用慢的 ros2 CLI。
-      # twist_mux = /cmd_vel 的兜零仲裁者；lightdog_sim.launch = 传感/驱动链路本体。
-      test: ["CMD-SHELL", "pgrep -f lightdog_twist_mux.py >/dev/null && pgrep -f lightdog_sim.launch.py >/dev/null"]
+      # 查三个与安全/对外服务最相关、且名字由我们掌控的进程，不用慢的 ros2 CLI。
+      # twist_mux = /cmd_vel 的兜零仲裁者；lightdog_sim.launch = 传感/驱动链路本体；
+      # lightdog_server = :8000 手机端。P4 关掉时不检查最后一项（$$ 是 compose 转义）。
+      test: ["CMD-SHELL", "pgrep -f lightdog_twist_mux.py >/dev/null && pgrep -f lightdog_sim.launch.py >/dev/null && { [ \"$${ENABLE_P4:-1}\" != 1 ] || pgrep -f lightdog_server.py >/dev/null; }"]
       interval: 15s
       timeout: 5s
       retries: 4

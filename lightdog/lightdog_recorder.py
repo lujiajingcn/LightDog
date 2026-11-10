@@ -285,6 +285,11 @@ class Recorder(Node):
         self.latest_t = None
         self.n_frames = 0
         self.pending = []            # 待合成事件
+        # 每个待合成事件都会起一个线程，且线程内要 join 写盘队列、开
+        # VideoCapture / VideoWriter。有人持续往 /recorder/event 灌消息时，
+        # 无界起线程会把 fd / 内存打满。并发上限 2，超出的留到下一拍。
+        self.MAX_PENDING = 32
+        self._assemble_sem = threading.BoundedSemaphore(2)
         self.n_events = 0
         self.warned_codec = False
         self._last_dir_gc = 0.0      # events/ snapshots/ 清理的节流时刻（墙钟）
@@ -361,6 +366,8 @@ class Recorder(Node):
         配额就永远触发不了，卡慢慢写满。
         """
         if not isinstance(rec, dict) or not rec.get('file'):
+            return None
+        if self._clip_path(rec) is None:
             return None
         for k in ('t0', 't1'):
             if k not in rec:
@@ -625,6 +632,10 @@ class Recorder(Node):
             't_from': t_ev - pre, 't_to': t_ev + post,
             'wall': time.time(),
         }
+        if len(self.pending) >= self.MAX_PENDING:
+            self.get_logger().warn(
+                f'待合成事件已达上限 {self.MAX_PENDING}，丢弃本次事件（{etype}）')
+            return
         self.pending.append(ctx)
         self.get_logger().info(
             f'事件 {etype}（{label}）已受理：{t_ev:.1f}s，窗口 -{pre:.0f}s/+{post:.0f}s')
@@ -652,9 +663,15 @@ class Recorder(Node):
         if due:
             self.pending = [c for c in self.pending if now < c['t_to']]
             self._flush_segment()      # 后置窗口的帧也要落盘
+            rest = []
             for c in due:
-                threading.Thread(target=self._assemble_event, args=(c,),
-                                 daemon=True).start()
+                if self._assemble_sem.acquire(blocking=False):
+                    threading.Thread(target=self._assemble_worker, args=(c,),
+                                     daemon=True).start()
+                else:
+                    # 并发满了就留到下一拍，不丢事件也不额外起线程
+                    rest.append(c)
+            self.pending.extend(rest)
 
         self._gc()
         wall = time.time()
@@ -665,6 +682,15 @@ class Recorder(Node):
         self._publish_state(now)
 
     # ---------- 事件合成 ----------
+
+    def _assemble_worker(self, ctx):
+        """线程壳：无论合成成功还是抛异常，都必须把并发名额还回去。"""
+        try:
+            self._assemble_event(ctx)
+        except Exception as e:                              # noqa: BLE001
+            self.get_logger().error(f'事件合成线程异常：{type(e).__name__}: {e}')
+        finally:
+            self._assemble_sem.release()
 
     def _assemble_event(self, ctx):
         """把所有相关分段读回来，裁出窗口内的帧，重新编码成一个事件视频。
@@ -833,7 +859,7 @@ class Recorder(Node):
         内存峰值就只有当前这一帧。
         """
         path = self._clip_path(clip)
-        if not os.path.exists(path):
+        if path is None or not os.path.exists(path):
             return
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
@@ -908,6 +934,10 @@ class Recorder(Node):
 
     def _drop_clip(self, clip):
         p = self._clip_path(clip)
+        if p is None:
+            self.get_logger().warn(
+                f'索引里的 file 不是纯文件名，拒绝删除：{clip.get("file")!r}')
+            return
         try:
             os.remove(p)
         except FileNotFoundError:
@@ -916,7 +946,17 @@ class Recorder(Node):
             self.get_logger().warn(f'删除 {p} 失败：{e}')
 
     def _clip_path(self, clip):
-        return os.path.join(self.clips_dir, clip['file'])
+        """索引里的 file 必须是纯文件名：它会被 _drop_clip 传给 os.remove。
+
+        clips.jsonl 与录像共用一个数据目录，一旦有别的写入者（或旧版索引）
+        把 file 写成 `../../xxx`，清理逻辑就会删到目录外面去。
+        """
+        name = clip.get('file') if isinstance(clip, dict) else None
+        if (not isinstance(name, str) or not name or name in ('.', '..')
+                or '/' in name or '\\' in name or '\x00' in name
+                or name != os.path.basename(name)):
+            return None
+        return os.path.join(self.clips_dir, name)
 
     def _rewrite_index(self):
         """索引是 append-only 的，清理后重写成一个小文件，避免无限增长。
@@ -948,7 +988,9 @@ class Recorder(Node):
         items = []
         for name in names:
             d = os.path.join(self.events_dir, name)
-            if not os.path.isdir(d):
+            # os.path.isdir 会跟随符号链接：不加这一条，指向外部目录的链接
+            # 会被当成普通事件目录交给 _rm_tree 递归删光。
+            if os.path.islink(d) or not os.path.isdir(d):
                 continue
             # 正在合成的目录绝对不能删：video.part.mp4 还在写
             if os.path.exists(os.path.join(d, 'video.part.mp4')):
@@ -1000,6 +1042,8 @@ class Recorder(Node):
     def _rm_tree(cls, path):
         """删除一个目录及其内容；失败只返回 False，不抛（清理不能影响录像）。"""
         try:
+            if os.path.islink(path):
+                return False
             with os.scandir(path) as it:
                 entries = list(it)
             for e in entries:

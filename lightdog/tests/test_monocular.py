@@ -141,7 +141,7 @@ class TestBBoxToPoint(unittest.TestCase):
     RGB = np.zeros((480, 640, 3), dtype=np.uint8)
     BBOX = (300, 100, 340, 299)          # px_h = 200
 
-    def _make(self, backend='onnx', mode='auto', depth=None, mono=None):
+    def _make(self, backend='onnx', mode='auto', depth=None, mono=None, fy=None):
         ns = {'np': np, 'time': time, 'image_to_depth': lambda m: m}
         fns = extract_methods(P2_SRC, 'PersonDetector', ['_bbox_to_point'], ns=ns)
         log = Log()
@@ -152,7 +152,8 @@ class TestBBoxToPoint(unittest.TestCase):
             depth_timeout=1.0,
             mono_height=mono if mono is not None
             else F2['resolve_mono_height'](backend, 0.62, 1.70),
-            fx=615.0, cx=320.0, cy=240.0,
+            fx=615.0, fy=fy if fy is not None else 615.0,
+            cx=320.0, cy=240.0,
             cam_off=[-0.065, 0.0, 0.255],
             rng_min=0.30, rng_max=8.00,
             publish_debug=False,
@@ -194,6 +195,20 @@ class TestBBoxToPoint(unittest.TestCase):
         wrong = self._z(obj._bbox_to_point(self.RGB, self.BBOX, None))
         self.assertLess(wrong, correct * 0.4)
         self.assertGreater(wrong, 0.30)        # range_min 会放行，正是危险所在
+
+    def test_vertical_pixels_use_fy_not_fx(self):
+        """px_h 是竖直像素，单目 z 和 y_cam 都必须用 fy。
+
+        真实相机标定出来 fx != fy 是常态；全用 fx 会让跟随距离按 fy/fx
+        系统性偏差，而且不报任何错。
+        """
+        obj, _ = self._make(mode='off', fy=800.0)
+        got = obj._bbox_to_point(self.RGB, self.BBOX, None)
+        z = 1.70 * 800.0 / 200.0
+        self.assertAlmostEqual(self._z(got), z, places=4)
+        v_c = 0.5 * (self.BBOX[1] + self.BBOX[3])
+        self.assertAlmostEqual(got[2], -(v_c - 240.0) / 800.0 * z + 0.255,
+                               places=4)
 
     def test_depth_wins_when_available(self):
         d = np.full((480, 640), 1.5, dtype=np.float32)
@@ -250,12 +265,16 @@ class TestYamlLiteralSafety(unittest.TestCase):
         self.assertEqual(yaml.safe_load("depth_mode: 'off'")['depth_mode'], 'off')
 
     def test_both_normalizers_reject_bool_with_an_actionable_hint(self):
-        for fn, fallback in ((F2['normalize_depth_mode'], 'auto'),
-                             (F5['normalize_fall_mode'], 'on')):
-            mode, err = fn(False)
-            self.assertEqual(mode, fallback)
-            self.assertIn('引号', err)
-            self.assertIn('YAML', err)
+        for fn in (F2['normalize_depth_mode'], F5['normalize_fall_mode']):
+            for raw in (True, False):
+                mode, err = fn(raw)
+                self.assertIn('引号', err)
+                self.assertIn('YAML', err)
+                # 关键：裸写 off（False）绝不能被反转成「启用」。
+                if fn is F5['normalize_fall_mode']:
+                    self.assertEqual(mode, 'on' if raw else 'off')
+                else:
+                    self.assertEqual(mode, 'auto')
 
     def test_checked_in_configs_have_string_depth_modes(self):
         for name in ('p2_params.yaml', 'p5_params.yaml'):

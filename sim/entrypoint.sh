@@ -233,7 +233,16 @@ echo ""
 # 安全仲裁者，掉了就没有人兜零，比 sim/slam 挂掉更该惊动编排。`wait -n` 返回
 # **先退出的那个子进程的退出码**；用 `|| rc=$?` 兜住 `set -e`，别在这一行就掀脚本。
 rc=0
-wait -n $MUX_PID $SIM_PID $SLAM_PID || rc=$?
+# I-004 只监控了 mux/sim/slam。P4/P5/system 崩了的话，容器还 healthy、
+# wait -n 也等不到任何东西 —— 表现是 :8000 打不开，而编排层毫无察觉。
+# 把已启用的 launch 一起纳入监控（未启用的变量为空，不能传进 wait）。
+MONITORED=("$MUX_PID" "$SIM_PID" "$SLAM_PID")
+for pid in "${P4_PID:-}" "${P5_PID:-}" "${SYS_PID:-}"; do
+  if [ -n "$pid" ]; then
+    MONITORED+=("$pid")
+  fi
+done
+wait -n "${MONITORED[@]}" || rc=$?
 
 # 收尾交给 trap EXIT 里的 cleanup（递归杀进程树），这里只决定退出码。
 if [ "$STOPPING" = "1" ]; then

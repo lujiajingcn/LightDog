@@ -69,6 +69,7 @@ import json
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 import rclpy
@@ -230,6 +231,10 @@ class VoiceBridge(Node):
         self._last_cmd_at = 0.0
         self._estop = False
         self._warned_tts = False
+        # TTS 子进程必须后台跑：say() 在单线程 spin 的订阅回调里，
+        # subprocess.run 卡在音频设备上最多 10s，期间 /voice/command
+        # 和 /safety/estop 全都不被处理。同时只准一个 TTS 在跑。
+        self._tts_lock = threading.Lock()
 
         self.create_subscription(
             String, str(p('command_topic').value), self._on_command, 10)
@@ -330,16 +335,27 @@ class VoiceBridge(Node):
 
         if not self.tts_command:
             return
-        try:
-            # 用 shlex 切分，绝不 shell=True：文本来自告警链路，虽然是我们
-            # 自己拼的，但一旦将来接了外部输入，shell 注入就是一次提权。
-            argv = [a.replace('{text}', s) for a in shlex.split(self.tts_command)]
-            subprocess.run(argv, capture_output=True, timeout=self.tts_timeout)
-        except (OSError, ValueError, subprocess.SubprocessError) as e:
-            if not self._warned_tts:
-                self._warned_tts = True
-                self.get_logger().error(
-                    f'tts_command 执行失败（{e}），后续只发 /voice/say 话题')
+        if not self._tts_lock.acquire(blocking=False):
+            self.get_logger().warn('上一条 TTS 还没结束，跳过本次（不阻塞回调）')
+            return
+
+        def _run_tts():
+            try:
+                # 用 shlex 切分，绝不 shell=True：文本来自告警链路，虽然是我们
+                # 自己拼的，但一旦将来接了外部输入，shell 注入就是一次提权。
+                argv = [a.replace('{text}', s)
+                        for a in shlex.split(self.tts_command)]
+                subprocess.run(argv, capture_output=True,
+                               timeout=self.tts_timeout)
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                if not self._warned_tts:
+                    self._warned_tts = True
+                    self.get_logger().error(
+                        f'tts_command 执行失败（{e}），后续只发 /voice/say 话题')
+            finally:
+                self._tts_lock.release()
+
+        threading.Thread(target=_run_tts, daemon=True).start()
 
 
 def main(args=None):
