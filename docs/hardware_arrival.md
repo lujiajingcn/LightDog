@@ -1,7 +1,9 @@
 # 实际到货硬件对照（RASPBOT V2 / 树莓派 5 16GB）
 
-> 资料来源：`C:\Users\lujiajing\Downloads\智能小车产品简介\IMG_7080.PNG` ~ `IMG_7103.PNG`（24 张商品详情截图，1170×2532）。
-> 本文只记录**图上写明**的规格与**代码里真实存在**的依赖；推断项一律标注「待确认」。
+> 资料来源：`C:\Users\lujiajing\Downloads\智能小车产品简介\IMG_7080.PNG` ~ `IMG_7103.PNG`（24 张商品详情截图，1170×2532），
+> 以及 2026-11-11 补查的淘宝原页（item `829645720397`）、亚博官方产品页 / 官方教程 /
+> 官方 GitHub / 经销商规格表 / 开源 I2C 驱动库，详见 **§九**。
+> 本文只记录**资料写明**的规格与**代码里真实存在**的依赖；推断项一律标注「待确认」。
 > 采购计划见 [`bom.md`](bom.md)，上真机通用坑见 [`hardware_readiness.md`](hardware_readiness.md)。
 > 本文与那两份的关系：它们写的是「计划买什么 / 买回来会在哪咬人」，本文写的是**「实际买到的是这台，跟计划差多少，下一步改哪里」**。
 
@@ -15,8 +17,8 @@
 | # | 冲突 | 严重度 | 是否要改代码 |
 |---|---|---|---|
 | C1 | 底盘是**四麦轮全向**，项目固件是**两轮差速** | 🔴 阻塞 | 要（协议帧 + 运动学 + 里程计） |
-| C2 | **没有 STM32**，Pi 5 直接驱动；项目整套 CRC16 串口协议没有目标硬件 | 🔴 阻塞 | 要（写 Linux 侧适配层） |
-| C3 | **TT 减速电机、参数表无编码器**；`/odom` 由固件上报帧驱动 | 🔴 阻塞 | 要（换里程计源或接受开环） |
+| C2 | **有板载 MCU + 出厂固件，但走 I2C 的 `Raspbot_Lib` Python API**，不是项目自写的 STM32 CRC16 串口协议（§九更正） | 🔴 阻塞 | 要（写 Linux 侧 I2C 适配层） |
+| C3 | **TT 减速电机，官方 I2C API 全清单无编码器 / 里程计 / IMU / 电压读取接口**；`/odom` 由固件上报帧驱动 | 🔴 阻塞 | 要（只能开环，§九已确证） |
 | C4 | 相机装在**二自由度可动云台**上，项目三个感知节点用静态 `camera_offset` | 🟠 高 | 要（锁云台或动态 TF） |
 | C5 | 预装 **Raspberry Pi OS + ROS 2 Humble**，项目是 **Ubuntu 24.04 + Jazzy** 生态 | 🟠 高 | 要选路线（见 §四） |
 | C6 | 回充标签用 **AprilTag**，项目 `dictionary: DICT_4X4_50`（ArUco） | 🟡 中 | 大概率只改一行参数 |
@@ -119,7 +121,7 @@
 - 两条路：① 把麦轮当四轮差速凑合（改动最小，能跑但精度差，且必须实测打滑系数）；
   ② 从 `T_CMD_VEL` 扩展 `linear.y`、四轮逆解矩阵、`T_ODOM` 的 `vx/vy`、URDF 一路改造 —— 这是改运动学，不是改参数。
 
-### C2 没有 STM32，串口协议没有目标硬件 🔴
+### C2 没有 STM32，串口协议没有目标硬件 🔴（措辞已按 §九 更正：板上有 MCU，走 I2C）
 
 - `docs/hardware_readiness.md` 的 D3 决策是「MCU = STM32，Pi 不再直接驱动电机」，
   `deploy/nodes.conf:45` 的 `mcu` 单元描述就是「下位机串口桥接（STM32）」。
@@ -331,6 +333,11 @@ marker 边长、桩位姿、存储容量；另加相机内参棋盘格标定、`
 **结论**：软件急停 ≠ 物理急停。真要恢复到原安全等级，仍需外接自锁按钮与硬件断使能，
 或外挂一块能跑 `firmware/` 的 STM32。这一条不能靠改参数解决。
 
+> 2026-11-11 更正：原表「商家协议未知 / CRC16 串口帧」按 §九 应读作
+> **本车是 I2C 寄存器 + 出厂固件，官方 Python 驱动库已确证**；缺的不再是「协议文档」，
+> 而是**电机编号与轮序映射**（官方两处教程互相矛盾），所以 `vendor_i2c` 在未填
+> `motor_id_map` 时同样强制 `self_test`。
+
 ### 8.4 上机前必做（按序）
 
 1. 换掉 `auth_token`、`sip_ami_secret`，配好 SSL 证书 —— 占位串不能上生产。
@@ -368,4 +375,129 @@ marker 边长、桩位姿、存储容量；另加相机内参棋盘格标定、`
 - P5 跌倒检测按普通相机路线保持停用（`fall-det: no`）。
 - Raspberry Pi OS + ROS2 Humble 下的 OpenCV aruco API、launch 参数类型推断**未上机验证**。
 - ONNX 模型未导出、相机内参与几何未实测、STM32 板级路径在这台车上不再适用。
+
+---
+
+## 九、官网 / 开源资料交叉核对（2026-11-11 补）
+
+> 起因：用户补了淘宝原链接，要求核对「截图里的信息可能不全」。核对结果是
+> **淘宝原页没有比 24 张截图多出任何可读文字**，但品牌官方教程里有几条
+> **推翻上一轮假设**的一手信息，其中两条直接决定「车到底会不会动」。
+
+### 9.1 淘宝原页到底取到了什么
+
+| 尝试 | 结果 |
+|---|---|
+| 短链 `https://e.tb.cn/h.j9KTeAgJNhupKxB?tk=flCi6dT730x` | 返回 12KB JS 跳板，无服务端重定向；HTML 里解析出 `item.htm?...&id=829645720397&price=599&suid=...`，即 **item id `829645720397`** |
+| `https://item.taobao.com/item.htm?id=829645720397` | **登录墙**（「登录页面」），无商品文字 |
+| `https://h5.m.taobao.com/awp/core/detail.htm?id=829645720397` | 只有 JS 壳 + base64 占位图 + 「店铺 / 客服 / 收藏 / 加入购物车 / 立即购买」，**规格文字全部在详情图里** |
+
+所以补全信息改用**品牌官方一手资料**（下表 A / A- 级），而不是继续爬淘宝。
+下单截图（`clipboard-2026-11-11T05-56-37-997Z-91d086f0.jpg`）另确认了已选 SKU：
+**豪华版（支持 AI 大模型功能）+ 含树莓派5-16GB 含 TF 卡 ¥2750**，颜色分类共 2 项，
+主板选项共 5 项（无主板不含 TF ¥615 / 含 TF ¥700 / 含 Pi5-4GB ¥1560 /
+含 Pi5-8GB ¥1985 / 含 Pi5-16GB ¥2750）。
+
+### 9.2 来源分级（关键：别把改装车当出厂车）
+
+| 级别 | 来源 | 采信内容 |
+|---|---|---|
+| **A 官方** | [`yahboom.com/tbdetails?id=623`](http://yahboom.com/tbdetails?id=623) 产品页、[`yahboom.net/study/RASPBOT-V2/12197`](https://www.yahboom.net/study/RASPBOT-V2/12197) 驱动库教程、[`Pi5-Board/12077`](https://www.yahboom.net/study/Pi5-Board/12077) 电机编号、[`YahboomTechnology/Raspbot-V2`](https://github.com/YahboomTechnology/Raspbot-V2) 官方仓库 | I2C 总线、完整驱动 API、出厂镜像路径、硬件清单、ROS2 Humble |
+| **A- 官方英文 / 经销商** | [`category.yahboom.net/products/raspbot-v2`](https://category.yahboom.net/products/raspbot-v2)、[RCDrone 规格表](https://rcdrone.top/zh/products/yahboom-raspbot-v2-robot)、[Eriksen 产品页](https://eriksen.co.th/index/product/detail/id/11497.html)、Cytron 16GB SKU | 云台 180°/110°、PD 5V/5A、AprilTag 功能、版本差异、7.4V 2S 2000mAh |
+| **B 第三方开源** | [PyPI `raspbot-v2`](https://pypi.org/project/raspbot-v2/) / [`nbourre/raspbotv2-lib`](https://github.com/nbourre/raspbotv2-lib) | I2C **bus 1 / 0x2B**、OLED 0x3C、原厂 `Raspbot_Lib` API 迁移表、舵机 home 角 |
+| **C 混杂改装，不采信为出厂配置** | `sandraschi/yahboom-mcp` 硬件栈、`jedld/raspbotv2_ros` | 这两份写了「标配正交编码器 + IMU + ESP32-S3 + micro-ROS + LiDAR + Hailo + 12.6V 电池」，与官方 7.4V 2S / 纯 I2C 清单冲突，明显混了别的车型与用户自行加装件；其自身也标注 `revision-dependent`、`verify on your sticker` |
+| 旁证 | 京东「亚博智能官方旗舰店」SKU | 产品尺寸 **长 20.8 / 宽 16.5 / 高 12.7 cm**，与截图 `208.74 × 165.83 × 127.05 mm` 一致 → 几何初值可信 |
+
+### 9.3 新增 / 更正的事实（对照 §一、§三、§八）
+
+| # | 项 | 之前（仅凭截图） | 官方资料确认 | 对代码的影响 |
+|---|---|---|---|---|
+| 1 | **驱动板总线** | 未知，按「串口协议待确认」设计 | **I2C**。官方 `class Raspbot()` docstring 原文「communicate with the Raspberry Pi car via I2C」，含 `get_i2c_device(address, i2c_bus)`；官方产品页「通过 I2C 与树莓派5通信，从而驱动舵机、电机、传感器」；第三方库给出 bus 1 / **0x2B** | 新增 `vendor_i2c` 后端；`direct_serial` 标注「与本车不符」 |
+| 2 | **板载 MCU** | C2 写「没有 STM32，Pi 5 直驱」 | **有板载 MCU + 出厂固件**，官方产品页「出厂自带外设驱动固件程序，用户可直接调用驱动 API」。只是它不是我们自写的 STM32 CRC16 固件 | C2 措辞更正：缺的不是 MCU，是「我们自己的固件」 |
+| 3 | **出厂驱动形态** | 推测商家 ROS 节点订阅 `/cmd_vel` | 出厂是 **Python / Jupyter 驱动库 `Raspbot_Lib`**，路径 `~/py_install`（教程示例版本 V0.0.2），`sudo python3 setup.py install`。官方那些带 `/cmd_vel` + `/scan` + `/imu` 的教程属于 **MicroROS / ROSMASTER 系列**，不是这台车 | `vendor_topic` 默认路径**很可能没有订阅者 → 车不动**；已改成默认 `vendor_i2c`，并给 `vendor_topic` 加订阅者数告警 |
+| 4 | **电机控制接口** | 未知 | `Ctrl_Muto(motor_id, motor_speed)`：-255..255；`Ctrl_Car(id, dir, speed)`：dir 0/1、0..255。**开环 PWM，无速度反馈** | 麦轮逆解出的四轮线速度可直接映射成 PWM 下发 |
+| 5 | **编码器 / 里程计** | 「参数表没列，待确认」 | **官方 API 全清单里没有任何编码器、轮速、里程计、IMU、电压读取函数**；`read_data_array` 在示例里只用于 `0x0a` 循迹、`0x1a/0x1b` 超声波、`0x0c` 红外。第三方重写原厂库的完整功能表同样没有编码器 | `odom_source: openloop` 从「待确认」升级为**硬约束**；`battery_source: none` 发 NaN 也确认是对的 |
+| 6 | **灯条** | 「协议未确认，只记录不下发」 | `Ctrl_WQ2812_brightness_ALL(R,G,B)`、`Ctrl_WQ2812_ALL(state,color)` | `led_backend: i2c`，亮度可真正下发 |
+| 7 | **云台** | 靠人工锁死 + 静态外参 | `Ctrl_Servo(id, angle)`，id 1/2、0–180°（第三方注明 id2 限 0–110°、home 为 90/25） | 具备「软件主动锁角」条件，但**本轮未接**（角度语义未统一，不猜）；仍靠 §8.4 第 4 条运行前置条件 |
+| 8 | **蜂鸣器 / 超声波** | 图上有 | `Ctrl_BEEP_Switch(state)`、`Ctrl_Ulatist_Switch(state)` + `read_data_array(0x1b,1)<<8 | read_data_array(0x1a,1)`（单位 mm） | 后续可接近距离避障；**本轮未接**，项目 `collision_monitor` 仍是 `/scan` 契约 |
+| 9 | **电机编号与轮序** | 完全未知 | ⚠️ **官方两处教程互相矛盾**：`RASPBOT-V2/12197` 测试代码注释 `Ctrl_Car(0..3)` = `L1,L2,R1,R2`；`Pi5-Board/12077` 却写 `motor_id=[1,4]` = `M1..M4`。且注释顺序疑为 (左前, 左后, 右前, 右后)，与代码 `WHEEL_NAMES=(FL,FR,RL,RR)` 不同 | **不做默认猜测**：新增 `motor_id_map`，空串时 `vendor_i2c` 强制降级 `self_test`，一个 I2C 字节都不发 |
+| 10 | **AprilTag** | 截图已确认「支持识别 AprilTag」 | 官方 / 经销商功能列表明确「**AprilTag 标签码识别 / 跟踪 / 追随**」、QR 码控制 | 验证 §C6 的 `dictionary: auto` 决策正确；**具体 AprilTag 家族仍未给**，仍靠 auto 多字典试 |
+| 11 | 系统 / 供电 / 电池 | Pi OS + Humble、5.1V/5A、7.4V 2000mAh 约 2h | 官方一致：Raspberry Pi OS + ROS2 Humble、Type-C PD **5V/5A**、**7.4V 2S 2000mAh 约 2.1 小时** | §四 路线判断不变；`vcgencmd get_throttled` 仍要验 |
+| 12 | 无 LiDAR / IMU / 深度相机 | 推断「没有」 | 官方产品页与规格表**均未列**这三项 | Nav2 costmap 仍缺 `/scan`；P5 保持 `depth_mode: 'off'` / `fall-det: no` |
+| 13 | 语音链路 | 离线词条 + 通义千问 | 官方：实时接入通义千问 + 内置三模型（语言 / 语音 / 视觉）+ RAG + 远场拾音 / 回声消除 / 降噪 | 输出仍在**商家 Python 程序内部**，未桥接到 `/voice/command`（未变） |
+| 14 | 课程数 | 截图「16 节」 | 经销商写「160 lessons」 | 冲突、低价值，不采信任一方，不影响代码 |
+
+### 9.4 官方 `Raspbot_Lib.Raspbot` API 全清单（教程 7.6 逐字要点）
+
+```
+get_i2c_device(address, i2c_bus) / write_u8(reg,data) / write_reg(reg)
+write_array(reg,data) / read_data_byte() / read_data_array(reg,length)
+Ctrl_Car(motor_id, motor_dir, motor_speed)      0..255, dir 0=正 1=反
+Ctrl_Muto(motor_id, motor_speed)                 -255..255, 符号定方向
+Ctrl_Servo(id, angle)                            0..180°
+Ctrl_WQ2812_ALL / _Alone / _brightness_ALL / _brightness_Alone
+Ctrl_IR_Switch / Ctrl_BEEP_Switch / Ctrl_Ulatist_Switch
++ LightShow 类（灯效）
+```
+
+**没有** `get_encoder` / `get_odom` / `get_imu` / `get_battery` / `set_car_motion(vx,vy,wz)`。
+最后那个 `set_car_motion` 是 **ROSMASTER X3 的 `Rosmaster_Lib`**（另一款带编码器的车），
+不能拿来套这台车 —— 这也是把 C 级混杂文档当真最容易踩的坑。
+
+### 9.5 上机 5 分钟核验（做这步之前车不会动，是故意的）
+
+```bash
+# 1) I2C 设备是否存在（0x2B 驱动板、0x3C OLED；地址随 revision 可能变）
+sudo i2cdetect -y 1
+
+# 2) 官方库是否在出厂镜像里
+python3 -c "from Raspbot_Lib import Raspbot; print(Raspbot)"
+
+# 3) 确认出厂并没有 ROS 底盘节点（若为空，vendor_topic 后端就是死路）
+ros2 topic info /cmd_vel
+
+# 4) 把车架起来（轮子离地），逐个单动，记下「编号 -> 哪个轮子转」
+python3 - <<'PY'
+from Raspbot_Lib import Raspbot
+import time
+bot = Raspbot()
+for mid in (0, 1, 2, 3):          # 若官方是 1-4 体系，改 (1,2,3,4)
+    print('motor', mid)
+    bot.Ctrl_Muto(mid, 80); time.sleep(1.0); bot.Ctrl_Muto(mid, 0)
+PY
+```
+
+把第 4 步结果按 **`FL,FR,RL,RR`** 顺序写进 `config/raspbot_params.yaml` 的
+`motor_id_map`（如 `'0,2,1,3'`）。填错 = 车横着走 / 原地打转；**空串才是安全默认**。
+填好后 `/raspbot/diag` 里的 `protocol_blocked` 会变 `false`、`motor_id_map` 会列出映射。
+
+### 9.6 仍未确认（别当成已修）
+
+- 电机编号体系（0-3 还是 1-4）+「编号 → 轮子位置」映射 —— **上机前唯一阻塞项**。
+- I2C 地址 `0x2B` 是否是你这台 revision（官方教程只给 `get_i2c_device(address, i2c_bus)`，具体地址来自第三方库）。
+- AprilTag 具体家族、目标 id、marker 黑框边长（决定 `marker_length`）。
+- 相机话题名、`camera_info` 内参、云台锁定角度、`camera_offset` / `base_link_height`。
+- `/raspbot/button` 点动按键怎么接进 ROS：官方只给 `read_data_array`，没给按键寄存器地址。
+- 超声波能否接到 `collision_monitor`（现契约是 `/scan`）；无 LiDAR 时全局导航仍不可用。
+- 语音模块 → `/voice/command` 桥接；Humble 下 OpenCV aruco API 与 launch 裸 `LaunchConfiguration` 类型推断。
+- ONNX 模型导出、相机内参 / 几何六项实测、`auth_token` / `sip_ami_secret` 占位串替换。
+
+### 9.7 本次据官方资料改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `lightdog/lightdog_raspbot_driver.py` | 新增 `vendor_i2c` 后端（调 `Ctrl_Muto` / `Ctrl_WQ2812_brightness_ALL`）；纯函数 `parse_motor_id_map` / `wheel_speeds_to_pwm`；`motor_id_map` 未实测时**强制 self_test**；I2C 下发失败补发全零；`vendor_topic` 无订阅者告警；diag 增 `block_reason` / `motor_id_map` / `vendor_subscribers`；文件头与后端说明改写 |
+| `lightdog/config/raspbot_params.yaml` | 默认 `driver_backend: vendor_i2c`、`motor_id_map: ''`（TODO）、`led_backend: i2c`；`i2c_module/class`、`motor_pwm_scale`；注释更正为 I2C 事实 |
+| `lightdog/tests/test_raspbot.py` | 新增 `TestOfficialI2CBackend`（编号解析、PWM 映射 / 钳位 / NaN、官方 API 钉住）+ 3 项安全静态不变量；配置断言改为 I2C 默认值 |
+| 本文档 | §〇 C2/C3、§三 C2 标题、§8.3 更正注记，以及本 §九 |
+
+### 9.8 本轮验证证据
+
+| 检查 | 结果 |
+|---|---|
+| `PATH=/c/MinGW/bin:$PATH python lightdog/tests/run.py` | **420 项：通过 414 / 失败 0 / 跳过 6**（比 §8.5 的 411 项 +9） |
+| 6 个 skip | 全是 Windows 无 `/proc` 的 `TestLiveSampling`，不是假绿 |
+| `python -m pyflakes lightdog deploy sim` / `bash -n` × 4 / `nodes.conf` 9 列 | RC=0 / OK / OK |
+| 固件 C 自检（本轮未改 C） | `-Werror` 零警告，94 + 268 项全过 |
+| 回退验证 | **9/9 CAUGHT**（轮序解析、NaN、PWM 上限、`self_test` 守卫、失败补零、无订阅者告警、编号不硬编码、默认后端、灯条后端），全部 `restored=True`，恢复后 `test_raspbot` rc=0 |
 

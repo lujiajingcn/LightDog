@@ -6,14 +6,16 @@
     /safety/estop   ──┘                          └──> /raspbot/diag（后端、闭锁、协议状态）
        /raspbot/button ─┘        (Pi 直驱)       └──> /safety/estop（按键 -> 软件闭锁）
                                    ↓
-                     商家驱动板的 /cmd_vel、四轮速度、或串口模板
+                     官方 Raspbot_Lib 的 I2C 寄存器（Ctrl_Muto）
 
 ## 为什么要有这个节点
 
-`docs/hardware_arrival.md` 记录的实车是：**Pi 5 直驱 + 机器人驱动板，没有 STM32；
-四个麦克纳姆轮 + TT 减速电机；产品参数表没有编码器；只有一个点动「按键」，
-没有自锁蘑菇头急停**。所以 `lightdog_mcu_bridge.py` 依赖的 CRC16 帧、IWDG、
-编码器里程计、物理按钮闭锁在这台车上全都没有对应的硬件。
+`docs/hardware_arrival.md` 记录的实车是：**Pi 5 + 机器人驱动板（板载 MCU +
+出厂固件），通过 I2C 用 Python 驱动库 `Raspbot_Lib` 控制，不是我们自写的 STM32
+CRC16 串口协议；四个麦克纳姆轮 + TT 减速电机，官方 I2C API 全清单里没有任何
+编码器 / 里程计 / IMU / 电压读取函数；只有一个点动「按键」，没有自锁蘑菇头急停**。
+所以 `lightdog_mcu_bridge.py` 依赖的 CRC16 帧、IWDG、编码器里程计、物理按钮闭锁
+在这台车上全都没有对应的硬件。
 
 本节点保留上层完全相同的 ROS 契约（速度进，odom / 电量 / 急停出），只把
 「下位机」这一层换成实车能用的东西：
@@ -21,15 +23,23 @@
 1. **全向运动学**：`/cmd_vel_muxed` 是 Twist，`twist_mux` 本来就把 `linear.y`
    透传下来（`lightdog_twist_mux.py:517`）。这里做 X 型麦轮逆解，四个轮速
    按最大值**等比缩放**（截断某一个轮子会悄悄改变整车运动方向）。
-2. **后端可插拔**，因为商家驱动板的串口协议文档还没拿到：
-   - `vendor_topic`（默认）：把 Twist 转发给商家 ROS 驱动订阅的话题（默认 `/cmd_vel`）。
-     这也补上了历史那条"真机无 ros_gz_bridge 时 `/cmd_vel` 没人消费"的缺口。
-   - `motor_array`：发布 `Float32MultiArray` 四轮线速度，商家若提供此接口可直接用。
-   - `direct_serial`：按可配置模板发串口。**协议未确认（`protocol_confirmed=false`）
-     时强制降级为 `self_test`，一个字节都不发** —— 不猜协议，猜错会让车乱跑。
-   - `self_test`：只跑逻辑不发包，用于 Pi 上离线自检。
+2. **后端可插拔**。官方教程已给出确切的 I2C 驱动 API（`Ctrl_Muto` 等），
+   但电机编号 / 轮序映射在官方两处教程里互相矛盾，必须上机实测：
+   - `vendor_i2c`（默认）：`from Raspbot_Lib import Raspbot`，麦轮逆解后逐个调
+     `Ctrl_Muto(motor_id, pwm)`（-255..255 开环 PWM）。**`motor_id_map` 没实测
+     填好时强制降级 `self_test`，一个字节都不发** —— 猜错轮序会让车乱跑。
+   - `vendor_topic`：把 Twist 转发给 ROS 底盘节点（默认 `/cmd_vel`）。注意官方
+     RASPBOT V2 出厂驱动是 Python/Jupyter API，**不是 ROS 底盘节点**，这个后端
+     只有在你自己起了订阅者时才有用；无订阅者时 diag 会告警。
+   - `motor_array`：发布 `Float32MultiArray` 四轮线速度。
+   - `direct_serial`：按模板发串口 —— **与本车不符**（本车是 I2C），仅为通用方案
+     保留；`protocol_confirmed=false` 时同样强制降级 `self_test`。
+   - `self_test`：只跑逻辑不发包。
 3. **里程计**：默认 `openloop`，按实际下发速度积分，并在 diag 里明说"开环、会漂"。
-   拿到编码器或商家 `/odom` 后把 `odom_source` 改成 `vendor` 即可。
+   这不是「还没确认有没有编码器」：官方 `Raspbot_Lib` 的完整 API 清单里只有
+   `Ctrl_*` 写函数和 `read_data_array`（仅用于循迹 / 超声波 / 红外寄存器），
+   **没有编码器、轮速、里程计、IMU 或电压的读取接口**。若日后外接了能发
+   `/odom` 的节点，把 `odom_source` 改成 `vendor` 即可。
 4. **急停**：车上没有自锁按钮，所以 `/raspbot/button` 的点动信号由**软件补闭锁**
    （松手不自动恢复），并明确标注「断电不保持、电气回路没有硬断 PWM」，
    这与原固件的物理闭锁不是等价安全等级，见 `docs/hardware_arrival.md` §C2/C3。
@@ -43,6 +53,7 @@
 所以在拿到遥测前发 NaN 表示"不知道"，绝不填 0。
 """
 
+import importlib
 import json
 import math
 import sys
@@ -61,7 +72,8 @@ from lightdog_qos import SAFETY_QOS
 #: 轮序固定：左前、右前、左后、右后。改接线必须同步改这里和模板里的 {m1..m4}。
 WHEEL_NAMES = ('FL', 'FR', 'RL', 'RR')
 
-BACKENDS = ('vendor_topic', 'motor_array', 'direct_serial', 'self_test')
+BACKENDS = ('vendor_i2c', 'vendor_topic', 'motor_array', 'direct_serial',
+             'self_test')
 ODOM_SOURCES = ('openloop', 'vendor', 'none')
 
 
@@ -126,6 +138,53 @@ def cmd_to_send(vx, vy, wz, estop, now, wall, hold):
     return vx, vy, wz
 
 
+def parse_motor_id_map(raw):
+    """解析 '0,1,2,3' 形式的电机编号映射，按 WHEEL_NAMES 顺序（FL,FR,RL,RR）。
+
+    官方两处教程冲突：`RASPBOT-V2/12197` 的测试代码注释用 0-3（L1,L2,R1,R2），
+    `Pi5-Board/12077` 却写 1-4（M1..M4），且都没给「编号 -> 轮子位置」的图。
+    所以这里**不设默认值**：空串 / 非四个不重复整数 / 越界一律返回 None，
+    调用方必须据此降级 self_test，绝不猜一个能用的值出来。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    parts = [x.strip() for x in text.split(',')]
+    if len(parts) != 4:
+        return None
+    ids = []
+    for x in parts:
+        try:
+            v = int(x)
+        except (TypeError, ValueError):
+            return None
+        if v < 0 or v > 8:
+            return None
+        ids.append(v)
+    if len(set(ids)) != 4:
+        return None
+    return tuple(ids)
+
+
+def wheel_speeds_to_pwm(speeds, max_wheel, pwm_scale):
+    """四轮轮缘线速度 (m/s) -> `Ctrl_Muto` 的开环 PWM 整数 (-255..255)。
+
+    `Ctrl_Muto` 只吃 PWM，没有速度闭环（官方 API 无编码器读数）。NaN 按 0；
+    max_wheel / pwm_scale 非正时全返回 0，宁可不动也不发越界值。
+    """
+    if max_wheel <= 0.0 or pwm_scale <= 0.0:
+        return (0, 0, 0, 0)
+    lim = int(pwm_scale)
+    out = []
+    for s in speeds:
+        v = 0.0 if s != s else max(-max_wheel, min(max_wheel, float(s)))
+        pwm = int(round(v / max_wheel * pwm_scale))
+        out.append(max(-lim, min(lim, pwm)))
+    return tuple(out)
+
+
 def _quat_from_yaw(yaw):
     half = 0.5 * float(yaw)
     return math.sin(half), math.cos(half)
@@ -146,6 +205,13 @@ class RaspbotDriver(Node):
                                'M {m1:.3f} {m2:.3f} {m3:.3f} {m4:.3f}\n')
         self.declare_parameter('protocol_confirmed', False)
         self.declare_parameter('reconnect_sec', 2.0)
+
+        # ---- 官方 I2C 驱动（Raspbot_Lib，出厂镜像自带 ~/py_install）----
+        # 电机编号 / 轮序官方没给一致的答案，必须上机四轮单动实测后填。
+        self.declare_parameter('i2c_module', 'Raspbot_Lib')
+        self.declare_parameter('i2c_class', 'Raspbot')
+        self.declare_parameter('motor_id_map', '')
+        self.declare_parameter('motor_pwm_scale', 255.0)
 
         # ---- 麦轮几何（实车待实测，值是按尺寸图的初值）----
         # 轴距/轮距取尺寸图 117.20 / 165.83 mm 的初值，代码里再各取一半。
@@ -191,13 +257,27 @@ class RaspbotDriver(Node):
             self.backend = 'self_test'
         self.protocol_confirmed = bool(p('protocol_confirmed').value)
         self.protocol_blocked = False
+        self.block_reason = ''
+        self.i2c_module = str(p('i2c_module').value)
+        self.i2c_class = str(p('i2c_class').value)
+        self.motor_id_map = parse_motor_id_map(p('motor_id_map').value)
+        self.motor_pwm_scale = float(p('motor_pwm_scale').value)
         if self.backend == 'direct_serial' and not self.protocol_confirmed:
-            # 猜错串口协议的后果是车乱跑，宁可不动。
+            # 猜错串口协议的后果是车乱跑，宁可不动；本车其实是 I2C，见文件头。
             self.get_logger().error(
                 'direct_serial 的商家协议还没确认（protocol_confirmed=false）——'
-                '强制降级 self_test，一字节都不发。拿到协议文档后再改参数')
+                '强制降级 self_test，一字节都不发；本车正确后端是 vendor_i2c')
             self.backend = 'self_test'
             self.protocol_blocked = True
+            self.block_reason = '串口协议未确认（且本车是 I2C）'
+        if self.backend == 'vendor_i2c' and self.motor_id_map is None:
+            self.get_logger().error(
+                'vendor_i2c 需要 motor_id_map：四个实测电机编号（FL,FR,RL,RR，逗号分隔）。'
+                '官方两处教程编号不一致（0-3 / 1-4）、轮序也没给，猜错会让车乱跑 ——'
+                '强制降级 self_test，一个字节都不发')
+            self.backend = 'self_test'
+            self.protocol_blocked = True
+            self.block_reason = 'motor_id_map 未实测'
 
         self.wheel_radius = float(p('wheel_radius').value)
         self.half_x = 0.5 * float(p('wheel_base_x').value)
@@ -245,6 +325,7 @@ class RaspbotDriver(Node):
         self._warned_template = False
         self.frames_sent = 0
         self.last_cmd = (0.0, 0.0, 0.0)
+        self.bot = None                 # Raspbot_Lib.Raspbot 实例，仅 vendor_i2c 用
 
         # ---- ROS 接口 ----
         self.create_subscription(Twist, str(p('cmd_vel_topic').value),
@@ -283,7 +364,8 @@ class RaspbotDriver(Node):
             f'hz={hz:.0f} cmd_hold={self.cmd_hold:.2f}s')
         if self.odom_source == 'openloop':
             self.get_logger().warn(
-                '里程计是**开环积分**（车上无编码器），位姿会漂；'
+                '里程计是**开环积分**（官方 I2C API 无编码器/里程计读取接口），'
+                '位姿会漂；'
                 '只适合短距离跟随，不要拿它做全局导航')
         if self.button_latching:
             self.get_logger().warn(
@@ -291,7 +373,23 @@ class RaspbotDriver(Node):
                 '安全等级低于自锁蘑菇头 + 固件断使能')
 
     def _init_backend(self, p):
-        if self.backend == 'vendor_topic':
+        if self.backend == 'vendor_i2c':
+            try:
+                mod = importlib.import_module(self.i2c_module)
+                self.bot = getattr(mod, self.i2c_class)()
+                self.get_logger().info(
+                    f'已加载官方 I2C 驱动 {self.i2c_module}.{self.i2c_class}；'
+                    f'电机编号(FL,FR,RL,RR)={self.motor_id_map}')
+            except Exception as e:
+                self.bot = None
+                self.backend = 'self_test'
+                self.protocol_blocked = True
+                self.block_reason = f'I2C 驱动库不可用：{e}'
+                self.get_logger().error(
+                    f'{self.i2c_module} 加载失败（{e}）—— 本车出厂镜像自带 '
+                    '~/py_install，请确认已启用 I2C 且用户在 i2c 组；'
+                    '强制降级 self_test')
+        elif self.backend == 'vendor_topic':
             self.pub_vendor = self.create_publisher(
                 Twist, str(p('vendor_cmd_topic').value), 10)
             self.get_logger().info(
@@ -419,6 +517,9 @@ class RaspbotDriver(Node):
             self.pub_motors.publish(m)
             self.frames_sent += 1
             return
+        if self.backend == 'vendor_i2c':
+            self._send_i2c(speeds)
+            return
         if self.backend == 'direct_serial':
             self._send_serial(speeds)
 
@@ -439,6 +540,24 @@ class RaspbotDriver(Node):
         if self.link.write(payload) is True:
             self.frames_sent += 1
 
+    def _send_i2c(self, speeds):
+        """把四轮速度写进官方驱动的 PWM 寄存器。失败时必须补一次全零。"""
+        if self.bot is None or self.motor_id_map is None:
+            return
+        pwms = wheel_speeds_to_pwm(speeds, self.max_wheel, self.motor_pwm_scale)
+        try:
+            for mid, pwm in zip(self.motor_id_map, pwms):
+                self.bot.Ctrl_Muto(mid, pwm)
+            self.frames_sent += 1
+        except Exception as e:
+            self.get_logger().error(
+                f'I2C 电机下发失败，立刻补发全零：{e}', throttle_duration_sec=5.0)
+            try:
+                for mid in self.motor_id_map:
+                    self.bot.Ctrl_Muto(mid, 0)
+            except Exception:
+                pass
+
     def _ensure_link(self):
         if self.link is None or self.link.open:
             return self.link is not None and self.link.open
@@ -450,6 +569,18 @@ class RaspbotDriver(Node):
         return False
 
     def _send_led(self, v):
+        if self.led_backend == 'i2c':
+            # 官方 API：Ctrl_WQ2812_brightness_ALL(R, G, B)，0-255。
+            if self.bot is None:
+                return False
+            v8 = int(round(clamp_speed(v, 0.0, 1.0) * 255.0))
+            try:
+                self.bot.Ctrl_WQ2812_brightness_ALL(v8, v8, v8)
+                return True
+            except Exception as e:
+                self.get_logger().error(f'灯条 I2C 下发失败：{e}',
+                                        throttle_duration_sec=5.0)
+                return False
         if self.led_backend == 'none':
             if not self._warned_led:
                 self._warned_led = True
@@ -486,11 +617,23 @@ class RaspbotDriver(Node):
         self.pub_batt.publish(m)
 
     def _publish_diag(self, now, vx, vy, wz):
+        subs = None
+        if self.backend == 'vendor_topic' and self.pub_vendor is not None:
+            subs = self.pub_vendor.get_subscription_count()
+            if subs == 0:
+                self.get_logger().warn(
+                    'vendor_topic 目标话题没有任何订阅者：官方 RASPBOT V2 出厂驱动 '
+                    '是 Python I2C API，不是 ROS 底盘节点，车不会动。'
+                    '请改用 driver_backend=vendor_i2c 并填好 motor_id_map',
+                    throttle_duration_sec=10.0)
         data = {
             'at_wall': round(now, 3),
             'backend': self.backend,
             'protocol_confirmed': self.protocol_confirmed,
             'protocol_blocked': self.protocol_blocked,
+            'block_reason': self.block_reason,
+            'motor_id_map': list(self.motor_id_map) if self.motor_id_map else None,
+            'vendor_subscribers': subs,
             'odom_source': self.odom_source,
             'battery_source': self.battery_source,
             'button_latching': self.button_latching,

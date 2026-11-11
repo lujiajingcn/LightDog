@@ -39,7 +39,8 @@ ARUCO = source_of('lightdog_aruco_dock.py')
 
 RB_FUNCS = extract_funcs(RB, [
     'clamp_speed', 'mecanum_wheel_speeds', 'normalize_wheel_speeds',
-    'integrate_openloop', 'cmd_to_send'], ns={'math': math})
+    'integrate_openloop', 'cmd_to_send', 'parse_motor_id_map',
+    'wheel_speeds_to_pwm'], ns={'math': math})
 
 ARUCO_FUNCS = extract_funcs(
     ARUCO, ['resolve_dictionary_names'],
@@ -166,6 +167,51 @@ class TestOpenloopOdomAndSafety(unittest.TestCase):
         self.assertEqual(f(5.0, -1.0, 1.0), 1.0)
 
 
+class TestOfficialI2CBackend(unittest.TestCase):
+    """官方 Raspbot_Lib 是 I2C + 开环 PWM；编号/轮序没给，不许猜。"""
+
+    def test_motor_id_map_requires_four_distinct_integers(self):
+        f = RB_FUNCS['parse_motor_id_map']
+        self.assertEqual(f('0,1,2,3'), (0, 1, 2, 3))
+        self.assertEqual(f(' 1, 2, 3, 4 '), (1, 2, 3, 4))
+        for bad in ('', None, '0,1,2', '0,1,2,2', 'a,1,2,3', '-1,1,2,3',
+                    '9,1,2,3', '0,1,2,3,4'):
+            self.assertIsNone(f(bad), f'{bad!r} 不该被当成合法轮序')
+
+    def test_wheel_speeds_map_to_signed_pwm(self):
+        f = RB_FUNCS['wheel_speeds_to_pwm']
+        self.assertEqual(f((0.35, 0.0, -0.175, 0.35), 0.35, 255.0),
+                         (255, 0, -128, 255))
+        self.assertEqual(f((0.0, 0.0, 0.0, 0.0), 0.35, 255.0), (0, 0, 0, 0))
+
+    def test_pwm_is_clamped_and_nan_is_zero(self):
+        f = RB_FUNCS['wheel_speeds_to_pwm']
+        got = f((9.9, -9.9, float('nan'), 0.1), 0.35, 255.0)
+        self.assertEqual(got[:2], (255, -255))
+        self.assertEqual(got[2], 0, 'NaN 绝不能变成电机指令')
+
+    def test_fractional_pwm_scale_stays_within_official_range(self):
+        # Ctrl_Muto 只接受 -255..255。速度钳位后 pwm = 1.0 * 255.5 -> round 256，
+        # 所以最后那道整数钳位不是死代码：非整数 motor_pwm_scale 会踩到。
+        f = RB_FUNCS['wheel_speeds_to_pwm']
+        got = f((0.35, -0.35, 0.0, 0.0), 0.35, 255.5)
+        self.assertEqual(got[:2], (255, -255))
+        self.assertTrue(all(-255 <= v <= 255 for v in got))
+
+    def test_invalid_scale_sends_all_zero(self):
+        f = RB_FUNCS['wheel_speeds_to_pwm']
+        for bad in ((0.0, 255.0), (0.35, 0.0), (-0.35, 255.0)):
+            self.assertEqual(f((0.2, 0.1, 0.3, 0.4), *bad), (0, 0, 0, 0))
+
+    def test_official_api_names_and_no_encoder_read_are_pinned(self):
+        with open(RB, encoding='utf-8') as f:
+            src = f.read()
+        self.assertIn('Ctrl_Muto', src)
+        self.assertIn('Ctrl_WQ2812_brightness_ALL', src)
+        self.assertIn("'vendor_i2c'", src)
+        self.assertIn("parse_motor_id_map(p('motor_id_map').value)", src)
+
+
 class TestAprilTagDictionaries(unittest.TestCase):
 
     def test_auto_includes_all_four_apriltag_families(self):
@@ -285,7 +331,11 @@ class TestRealConfigIsActuallySwitched(unittest.TestCase):
 
     def test_raspbot_driver_defaults_are_safe(self):
         p = _load('raspbot_params.yaml')['/lightdog_raspbot_driver']['ros__parameters']
-        self.assertEqual(p['driver_backend'], 'vendor_topic')
+        self.assertEqual(p['driver_backend'], 'vendor_i2c',
+                         '本车驱动板是 I2C，不是 ROS /cmd_vel 底盘节点')
+        self.assertEqual(p['motor_id_map'], '',
+                         '电机编号/轮序未实测时必须是空串，节点才会强制不动')
+        self.assertEqual(p['led_backend'], 'i2c')
         self.assertIs(p['protocol_confirmed'], False)
         self.assertEqual(p['odom_source'], 'openloop')
         self.assertEqual(p['battery_source'], 'none')
@@ -322,6 +372,19 @@ class TestSafetyInvariants(unittest.TestCase):
     def setUp(self):
         with open(RB, encoding='utf-8') as f:
             self.src = f.read()
+
+    def test_unmapped_motors_force_self_test(self):
+        self.assertIn("if self.backend == 'vendor_i2c' and self.motor_id_map is None:",
+                      self.src)
+        self.assertIn("self.block_reason = 'motor_id_map 未实测'", self.src)
+
+    def test_vendor_topic_warns_when_nobody_subscribes(self):
+        self.assertIn('get_subscription_count()', self.src)
+        self.assertIn('不是 ROS 底盘节点', self.src)
+
+    def test_i2c_failure_reasserts_zero_speed(self):
+        self.assertIn('I2C 电机下发失败，立刻补发全零', self.src)
+        self.assertIn('self.bot.Ctrl_Muto(mid, 0)', self.src)
 
     def test_unconfirmed_serial_protocol_forces_self_test(self):
         self.assertIn("if self.backend == 'direct_serial' and not self.protocol_confirmed:",
