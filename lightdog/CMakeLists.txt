@@ -24,6 +24,7 @@ install(PROGRAMS
   lightdog_mission.py
   lightdog_voice.py
   lightdog_mcu_bridge.py
+  lightdog_raspbot_driver.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

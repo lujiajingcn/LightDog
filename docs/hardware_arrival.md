@@ -269,3 +269,103 @@ marker 边长、桩位姿、存储容量；另加相机内参棋盘格标定、`
 7. 电池「7.4V 25」的完整标注（是否 25C）、驱动板 5V/5A 在满载时是否稳。
 8. 64GB TF 卡是否随货，是否有 NVMe/M.2 扩展位。
 9. 商家 Humble 镜像里 `python3-opencv` 是否带 `aruco` contrib（`lightdog_aruco_dock.py:249-250` 会直接报错）。
+
+---
+
+## 八、软件已按实车改造（2026-11-11）
+
+> 决策：按已到货的 RASPBOT V2 硬件条件改造软件，以硬件为准。
+> 落地原则：**只改硬件资料能确定的**；资料没给的（商家串口协议、话题名、编码器、
+> 几何精值）一律显式参数化并标注「待确认」，不编造数值冒充实车值。
+> 仿真配置 `p*_params.yaml`、`firmware/`、上层节点的话题契约全部保持不动。
+
+### 8.1 六个冲突怎么落的
+
+| # | 落地做法 | 文件 |
+|---|---|---|
+| C1 四麦轮 | 新驱动节点订阅 `/cmd_vel_muxed`（`twist_mux` 本来就透传 `linear.y`），做 X 型麦轮逆解，四轮超限时**等比缩放**；`vendor_topic` 后端也可直接把 Twist 交给商家驱动做逆解 | [`lightdog_raspbot_driver.py`](../lightdog/lightdog_raspbot_driver.py) |
+| C2 无 STM32 | 新增 **Pi 直驱**驱动节点，保留 `/cmd_vel_muxed`、`/odom`、`/battery_state`、`/safety/estop`、`/led/brightness` 契约，上层节点零改动；原 `mcu` 单元保留但停用，固件代码作为通用方案不删 | 同上、`deploy/nodes.conf` |
+| C3 无编码器 | `odom_source: openloop`，按实际下发速度用中点航向积分，并在启动日志与 `/raspbot/diag` 明说「会漂」；拿到编码器/商家 odometry 后改 `vendor` 即可（自带自环检测） | `config/raspbot_params.yaml` |
+| C4 可动云台 | `aruco_dock` 新增 `gimbal_locked` + `gimbal_pan_deg/tilt_deg`：锁死角度进外参旋转链；未锁定时**显式停止发布** `/detected_dock_pose` 并报 error，不再拿错外参算假位姿 | `lightdog_aruco_dock.py`、`real_p3_params.yaml` |
+| C5 Humble | 新增 `real_*.yaml` 真机配置集，`nodes.conf` 全量切换；`install.sh` 本来就把 `humble` 列在探测候选里，用 `--ros-distro` 显式指定即可。§四 三条系统路线仍需拍板 | `config/real_*.yaml`、`deploy/nodes.conf` |
+| C6 AprilTag | `dictionary: auto` 依次试 ArUco 4x4 与 OpenCV contrib 的 4 种 AprilTag 字典，只有检出**目标 id** 才锁定并记日志；代码按名字动态取字典，不用改算法 | `lightdog_aruco_dock.py`、`real_p3_params.yaml` |
+
+驱动节点的四种后端：
+
+| 后端 | 行为 | 何时用 |
+|---|---|---|
+| `vendor_topic`（默认） | 把 Twist 转发到 `vendor_cmd_topic`（默认 `/cmd_vel`） | 商家 ROS 驱动订阅标准速度话题；也补上真机 `/cmd_vel` 无人消费的历史缺口 |
+| `motor_array` | 发 `Float32MultiArray` 四轮线速度 | 商家提供四轮速度接口 |
+| `direct_serial` | 按 `motor_frame_template` 发串口 | 拿到商家协议文档之后 |
+| `self_test` | 只跑逻辑、不发包 | Pi 上离线自检；**协议未确认时自动降级到这个** |
+
+### 8.2 真机配置改了什么 / 故意没改什么
+
+`config/real_*.yaml` 由仿真配置按字节派生，参数键集合与仿真版**完全一致**（有回归钉住）：
+
+| 已改（硬件事实直接决定） | 值 |
+|---|---|
+| 所有 `use_sim_time` | `false` |
+| `p2.depth_mode` / `p5.depth_mode` | `'off'`（带引号，USB 单目无深度） |
+| `p2.backend` | `onnx` |
+| `p3.dictionary` | `auto` |
+| `p3.sim_charging` / `p4.faststart` | `false` / `true` |
+| `p4.auth_token` / `p5.sip_ami_secret` | 占位 `CHANGE_ME_BEFORE_DEPLOY`（空值更危险，见下） |
+| `p4.max_disk_mb` / `max_event_mb` | `2048` / `1024`（64GB TF 卡保守配额，按 `df -h /data` 复核） |
+
+**故意没改**：`camera_offset`、`base_link_height`、`marker_length`、`dock_pose_*`、
+`image_topic` / `info_topic` 仍保留仿真值，但每行加了 TODO。商品图里根本没有这些数值，
+任何填写都是编造；到货后按 §五 实测再改。这些项留在配置文件里就是「不报错但一直不对」
+的典型来源，别把它们当已经配好了。
+
+### 8.3 安全等级确实降低了，别当成等价替换
+
+| 原设计（STM32） | 实车（Pi 直驱） | 补偿 |
+|---|---|---|
+| IWDG 硬件看门狗，心跳断 300ms 断 PWM | 没有 | 10Hz 持续下发 + `cmd_hold` 0.3s 超时归零 + 退出前发零速 |
+| 22mm 自锁蘑菇头，物理断使能 | 只有点动「按键」 | `/raspbot/button` 由软件补闭锁（松手不恢复），**电气回路没有硬断 PWM** |
+| 编码器里程计 | 参数表无编码器 | 开环积分，diag 明示；禁止拿它做全局导航 |
+| 电压/电流遥测 | 未确认 | 发 NaN 表示「不知道」；填 0 会立刻误触发低电回充 |
+| CRC16 串口帧 | 商家协议未知 | `protocol_confirmed=false` 时 `direct_serial` 强制降级 `self_test`，一字节不发 |
+
+**结论**：软件急停 ≠ 物理急停。真要恢复到原安全等级，仍需外接自锁按钮与硬件断使能，
+或外挂一块能跑 `firmware/` 的 STM32。这一条不能靠改参数解决。
+
+### 8.4 上机前必做（按序）
+
+1. 换掉 `auth_token`、`sip_ami_secret`，配好 SSL 证书 —— 占位串不能上生产。
+2. 确认商家 ROS 驱动实际订阅的话题名，改 `vendor_cmd_topic`；若走串口，先拿协议文档
+   再设 `protocol_confirmed: true`。**默认路径不需要这一步也能跑逻辑，但车可能不动**。
+3. 按 §四 拍板系统路线，部署时显式 `--ros-distro humble`（或 Docker 里的 jazzy）。
+4. 把云台锁死到固定角度并写进 `gimbal_pan_deg/tilt_deg`，禁止商家追踪程序转动它。
+5. 棋盘格标定 110° 广角相机、发布 `camera_info`；实测几何六项 + `mono_height_person`。
+6. 导出 ONNX 模型（`yolo export model=yolov8n.pt format=onnx imgsz=320 opset=12`）。
+7. 按 §六 验收：`vcgencmd get_throttled` 必须 `0x0`；急停项若只有软件闭锁，如实记 FAIL。
+
+### 8.5 本次验证证据
+
+| 检查 | 结果 |
+|---|---|
+| `PATH=/c/MinGW/bin:$PATH python lightdog/tests/run.py` | **411 项：通过 405 / 失败 0 / 跳过 6**（新增 26 项实车判据） |
+| 6 个 skip | 全是 `test_soak.TestLiveSampling` 的「没有 /proc（Windows 宿主机）」 |
+| `python -m pyflakes lightdog deploy sim` | RC=0 |
+| `bash -n` × 4 + `nodes.conf` 9 列校验 | OK |
+| 固件 C 自检（本轮未改 C） | `-Werror` 零警告，94 + 268 项全过 |
+| 回退验证 6 段 | **6/6 CAUGHT**（麦轮符号、超时归零、协议守卫、AprilTag 多字典、云台拒绝、`nodes.conf` 切换），全部 `restored=True` |
+
+新增回归在 `lightdog/tests/test_raspbot.py`，已挂进 `run.py`：麦轮逆解/正解自洽、
+等比缩放、开环积分、`cmd_to_send`、字典自动识别与误锁防护、云台显式拒绝、真机配置与
+仿真参数集一致、`nodes.conf` 真的切到实车驱动、安全不变量静态断言。
+
+### 8.6 仍未解决（别当成已修）
+
+- 商家驱动板串口协议、实际订阅话题名、灯条协议、按键接线 —— §七 1/5/6 项。
+- 电机到底有没有编码器 —— 决定 C3 是继续开环还是切 `vendor`。
+- **P2 单目跟随同样依赖静态相机外参，但只有 P3 做了「云台未锁定就拒绝发布」的显式保护**；
+  P2 目前靠「上机前锁死云台」这条运行前置条件，没有代码级联锁。这是已知限制。
+- 没有 2D LiDAR，Nav2 costmap 缺测距源；P3 视觉对接可用，全局导航不行。
+- 语音模块还没桥接到 `/voice/command`；Asterisk 外呼是另一条链路，仍需真机四步验收。
+- P5 跌倒检测按普通相机路线保持停用（`fall-det: no`）。
+- Raspberry Pi OS + ROS2 Humble 下的 OpenCV aruco API、launch 参数类型推断**未上机验证**。
+- ONNX 模型未导出、相机内参与几何未实测、STM32 板级路径在这台车上不再适用。
+

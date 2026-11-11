@@ -39,11 +39,21 @@ SimpleChargingDock 那边的 external_detection_* 全部置零，语义最干净
 这两个数直接对应 lightdog/models/dock/model.sdf 里的 marker_visual pose。
 改桩的几何就必须同步改这里，否则解出来的 yaw 会整体差 90° 或 180°。
 
-## 为什么不用 TF
+## 为什么不用 TF / 实车云台怎么办
 
 和 lightdog_person_detector 一样：相机安装是静态的（rpy=0），用参数补偿比拉
-tf2 少一个失败模式；P2 已经验证这条路可靠。真机上若换成可转动的云台，再改成
-tf2 查询。
+tf2 少一个失败模式；P2 已经验证这条路可靠。
+
+**实车 RASPBOT V2 的相机装在二自由度云台上**（水平 180°、上下 110°），
+静态外参只在「云台锁死」时成立。所以：
+- `gimbal_locked: true`（默认）+ `gimbal_pan_deg/tilt_deg` 写锁定角度，
+  外参旋转链按这个角度补一次；
+- `gimbal_locked: false` 时节点**显式停止发布** `/detected_dock_pose` 并报 error，
+  而不是拿错外参算一个「数值正常但方向不对」的假位姿。
+要做云台实时追踪，就得改成 tf2 查询动态外参，那是另一条路（尚未实现）。
+
+另外实车贴的是 **AprilTag**，不是 ArUco。`dictionary: auto` 会依次尝试
+ArUco 4x4 与 OpenCV contrib 自带的 4 种 AprilTag 字典，命中哪个记日志。
 """
 
 import math
@@ -94,6 +104,27 @@ def make_tf(rotation, translation):
     t[:3, :3] = rotation
     t[:3, 3] = translation
     return t
+
+
+#: 实车贴的是 AprilTag。OpenCV contrib 的 aruco 模块同时带这四种预定义字典，
+#: `auto` 依次试，不用先问商家到底是哪一族（文档里也没写）。
+#: 写成字面量（不是拼接表达式）是为了让离线回归能原样抽出这个常量。
+AUTO_DICTS = ('DICT_4X4_50',
+              'DICT_APRILTAG_16H5', 'DICT_APRILTAG_25H9',
+              'DICT_APRILTAG_36H10', 'DICT_APRILTAG_36H11')
+
+
+def resolve_dictionary_names(raw):
+    """把 dictionary 参数解析成「依次尝试」的字典名列表。
+
+    'auto' / 空 -> ArUco 4x4 + 4 种 AprilTag；也接受逗号分隔的显式列表。
+    纯函数，方便离线回归；cv2 里不存在的名字由调用方过滤并告警。
+    """
+    text = str(raw if raw is not None else '').strip()
+    if not text or text.lower() == 'auto':
+        return list(AUTO_DICTS)
+    names = [s.strip() for s in text.split(',') if s.strip()]
+    return names or list(AUTO_DICTS)
 
 
 def matrix_to_quat(m):
@@ -188,6 +219,10 @@ class ArucoDockDetector(Node):
         self.declare_parameter('marker_length', 0.084)
         self.declare_parameter('marker_id', 0)
         self.declare_parameter('dictionary', 'DICT_4X4_50')
+        # 实车相机在可动云台上：静态外参只在锁死时成立。false 时显式不发布位姿。
+        self.declare_parameter('gimbal_locked', True)
+        self.declare_parameter('gimbal_pan_deg', 0.0)
+        self.declare_parameter('gimbal_tilt_deg', 0.0)
 
         # 相机安装（与 person_detector 一致：4wd 的 depth_sensor_pose）
         self.declare_parameter('camera_offset', [-0.065, 0.0, 0.255])
@@ -220,6 +255,9 @@ class ArucoDockDetector(Node):
         self.marker_length = float(p('marker_length').value)
         self.marker_id = int(p('marker_id').value)
         dict_name = str(p('dictionary').value)
+        self.gimbal_locked = bool(p('gimbal_locked').value)
+        gimbal_pan = math.radians(float(p('gimbal_pan_deg').value))
+        gimbal_tilt = math.radians(float(p('gimbal_tilt_deg').value))
         self.publish_debug = bool(p('publish_debug').value)
         self.rate = float(p('rate').value)
         self.max_range = float(p('max_range').value)
@@ -235,9 +273,12 @@ class ArucoDockDetector(Node):
 
         # T_base_camera_link：平移补偿，旋转恒等（URDF 里 rpy=0）
         t_base_cam = make_tf(np.eye(3), np.array(cam_off))
+        # 云台锁死角度的旋转补偿。只补旋转、**枢轴平移未建模**（几厘米量级），
+        # 上真机要实测修正；见 docs/hardware_arrival.md §C4。
+        t_gimbal = make_tf(rpy_matrix(0.0, gimbal_tilt, gimbal_pan), np.zeros(3))
         # T_camera_link_optical：REP-103 光学系
         t_cam_opt = make_tf(rpy_matrix(*opt_rpy), np.zeros(3))
-        self.t_base_opt = t_base_cam @ t_cam_opt
+        self.t_base_opt = t_base_cam @ t_gimbal @ t_cam_opt
         # T_marker_dock：marker 安装变换的逆（marker -> dock）
         t_dock_marker = make_tf(rpy_matrix(*mk_rpy), np.array(mk_pos))
         self.t_marker_dock = np.linalg.inv(t_dock_marker)
@@ -245,23 +286,35 @@ class ArucoDockDetector(Node):
         approach = float(p('approach_offset').value)
         self.t_dock_dockpose = make_tf(rot_z(math.pi), np.array([approach, 0.0, 0.0]))
 
-        # ArUco
+        # 字典：仿真是 ArUco，实车是 AprilTag。`auto` 依次试全部候选，
+        # 命中哪个记在 active_dict，启动/命中日志都能看到，不靠猜。
         if not hasattr(cv2, 'aruco'):
             raise RuntimeError('这个 opencv 没编译 aruco 模块（需要 opencv-contrib）')
-        self.dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
         self.detector_params = cv2.aruco.DetectorParameters_create() \
             if hasattr(cv2.aruco, 'DetectorParameters_create') else cv2.aruco.DetectorParameters()
-        # OpenCV >= 4.7 推荐 ArucoDetector 对象；老的 detectMarkers(gray, dict,
-        # parameters=...) 在新版本里签名已经变了（apt 一升级就静默失效）。
-        # 有 ArucoDetector 就用它，没有才退回老接口 —— 两条路返回值都是
-        # (corners, ids, rejected)。
-        self._aruco = None
-        if hasattr(cv2.aruco, 'ArucoDetector'):
-            try:
-                self._aruco = cv2.aruco.ArucoDetector(self.dictionary, self.detector_params)
-            except Exception:
-                self._aruco = None
-        if self._aruco is None:
+        # OpenCV >= 4.7 用 ArucoDetector 对象；老接口签名在 apt 升级后会静默失效，
+        # 所以没有 ArucoDetector 才退回 detectMarkers(gray, dict, parameters=...)。
+        self.dictionaries = []
+        for name in resolve_dictionary_names(dict_name):
+            if not hasattr(cv2.aruco, name):
+                self.get_logger().warn(f'当前 opencv 没有字典 {name}，跳过')
+                continue
+            d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name))
+            det = None
+            if hasattr(cv2.aruco, 'ArucoDetector'):
+                try:
+                    det = cv2.aruco.ArucoDetector(d, self.detector_params)
+                except Exception:
+                    det = None
+            self.dictionaries.append((name, d, det))
+        if not self.dictionaries:
+            raise RuntimeError(f'没有可用的 marker 字典（请求 {dict_name}）')
+        self.dictionary = self.dictionaries[0][1]   # 保留单字典语义
+        self.active_dict = self.dictionaries[0][0]
+        if len(self.dictionaries) > 1:
+            self.get_logger().info(
+                f'dictionary=auto：依次尝试 {[n for n, _, _ in self.dictionaries]}')
+        if all(det is None for _, _, det in self.dictionaries):
             self.get_logger().warn(
                 '当前 opencv 没有 ArucoDetector（<4.7），退回 detectMarkers 老接口')
 
@@ -290,6 +343,7 @@ class ArucoDockDetector(Node):
         self.img_seq = 0
         self._det_seq = -1
         self.visible = False
+        self._warned_gimbal = False
 
         sensor_qos = QoSProfile(depth=1,
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -305,9 +359,15 @@ class ArucoDockDetector(Node):
         self.create_timer(1.0 / max(1.0, self.rate), self._tick)
 
         self.get_logger().info(
-            f'ArUco dock detector 就绪：{dict_name} id={self.marker_id} '
+            f'marker dock detector 就绪：{dict_name} id={self.marker_id} '
             f'边长 {self.marker_length:.3f}m，marker->dock rpy '
-            f'{[round(math.degrees(v), 1) for v in mk_rpy]}')
+            f'{[round(math.degrees(v), 1) for v in mk_rpy]}，'
+            f'云台 locked={self.gimbal_locked} '
+            f'pan={math.degrees(gimbal_pan):.0f}° tilt={math.degrees(gimbal_tilt):.0f}°')
+        if not self.gimbal_locked:
+            self.get_logger().error(
+                'gimbal_locked=false：不会发布 /detected_dock_pose，'
+                '实车必须锁死云台或改成 tf2 动态外参')
 
     # ---------- 回调 ----------
 
@@ -332,10 +392,26 @@ class ArucoDockDetector(Node):
         self.img_seq += 1
 
     def _detect_markers(self, gray):
-        if self._aruco is not None:
-            return self._aruco.detectMarkers(gray)
-        return cv2.aruco.detectMarkers(gray, self.dictionary,
-                                       parameters=self.detector_params)
+        """多字典依次尝试，只有检出**目标 id** 才锁定该字典。
+
+        商家的 AprilTag 家族还没确认，auto 比硬编码一种安全；但也不能因为
+        别的字典检出一个同号 tag 就误锁，所以按 marker_id 过滤。
+        """
+        last = (None, None, [])
+        for name, d, det in self.dictionaries:
+            if det is not None:
+                res = det.detectMarkers(gray)
+            else:
+                res = cv2.aruco.detectMarkers(gray, d, parameters=self.detector_params)
+            ids = res[1]
+            if ids is not None and len(ids) > 0 and \
+                    self.marker_id in [int(i) for i in ids.flatten()]:
+                if name != self.active_dict:
+                    self.active_dict = name
+                    self.get_logger().info(f'marker 字典自动命中：{name}')
+                return res
+            last = res
+        return last
 
     def _tick(self):
         # 定时器回调里抛异常会直接把 rclpy 的 spin 打断（节点假死）。
@@ -346,6 +422,18 @@ class ArucoDockDetector(Node):
             self.get_logger().warn(f'ArUco 检测异常：{e}', throttle_duration_sec=10.0)
 
     def _tick_impl(self):
+        if not self.gimbal_locked:
+            # 云台可动时静态 camera_offset 不成立，solvePnP 会给出一个
+            # 「数值正常但方向错了」的位姿。宁可显式不可用，也不要静默算错。
+            if self.visible:
+                self.visible = False
+                self.vis_pub.publish(Bool(data=False))
+            if not self._warned_gimbal:
+                self._warned_gimbal = True
+                self.get_logger().error(
+                    'gimbal_locked=false：云台可动但外参是静态的，已停止发布 '
+                    '/detected_dock_pose；锁死云台或改成 tf2 动态查询')
+            return
         msg = self.latest
         if msg is None or self.camera_matrix is None:
             return

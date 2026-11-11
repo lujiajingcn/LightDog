@@ -8,6 +8,9 @@
 > 但选型与配置要以 [`hardware_arrival.md`](hardware_arrival.md) 的实车对照为准。
 > 特别注意：`deploy/install.sh` 的发行版探测（第 90 行）本来就包含 `humble`，
 > 它没有 Ubuntu 版本号硬检查；真正要拍板的是 §四 的系统路线。
+> **软件侧已按实车改造完**（新驱动节点、真机配置集、AprilTag/云台适配），
+> 详见 [`hardware_arrival.md`](hardware_arrival.md) §八；本文 §一 的参数清单仍要
+> 对照那份文件里的 `real_*.yaml` 去看，别再照仿真配置改。
 
 要采购什么、买几个、为什么必须是那个规格，见 [`bom.md`](bom.md) —— 两份文档
 是一对：bom 说"买这个"，这里说"买回来之后会在哪咬你"。

@@ -1,0 +1,130 @@
+# 真机配置（RASPBOT V2 / Pi 5 16GB / ROS2 Humble）—— 由仿真配置派生。
+#
+# 依据 docs/hardware_arrival.md 的商品截图：普通 USB 单目相机（无深度）、
+# 四麦轮 + TT 电机、Pi 直驱无 STM32、Raspberry Pi OS + ROS2 Humble。
+# 仿真配置仍是同名的 p*_params.yaml，本文件只给 deploy/nodes.conf 用。
+#
+# 【只改硬件资料能确定的】use_sim_time、深度模式、ONNX 后端、AprilTag 字典、
+#   离线充电、faststart、鉴权/密钥占位、TF 卡配额。
+# 【资料没给、必须实测后改】camera_offset / base_link_height / marker_length /
+#   dock_pose_* / 相机话题名 / 内参。这些行有 TODO，值是仿真 4wd 的，
+#   **不要当成实车值** —— 照抄会出现「不报错但一直不对」。
+# 【必须现场填写】auth_token、sip_ami_secret、SSL 证书路径。
+#
+# 注意：下方**原样保留**了仿真配置里的说明文字，个别注释还写着
+# 「use_sim_time: true」等仿真语境；那只是历史说明，实际生效的是参数值 false。
+#
+
+# LightDog P5 参数（跌倒检测 + 告警链路）
+#
+# 时间参数全部依赖仿真时钟，use_sim_time: true。
+# 注意：软件渲染下实时因子约 0.2x，也就是说 `suspect_hold: 5.0` 在墙钟上要等
+# 约 25 秒。真机上两者一致，不用把参数改小。
+
+/lightdog_fall_detector:
+  ros__parameters:
+    use_sim_time: false
+
+    rgb_topic: /camera/color/image_raw
+    depth_topic: /camera/depth/image_rect_raw
+    info_topic: '/camera/color/camera_info' # TODO publish calibrated camera_info
+
+    # 相机装车几何（与 p2/p3 保持同一套值）。光心离地 = 0.255 + 0.1195 = 0.3745m，
+    # 这个数错了，判出来的"离地高度"会整体平移，阈值就全失准。
+    camera_offset: [-0.065, 0.0, 0.255]   # TODO measure: gimbal locked, camera vs base_link
+    base_link_height: 0.1195              # TODO measure: base_link height (sim 4wd value)
+
+    # 橙色上衣的 HSV（与 P2 检测器同一套实测值）
+    h_min: 0.012
+    h_max: 0.090
+    s_min: 0.45
+    v_min: 0.15
+    min_points: 200
+    range_min: 0.30
+    range_max: 8.00
+
+    # 判据：人体点云离地高度的 95 分位（米）。
+    # 橙色躯干下沿 0.72m，所以站着时 z_p95 必然 >= 0.72；躺倒时整根压在 0~0.34m。
+    # 0.50 / 0.68 落在 (0.34, 0.72) 这个空档里，两边都有余量。
+    lying_top_max: 0.50
+    stand_top_min: 0.68
+
+    rate: 10.0
+    absent_timeout: 1.5
+    # 帧新鲜度（墙钟秒）。相机冻帧/断线后不能拿最后一帧反复判定：
+    # 冻在 standing -> 真摔倒也不报警；冻在 lying -> 人起来了还在叫。
+    # 超时改报 unknown，告警状态机据此知道「看不见」，不会当成已起身。
+    # 仿真相机实测 1.5Hz（0.67s/帧），1.5s 容忍两帧丢失；真机 30Hz 早该报了。
+    frame_timeout: 1.5
+    depth_timeout: 1.0
+    publish_debug: true
+
+    # 深度来源：on（默认，深度相机在位）/ off（普通彩色相机）。
+    # 本节点**没有单目降级路径**：z_p95 就是逐像素深度反投影出来的，
+    # 没有深度就算不出离地高度。off 时不订阅深度、持续发
+    # /fall/state=unknown，绝不静默装死，也不会误报 standing/lying。
+    # ⚠️ 值必须加引号：YAML 1.1 把裸写的 on/off 当成布尔，
+    #    `depth_mode: off` 会变成 False，停用就静默失效了。
+    # 真机走普通相机路线时改成 'off'，并在 deploy/nodes.conf 里把
+    # fall-det 设成 no；接毫米波雷达后让雷达节点直接发布 /fall/state。
+    depth_mode: 'off'    # no depth; emits unknown
+
+/lightdog_alert_manager:
+  ros__parameters:
+    use_sim_time: false
+
+    # ---- 一级确认：姿态持续性 ----
+    suspect_hold: 5.0         # 连续躺倒多少秒才算"可疑"（过滤弯腰/蹲下）
+    lying_gap: 1.0            # 判据抖动容忍：1 秒内还看到过 lying 就仍然算躺着
+    # SUSPECTED 阶段「连续看不到人」多久才判为人已离开并复位。
+    # unknown（蹲下/被遮挡/相机故障）不算人走了：只有明确看到站立、或明确
+    # 连续无人，才撤销已经开始的确认，避免一次遮挡抹掉整条流程。
+    absent_grace: 10.0
+
+    # ---- 二级确认：交互无响应 ----
+    confirm_window: 15.0      # 语音问询后再等多久；这期间站起来就取消
+    recover_hold: 3.0         # 站起来持续多久算真的恢复了
+
+    # ---- 告警 ----
+    resolved_hold: 5.0
+    contacts_path: /data/contacts.json
+
+    # ---- 外呼（选型已定：自建 SIP / Asterisk）----
+    # auto 的解析顺序：sip_ami_secret 非空 -> sip；call_command 非空 -> command；
+    # 否则 log（只记录不真拨）。仿真里什么都不配就是 log，真机配上 secret 即
+    # 自动走 SIP —— 同一份 yaml 不用维护两个版本。
+    call_mode: auto
+    # 走 SIP 必须配 secret（与 /etc/asterisk/manager.conf 的 secret 一致）。
+    # 从 0600 的 yaml 读，不要写在 unit 的 -p 里：`systemctl status` 会把它
+    # 打给所有能看日志的人。
+    sip_ami_secret: 'CHANGE_ME_BEFORE_DEPLOY'  # TODO random secret; empty = no calls
+    sip_ami_host: 127.0.0.1          # Asterisk 与本机同机；分机在别的机器也无妨
+    sip_ami_port: 5038
+    sip_ami_user: lightdog
+    sip_channel_template: 'PJSIP/{number}'   # 联系人号码 -> Asterisk 频道名
+    sip_context: alarm               # dialplan 里的告警上下文，见 deploy/sip/
+    sip_exten: s
+    sip_ring_timeout: 45.0           # 响铃多少秒算没人接（然后打下一个）
+    sip_max_call: 120.0              # 接通后最多占线多久，超时自动挂断
+    sip_connect_timeout: 5.0         # AMI 连接/登录超时
+
+    # 兜底通道：外部语音 API 的 CLI 模板，支持 {phone} {name} {attempt}。
+    # 参数用 shlex 切分、不走 shell（号码和姓名是手机端可编辑的外部输入）。
+    # 它只知道命令是否成功退出，所以界面文案是「已发出外呼」而不是「已接通」。
+    call_command: ''
+    call_interval: 20.0       # 两次呼叫间隔（仿真秒）
+    max_rounds: 3             # 联系人轮询几轮后放弃
+    # 事件视频的取帧窗口（秒，仿真/机器人时间）。
+    #
+    # pre 必须 >= suspect_hold + confirm_window + 余量（5 + 15 + 5 = 25）：
+    # 告警是在「躺倒 5 秒 + 问询 15 秒无响应」之后才触发的，如果 pre 只给 15 秒，
+    # 视频起点正好卡在问询开始那一刻 —— 人已经躺在地上了，最关键的「怎么倒的」
+    # 反而没拍到（第一版就是 15，实测抽首帧发现人已经躺平）。
+    event_pre: 25.0
+    event_post: 10.0
+    auto_reset: true          # 人站起来后自动解除（false 则需人工 reset）
+
+    fall_state_topic: /fall/state
+    fall_z_topic: /fall/z_p95
+    event_topic: /recorder/event
+    tick_hz: 5.0

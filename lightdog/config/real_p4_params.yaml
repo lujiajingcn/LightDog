@@ -1,0 +1,116 @@
+# 真机配置（RASPBOT V2 / Pi 5 16GB / ROS2 Humble）—— 由仿真配置派生。
+#
+# 依据 docs/hardware_arrival.md 的商品截图：普通 USB 单目相机（无深度）、
+# 四麦轮 + TT 电机、Pi 直驱无 STM32、Raspberry Pi OS + ROS2 Humble。
+# 仿真配置仍是同名的 p*_params.yaml，本文件只给 deploy/nodes.conf 用。
+#
+# 【只改硬件资料能确定的】use_sim_time、深度模式、ONNX 后端、AprilTag 字典、
+#   离线充电、faststart、鉴权/密钥占位、TF 卡配额。
+# 【资料没给、必须实测后改】camera_offset / base_link_height / marker_length /
+#   dock_pose_* / 相机话题名 / 内参。这些行有 TODO，值是仿真 4wd 的，
+#   **不要当成实车值** —— 照抄会出现「不报错但一直不对」。
+# 【必须现场填写】auth_token、sip_ami_secret、SSL 证书路径。
+#
+# 注意：下方**原样保留**了仿真配置里的说明文字，个别注释还写着
+# 「use_sim_time: true」等仿真语境；那只是历史说明，实际生效的是参数值 false。
+#
+
+# LightDog P4 参数（视频存储 + 手机互联）
+#
+# 两条铁律：
+#
+# 1. 录像节点用 `use_sim_time: true` —— 分段边界要跟相机时间戳同源，否则
+#    「事发前 10 秒」在 0.25x 实时因子的仿真里会算错 4 倍。
+# 2. 后端节点**不用** sim time —— 它对外提供的是 HTTP 服务，时间轴必须是墙钟，
+#    否则手机上看到的事件时间和真实时间对不上。
+
+/lightdog_recorder:
+  ros__parameters:
+    use_sim_time: false
+
+    image_topic: '/camera/color/image_raw' # TODO remap to the vendor driver topic
+    data_dir: /data
+
+    # 段长 / 环形保留 / 配额。
+    #
+    # 单位刻意不一样，别混：
+    #   segment_sec  = ROS 秒，表示「这一段装多少秒的画面」（仿真相机实测约 1.5Hz，
+    #                  10 秒 ≈ 15 帧；真机 30Hz 则约 300 帧）
+    #   retain_sec   = **墙钟**秒，表示「卡里的东西留多久」。用墙钟是因为 ROS 时间
+    #                  重启后会归零（仿真每次重启 /clock 从 0 开始，真机 NTP 校时同理），
+    #                  拿它算"多久以前录的"会得到负数，旧录像永远清不掉。
+    # 真机上两者等价（ROS 时间 = 系统时间），可以直接按画面时长理解。
+    segment_sec: 10.0
+    retain_sec: 1800.0
+    min_segments: 6          # 至少留 6 段，防止 retain_sec 配小以后立刻被清空
+    max_disk_mb: 2048.0        # 64GB TF card; recheck with df -h /data
+
+    # 事件窗口默认值。P5 的跌倒检测可以在消息里覆盖。
+    pre_sec: 10.0
+    post_sec: 10.0
+    # 事件视频帧数上限。必须 >= (pre+post) × 相机帧率：
+    # 合成时从窗口头部往后写，撞上限就截掉尾巴，而尾巴恰恰是「倒下之后」。
+    # P5 告警窗口 25+10=35s，30Hz 相机需要 1050 帧，故取 1200。
+    # 实测：本机 25.9fps × 35s = 910 帧，旧的 900 已经丢掉 0.3 秒。
+    max_event_frames: 1200
+
+    # 事件目录的保留策略（与上面的环形缓冲是两套）。
+    # 一次跌倒事件 35s：仿真约 80KB，真机 30fps H.264 约 2~3MB。
+    # 不设上限的话 events/ 只进不出，一个月几百 MB，SD 卡写满后录像、事件、
+    # 告警落盘会一起失败（ENOSPC），而且多半发生在半夜。
+    event_retain_days: 30.0
+    max_event_mb: 1024.0       # no NVMe; mind card wear
+    min_events: 20            # 至少留这么多条，最近的取证不会被容量策略删掉
+    max_snapshots: 200        # snapshots/ 只保留最新这么多张
+
+    # avc1 = H.264。手机（尤其 iOS）只认这个；打不开会自动降级 mp4v 并报错日志。
+    codec: avc1
+    # 事件视频重封装为 faststart（moov 前置），需要镜像里有 ffmpeg。
+    # 默认关：OpenCV 用 avc1 标签写 MPEG-4 Part 2 是常见怪癖，真机开之前
+    # 先用手机实播一遍确认没被重封装搞坏。
+    faststart: true
+    jpeg_quality: 80
+    # 环形缓冲里每帧 JPEG 的质量。这个值直接决定常驻内存：
+    # 640x480、q=80 约 40KB/帧，720 帧上限 ≈ 28MB；调到 95 会翻倍以上，
+    # 而树莓派/Orin Nano 上这部分是**常驻**的，不是峰值。
+    buffer_jpeg_quality: 80
+    recording: true
+    state_topic: /recorder/state
+
+/lightdog_server:
+  ros__parameters:
+    http_host: 0.0.0.0
+    http_port: 8000
+
+    # 空 = 不鉴权。仿真默认空，方便浏览器直接开；
+    # **真机必须设置**，否则同一个 WiFi 下任何人都能看到摄像头。
+    auth_token: 'CHANGE_ME_BEFORE_DEPLOY'   # TODO random token; empty = open camera
+
+    data_dir: /data
+    # 空 = 自动用包内安装的 web/ 目录（colcon install 后的 share/lightdog/web）。
+    # 只有想把网页放到别处（例如放在只读分区/独立部署）时才需要写死。
+    web_dir: ''
+    image_topic: '/camera/color/image_raw' # TODO remap to the vendor driver topic
+    # 下面两个话题名是**跨模块契约**：变了以后 /api/v1/status 里的电量与告警
+    # 会静默变成 null / NORMAL，界面上看不出来。改之前先 grep 发布方。
+    battery_topic: /battery_state          # 发布方：lightdog_dock_manager
+    alert_topic: /alert/state              # 发布方：lightdog_alert_manager
+    jpeg_quality: 75
+    # 推流频率上限。相机只有 1.5Hz 时，这个值再大也只是重复同一张图，
+    # 所以取 10 是为了真机 30Hz 场景留余量。
+    stream_fps: 10.0
+    device_name: LightDog
+
+    # 可选 HTTPS。两个都填才生效；证书有问题时**拒绝以明文启动**（宁可没画面，
+    # 也不要让用户以为已经加密）。自签证书手机会提示不受信任，这是必然的。
+    # 例：openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    #       -keyout key.pem -out cert.pem -subj "/CN=lightdog"
+    ssl_certfile: ''
+    ssl_keyfile: ''
+
+    # SSE 事件流（GET /api/v1/events/stream）的推送周期。手机端用它替代 1Hz
+    # 轮询 /status：只有数据变化才发 body，否则发一行注释心跳。
+    sse_interval: 1.0
+
+    # 急停话题。手机端 POST /api/v1/estop 往这里发，twist_mux 闭锁到显式解除。
+    estop_topic: /safety/estop

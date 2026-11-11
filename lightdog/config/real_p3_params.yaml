@@ -1,0 +1,128 @@
+# 真机配置（RASPBOT V2 / Pi 5 16GB / ROS2 Humble）—— 由仿真配置派生。
+#
+# 依据 docs/hardware_arrival.md 的商品截图：普通 USB 单目相机（无深度）、
+# 四麦轮 + TT 电机、Pi 直驱无 STM32、Raspberry Pi OS + ROS2 Humble。
+# 仿真配置仍是同名的 p*_params.yaml，本文件只给 deploy/nodes.conf 用。
+#
+# 【只改硬件资料能确定的】use_sim_time、深度模式、ONNX 后端、AprilTag 字典、
+#   离线充电、faststart、鉴权/密钥占位、TF 卡配额。
+# 【资料没给、必须实测后改】camera_offset / base_link_height / marker_length /
+#   dock_pose_* / 相机话题名 / 内参。这些行有 TODO，值是仿真 4wd 的，
+#   **不要当成实车值** —— 照抄会出现「不报错但一直不对」。
+# 【必须现场填写】auth_token、sip_ami_secret、SSL 证书路径。
+#
+# 注意：下方**原样保留**了仿真配置里的说明文字，个别注释还写着
+# 「use_sim_time: true」等仿真语境；那只是历史说明，实际生效的是参数值 false。
+#
+
+# LightDog P3 参数（自动回充）
+#
+# 时间相关参数依赖仿真时钟，use_sim_time: true。
+# 唯一的例外是 twist_mux（在 p2_params.yaml 里，故意用墙钟）。
+
+/lightdog_aruco_dock:
+  ros__parameters:
+    use_sim_time: false
+
+    image_topic: '/camera/color/image_raw' # TODO remap to the vendor driver topic
+    info_topic: '/camera/color/camera_info' # TODO publish calibrated camera_info
+
+    # ArUco 本体。marker_length 是**黑框边长**，不是白板边长：
+    # lightdog/models/dock/model.sdf 里白板 0.14m 装 10 个 cell
+    # （6 cell marker + 每边 2 cell 静默区），黑框 = 0.14 * 6/10 = 0.084。
+    # 填错会让解出来的距离按比例整体缩放（0.084 填成 0.10 会让距离多算 19%），
+    # 表现是回充时提前停下或者一直往桩里顶。
+    marker_length: 0.084                  # TODO measure: AprilTag black-square side
+    marker_id: 0
+    dictionary: auto                   # vendor uses AprilTag; auto tries 5 dicts
+    # 仿真相机固定安装；实车 RASPBOT V2 是二自由度云台，见 real_p3_params.yaml。
+    # false 时节点显式停止发布 /detected_dock_pose，而不是用错外参算假位姿。
+    gimbal_locked: true                   # TODO lock the 2-DOF gimbal before docking
+    gimbal_pan_deg: 0.0                   # TODO measure: locked pan angle (deg)
+    gimbal_tilt_deg: 0.0                  # TODO measure: locked tilt angle (deg)
+
+    # 相机安装（4wd 的 depth_sensor_pose = xyz "-0.065 0 0.255" rpy "0 0 0"，
+    # 相对 base_link）。base_link_height 把它抬到 base_footprint 上，漏掉会让
+    # 解出来的 dock z 恒偏 -0.1195。
+    camera_offset: [-0.065, 0.0, 0.255]   # TODO measure: gimbal locked, camera vs base_link
+    base_link_height: 0.1195              # TODO measure: base_link height (sim 4wd value)
+    # camera_link -> 光学系（x 右 / y 下 / z 前），REP-103 标准值
+    optical_rpy_deg: [-90.0, 0.0, -90.0]
+
+    # marker 在 dock 上的安装，必须与 model.sdf 的 marker_visual pose 一致
+    marker_pos: [-0.0775, 0.0, 0.155]
+    marker_rpy_deg: [90.0, 0.0, 90.0]
+
+    # 桩原点沿桩 +x 到「机器人中心停靠位」的距离。opennav_docking 的 dock pose
+    # 语义是**机器人停靠位姿**，不是桩的位姿，所以发布前要前移这么多并掉头 180°。
+    # 必须与 sim/.env 的 DOCK_APPROACH 一致（那边用来生成 dock_database.yaml）。
+    approach_offset: 0.30
+
+    rate: 10.0
+    max_range: 3.0
+    publish_debug: true
+    # 相机断流判据（墙钟秒）。超时后主动把 /dock/marker_visible 置 false，
+    # 否则对准逻辑会以为桩还在视野里、原地微调而不进入扫描。
+    frame_timeout: 1.0
+    # marker 的 +x 方向与预期差 180° 时用（贴纸贴反/换了一家供应商的板子），
+    # 打开后解出来的 yaw 整体翻转。正常情况下保持 false。
+    invert_marker_yaw: false
+
+/lightdog_dock_manager:
+  ros__parameters:
+    use_sim_time: false
+
+    battery_topic: /battery_state
+    capacity_ah: 5.0
+    low_ratio: 0.25
+    full_ratio: 0.95
+    low_voltage: 11.90
+    low_confirm_time: 3.0
+    full_cooldown: 30.0
+
+    dock_id: home_dock
+    # false：「从远处开到桩附近」属于 P4 的任务调度，P3 只负责「已在桩附近 ->
+    # 精确停靠」。而且实测四驱 skid steer 的 odom yaw 高估约 35%，靠导航摆正
+    # 朝向不可靠 —— 所以停靠前的朝向由下面的视觉对准负责。
+    navigate_to_staging: false
+    max_staging_time: 120.0
+    max_retries: 2
+    retry_cooldown: 20.0
+    # 手动 cancel 后的静默期。低电状态没变，不冷却的话取消完 3s 就又去充电，
+    # 手机端「取消回充」等于没有。
+    cancel_cooldown: 120.0
+    auto_dock: true
+
+    # 停靠成功 != 充上电。docking_server 只保证"停到位"，触点没接触上时
+    # 界面照样显示 DOCKED、电量却不动。这里在 DOCKED 后抽查电量是否在涨，
+    # 30s 没涨就报 error（不自动离桩，避免 BMS 上报滞后时来回折腾）。
+    verify_charging: true
+    charge_check_timeout: 30.0
+
+    # 离桩超时（秒）。真机桩前净空不同，不能写死：给 30s 时车稍慢一点就
+    # 返回 905 FAILED_TO_CONTROL。仿真 0.2x 实时因子下更要放宽（实测 30s
+    # 只有约 6s 仿真时间，手动 undock 会失败，仿真里建议 60~90）。
+    max_undocking_time: 30.0
+
+    # 视觉对准：docking_server 进 INITIAL_PERCEPTION 后只会等、不会转，所以
+    # 必须先由本节点把车头摆正（否则 error_code=904 FAILED_TO_DETECT_DOCK）。
+    align_before_dock: true
+    align_tol: 0.10           # rad ≈ 5.7°
+    align_kp: 1.2
+    align_max_w: 0.45         # rad/s
+    align_scan_rate: 0.50     # 看不见 marker 时的扫描角速度（sim time），约 12.6s 一圈
+    align_timeout: 150.0      # 墙钟秒；软件渲染实时因子约 0.25x，转一圈要 50-60s 墙钟
+    cmd_vel_topic: /cmd_vel_dock
+    # 等 docking/undocking action server 上线的最长墙钟秒数。代码走非阻塞
+    # 轮询 server_is_ready()，这个值只是放弃上限，不会冻结执行器。
+    action_connect_timeout: 2.0
+
+    # 仿真补丁：Gazebo 的 LinearBatteryPlugin 只放电不充电，不打开这个就
+    # 永远等不到"充满"，状态机后半段（DOCKED -> UNDOCKING）没法验证。
+    # 真机必须改成 false，让真实电量说话。
+    sim_charging: false
+    sim_charge_rate: 0.05       # Ah/s（仿真时间），5Ah 从 0 充满约 100s
+    sim_battery_topic: /dock/sim_battery_ratio
+    sim_battery_timeout: 5.0
+
+    tick_hz: 10.0

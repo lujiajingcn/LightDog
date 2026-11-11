@@ -1,0 +1,64 @@
+# RASPBOT V2 实车驱动参数 —— 车上**没有 STM32**，这个节点取代 lightdog_mcu_bridge。
+#
+# 依据 docs/hardware_arrival.md（24 张商品截图）填的，只写硬件资料能确定的值；
+# 资料没给的（商家串口协议、话题名、编码器、几何精值）一律显式标注「待确认」，
+# 不编造。启动后看 /raspbot/diag 就能知道当前生效的后端与降级原因。
+#
+# 安全默认值：driver_backend=vendor_topic 走标准 Twist，不需要猜协议；
+# protocol_confirmed=false 时若切到 direct_serial，节点会**强制降级 self_test**，
+# 一个字节都不发。拿到商家协议文档后再改这两项。
+
+/lightdog_raspbot_driver:
+  ros__parameters:
+    use_sim_time: false
+
+    # ---- 后端 ----
+    # vendor_topic  : 把 Twist 转发给商家 ROS 驱动（默认，最可能直接可用）
+    # motor_array   : 发 Float32MultiArray 四轮线速度（自己做麦轮逆解）
+    # direct_serial : 按 motor_frame_template 发串口（协议必须已确认）
+    # self_test     : 只跑逻辑不发包
+    driver_backend: vendor_topic
+    vendor_cmd_topic: '/cmd_vel'        # 待确认：商家驱动实际订阅的话题名
+    motor_topic: '/raspbot/wheel_speeds'
+    port: '/dev/ttyUSB0'                # 待确认：驱动板实际串口
+    baud: 115200
+    # 双引号里的 \n 才是换行；单引号会变成字面 \n，商家板会收到两个字符。
+    motor_frame_template: "M {m1:.3f} {m2:.3f} {m3:.3f} {m4:.3f}\n"
+    protocol_confirmed: false           # 拿到商家协议文档前**不要**改成 true
+    reconnect_sec: 2.0
+
+    # ---- 麦轮几何（按尺寸图估算，必须卡尺实测）----
+    # 侧视图轴距 117.20mm、正视图轮距 165.83mm、轮径目测约 65mm。
+    wheel_radius: 0.0325
+    wheel_base_x: 0.1172
+    wheel_base_y: 0.1658
+    max_wheel_mps: 0.35
+    max_linear: 0.25
+    max_lateral: 0.25
+    max_angular: 0.70
+
+    # ---- 话题契约（与 mcu_bridge 一致，上层节点零改动）----
+    cmd_vel_topic: '/cmd_vel_muxed'
+    led_topic: '/led/brightness'
+    vendor_led_topic: '/raspbot/led'
+    led_backend: none                   # 灯条协议未确认，只记录不下发
+    estop_topic: '/safety/estop'
+    button_topic: '/raspbot/button'     # 待确认：车上点动按键怎么接进 ROS
+    button_latching: true               # 软件补闭锁：松手不自动恢复
+    estop_auto_release: false
+    odom_topic: '/odom'
+    vendor_odom_topic: '/odom_raw'
+    odom_source: openloop               # 参数表无编码器；拿到里程计后改 vendor
+    odom_frame_id: odom
+    base_frame_id: base_link
+    battery_topic: '/battery_state'
+    battery_source: none                # 无电压遥测 -> 发 NaN，绝不填 0
+    vendor_battery_topic: '/raspbot/battery_ratio'
+    fault_topic: '/mcu/fault'
+    diag_topic: '/raspbot/diag'
+
+    # ---- 时序 ----
+    heartbeat_hz: 10.0
+    cmd_hold: 0.30                      # 停发速度超过 0.3s 主动归零（没有 IWDG 了）
+    battery_period: 5.0
+    diag_period: 2.0

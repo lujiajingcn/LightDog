@@ -38,6 +38,7 @@ GROUPS = [
     ('test_monocular', '普通相机路线：depth_mode 三态 / 按后端选单目高度 / P5 不静默'),
     ('test_consistency', '参数与版本一致性'),
     ('test_review_20261110', '全工程审查回归：协议 / HTTP / 感知 / 固件不变量'),
+    ('test_raspbot', 'RASPBOT V2 实车适配：麦轮 / 安全降级 / AprilTag / 真机配置'),
 ]
 
 

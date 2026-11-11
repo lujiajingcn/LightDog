@@ -18,6 +18,11 @@
     marker_length: 0.084
     marker_id: 0
     dictionary: DICT_4X4_50
+    # 仿真相机固定安装；实车 RASPBOT V2 是二自由度云台，见 real_p3_params.yaml。
+    # false 时节点显式停止发布 /detected_dock_pose，而不是用错外参算假位姿。
+    gimbal_locked: true
+    gimbal_pan_deg: 0.0
+    gimbal_tilt_deg: 0.0
 
     # 相机安装（4wd 的 depth_sensor_pose = xyz "-0.065 0 0.255" rpy "0 0 0"，
     # 相对 base_link）。base_link_height 把它抬到 base_footprint 上，漏掉会让
