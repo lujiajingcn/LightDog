@@ -88,3 +88,5 @@ sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv
 
 节点/话题/参数的细节见 `docs/` 下的阶段文档，硬件相关的坑见
 `docs/hardware_readiness.md`，**要买什么、买几个、为什么是这个规格见 `docs/bom.md`**。
+**车已到货，实车与计划的差异、冲突矩阵和到货必改配置见
+[`docs/hardware_arrival.md`](docs/hardware_arrival.md)**。

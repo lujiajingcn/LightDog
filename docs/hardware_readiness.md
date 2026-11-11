@@ -2,6 +2,13 @@
 
 这份文档不介绍功能，只回答一个问题：**这套代码搬到真车上，会在哪里咬人。**
 
+> **车已到货。** 实际是 RASPBOT V2（Pi 5 16GB / 四麦轮 / USB 单目广角相机 + 可动云台 /
+> Pi 直驱无 STM32 / Raspberry Pi OS + ROS2 Humble），与本文 §〇 的 D1（Pi 5 8GB +
+> Ubuntu 24.04 + Jazzy）、D3（MCU = STM32）不一致。本文下面各条**通用坑依然有效**，
+> 但选型与配置要以 [`hardware_arrival.md`](hardware_arrival.md) 的实车对照为准。
+> 特别注意：`deploy/install.sh` 的发行版探测（第 90 行）本来就包含 `humble`，
+> 它没有 Ubuntu 版本号硬检查；真正要拍板的是 §四 的系统路线。
+
 要采购什么、买几个、为什么必须是那个规格，见 [`bom.md`](bom.md) —— 两份文档
 是一对：bom 说"买这个"，这里说"买回来之后会在哪咬你"。
 
