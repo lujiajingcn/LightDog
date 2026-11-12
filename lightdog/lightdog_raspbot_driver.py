@@ -26,11 +26,19 @@ CRC16 串口协议；四个麦克纳姆轮 + TT 减速电机，官方 I2C API �
 2. **后端可插拔**。官方教程已给出确切的 I2C 驱动 API（`Ctrl_Muto` 等），
    但电机编号 / 轮序映射在官方两处教程里互相矛盾，必须上机实测：
    - `vendor_i2c`（默认）：`from Raspbot_Lib import Raspbot`，麦轮逆解后逐个调
-     `Ctrl_Muto(motor_id, pwm)`（-255..255 开环 PWM）。**`motor_id_map` 没实测
-     填好时强制降级 `self_test`，一个字节都不发** —— 猜错轮序会让车乱跑。
-   - `vendor_topic`：把 Twist 转发给 ROS 底盘节点（默认 `/cmd_vel`）。注意官方
-     RASPBOT V2 出厂驱动是 Python/Jupyter API，**不是 ROS 底盘节点**，这个后端
-     只有在你自己起了订阅者时才有用；无订阅者时 diag 会告警。
+     `Ctrl_Muto(motor_id, pwm)`（-255..255 开环 PWM）。官方
+     `03.Car basic course/5.Motor control.pdf` 明确 `motor_id=[1,4]`（1:M1 …
+     4:M4，扩展板丝印也是 M1~M4）；**但资料没给「M1..M4 -> 轮子位置」的对应**，
+     所以 `motor_id_map` 没实测填好时强制降级 `self_test`，一个字节都不发。
+   - `vendor_topic`：把 Twist 转发给**官方 ROS2 底盘节点** `/driver_node`
+     （`ros2 launch yahboomcar_bringup bringup.launch.py`，见官方教程
+     `13.ROS2-Robot chassis control course/1.Robot information release.pdf`）。
+     该节点在**出厂 Docker 容器内**运行，订阅 `/cmd_vel` / `/buzzer` /
+     `/rgblight` / `/servo`，发布 `/ultrasonic` / `/line_sensor`；它**不发布**
+     `/odom` 和电量，所以本节点的开环 odom / NaN 电量仍然必要。
+     官方 `/cmd_vel` 有效值是**归一化量**（linear.x/y [-1,1]、angular.z
+     [-3,3]）而不是 m/s，用 `vendor_linear_gain` / `vendor_angular_gain` 标定。
+     若容器与宿主 ROS 域不通，diag 会报「没有订阅者」。
    - `motor_array`：发布 `Float32MultiArray` 四轮线速度。
    - `direct_serial`：按模板发串口 —— **与本车不符**（本车是 I2C），仅为通用方案
      保留；`protocol_confirmed=false` 时同样强制降级 `self_test`。
@@ -43,6 +51,9 @@ CRC16 串口协议；四个麦克纳姆轮 + TT 减速电机，官方 I2C API �
 4. **急停**：车上没有自锁按钮，所以 `/raspbot/button` 的点动信号由**软件补闭锁**
    （松手不自动恢复），并明确标注「断电不保持、电气回路没有硬断 PWM」，
    这与原固件的物理闭锁不是等价安全等级，见 `docs/hardware_arrival.md` §C2/C3。
+   官方 `03.Car basic course/2.Key reading.pdf` 给出板载 KEY1 的读法：
+   `read_data_array(0x0d, 1)` -> 0 未按下 / 1 按下；`button_backend: i2c`
+   可直接轮询它，不必再依赖一个没人发布的 `/raspbot/button` 话题。
 5. **没有 IWDG 了**：靠 10Hz 定时器持续下发 + `cmd_hold` 超时归零 + 退出前发零速
    来替代。这比固件看门狗弱，是真机的已知风险，不藏起来。
 
@@ -141,8 +152,10 @@ def cmd_to_send(vx, vy, wz, estop, now, wall, hold):
 def parse_motor_id_map(raw):
     """解析 '0,1,2,3' 形式的电机编号映射，按 WHEEL_NAMES 顺序（FL,FR,RL,RR）。
 
-    官方两处教程冲突：`RASPBOT-V2/12197` 的测试代码注释用 0-3（L1,L2,R1,R2），
-    `Pi5-Board/12077` 却写 1-4（M1..M4），且都没给「编号 -> 轮子位置」的图。
+    官方 `03.Car basic course/5.Motor control.pdf` 明确 `motor_id=[1,4]`
+    （1:M1 … 4:M4，扩展板丝印也是 M1~M4）；旧网页教程示例里的 0-3 不是
+    这套 API 的取值。**但所有官方资料都没给「M1..M4 -> 轮子位置」的对应**，
+    URDF 教程只给了 `l1/l2/r1/r2 = 左前/左后/右前/右后` 的 joint 名。
     所以这里**不设默认值**：空串 / 非四个不重复整数 / 越界一律返回 None，
     调用方必须据此降级 self_test，绝不猜一个能用的值出来。
     """
@@ -183,6 +196,79 @@ def wheel_speeds_to_pwm(speeds, max_wheel, pwm_scale):
         pwm = int(round(v / max_wheel * pwm_scale))
         out.append(max(-lim, min(lim, pwm)))
     return tuple(out)
+
+
+#: 官方 ROS2 底盘 /driver_node 的 /cmd_vel 有效值域（教程 1 的 3.2 节注释）。
+VENDOR_LINEAR_LIMIT = 1.0
+VENDOR_ANGULAR_LIMIT = 3.0
+
+#: 官方云台 /servo 的机械限位（教程 1 的 3.4 节）：s1 [0,180]，s2 [0,110]。
+SERVO_S1_RANGE = (0.0, 180.0)
+SERVO_S2_RANGE = (0.0, 110.0)
+
+#: 板载 KEY1 的 I2C 寄存器地址（03.Car basic course/2.Key reading.pdf）。
+KEY1_ADDRESS = 0x0d
+
+
+def vendor_twist_to_normalized(vx, vy, wz, linear_gain, angular_gain,
+                               linear_limit=VENDOR_LINEAR_LIMIT,
+                               angular_limit=VENDOR_ANGULAR_LIMIT):
+    """m/s、rad/s -> 官方 /driver_node 的归一化 /cmd_vel。
+
+    官方 `1.Robot information release.pdf` 的注释写的是
+    `linear: x[-1,1] y[-1,1]` / `angular: z[-3,3]`，**不是** m/s：直接把
+    `twist_mux` 的 0.25 m/s 原样转过去，车会慢得几乎不动。gain 由实车标定，
+    默认 1.0（数值上保持恒等）是为了不改既有行为，但量纲差异必须显式化。
+    gain 非正 / NaN / 限值非正一律安全归零，绝不把 NaN 发给底盘节点。
+    """
+    if (linear_gain <= 0.0 or angular_gain <= 0.0 or
+            linear_gain != linear_gain or angular_gain != angular_gain or
+            linear_limit <= 0.0 or angular_limit <= 0.0):
+        return (0.0, 0.0, 0.0)
+    return (clamp_speed(vx * linear_gain, -linear_limit, linear_limit),
+            clamp_speed(vy * linear_gain, -linear_limit, linear_limit),
+            clamp_speed(wz * angular_gain, -angular_limit, angular_limit))
+
+
+def servo_lock_angles(s1, s2):
+    """把云台锁到可复现的角度；超官方机械限位或非法值返回 None（不下发）。
+
+    官方 `/servo`：s1 [0,180]、s2 [0,110]，超出范围舵机根本不转 —— 与其
+    静默发一个没生效的角度，不如显式拒绝并告警（相机外参必须可信）。
+    """
+    for v, (lo, hi) in ((s1, SERVO_S1_RANGE), (s2, SERVO_S2_RANGE)):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if f != f or f < lo or f > hi:
+            return None
+    return int(round(float(s1))), int(round(float(s2)))
+
+
+def read_key1(bot, address=KEY1_ADDRESS):
+    """读板载 KEY1：官方 `read_data_array(0x0d, 1)` 返回 0 未按 / 1 按下。
+
+    读失败返回 None 表示「不知道」，**绝不返回 False** —— 不能把 I2C 故障
+    当成「按键松开」去动急停闭锁。
+    """
+    if bot is None:
+        return None
+    try:
+        raw = bot.read_data_array(address, 1)
+    except Exception:
+        return None
+    if isinstance(raw, (bytes, bytearray)):
+        raw = list(raw)
+    if isinstance(raw, (list, tuple)):
+        if not raw:
+            return None
+        raw = raw[0]
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return bool(v)
 
 
 def _quat_from_yaw(yaw):
@@ -250,6 +336,20 @@ class RaspbotDriver(Node):
         self.declare_parameter('battery_period', 5.0)
         self.declare_parameter('diag_period', 2.0)
 
+        # ---- 官方 ROS2 底盘 / 云台 / 板载按键（docs/hardware_arrival.md §十）----
+        self.declare_parameter('vendor_linear_gain', 1.0)
+        self.declare_parameter('vendor_angular_gain', 1.0)
+        self.declare_parameter('vendor_linear_limit', VENDOR_LINEAR_LIMIT)
+        self.declare_parameter('vendor_angular_limit', VENDOR_ANGULAR_LIMIT)
+        self.declare_parameter('gimbal_backend', 'none')
+        self.declare_parameter('servo_topic', '/servo')
+        self.declare_parameter('servo_s1', 90.0)
+        self.declare_parameter('servo_s2', 25.0)
+        self.declare_parameter('gimbal_period', 1.0)
+        self.declare_parameter('button_backend', 'topic')
+        self.declare_parameter('button_poll_hz', 2.0)
+        self.declare_parameter('key1_address', KEY1_ADDRESS)
+
         p = self.get_parameter
         self.backend = str(p('driver_backend').value)
         if self.backend not in BACKENDS:
@@ -273,7 +373,7 @@ class RaspbotDriver(Node):
         if self.backend == 'vendor_i2c' and self.motor_id_map is None:
             self.get_logger().error(
                 'vendor_i2c 需要 motor_id_map：四个实测电机编号（FL,FR,RL,RR，逗号分隔）。'
-                '官方两处教程编号不一致（0-3 / 1-4）、轮序也没给，猜错会让车乱跑 ——'
+                '官方确证编号是 1-4（M1..M4），但「编号->轮子位置」没给，猜错会乱跑 ——'
                 '强制降级 self_test，一个字节都不发')
             self.backend = 'self_test'
             self.protocol_blocked = True
@@ -295,6 +395,34 @@ class RaspbotDriver(Node):
         self.battery_period = float(p('battery_period').value)
         self.diag_period = float(p('diag_period').value)
         self.led_backend = str(p('led_backend').value)
+        self.vendor_linear_gain = float(p('vendor_linear_gain').value)
+        self.vendor_angular_gain = float(p('vendor_angular_gain').value)
+        self.vendor_linear_limit = float(p('vendor_linear_limit').value)
+        self.vendor_angular_limit = float(p('vendor_angular_limit').value)
+        self.gimbal_backend = str(p('gimbal_backend').value)
+        if self.gimbal_backend not in ('none', 'i2c', 'servo_topic'):
+            self.get_logger().error(
+                f'未知 gimbal_backend={self.gimbal_backend}，禁用云台锁定')
+            self.gimbal_backend = 'none'
+        self.servo_topic = str(p('servo_topic').value)
+        self.servo_s1 = float(p('servo_s1').value)
+        self.servo_s2 = float(p('servo_s2').value)
+        self.gimbal_period = max(0.2, float(p('gimbal_period').value))
+        self.button_backend = str(p('button_backend').value)
+        if self.button_backend not in ('topic', 'i2c'):
+            self.get_logger().error(
+                f'未知 button_backend={self.button_backend}，回退 topic')
+            self.button_backend = 'topic'
+        self.button_poll_hz = max(0.1, float(p('button_poll_hz').value))
+        self.key1_address = int(p('key1_address').value)
+        self._gimbal_angles = servo_lock_angles(self.servo_s1, self.servo_s2)
+        if self.gimbal_backend != 'none' and self._gimbal_angles is None:
+            self.get_logger().error('云台锁定角度超出官方限位或非法 —— 禁用锁定')
+            self.gimbal_backend = 'none'
+        self.pub_servo = None
+        self._servo_msg_type = None
+        self.last_gimbal = 0.0
+        self.last_button_poll = 0.0
 
         self.odom_source = str(p('odom_source').value)
         if self.odom_source not in ODOM_SOURCES:
@@ -361,7 +489,8 @@ class RaspbotDriver(Node):
         self.get_logger().info(
             f'RASPBOT V2 驱动就绪：backend={self.backend} odom={self.odom_source} '
             f'battery={self.battery_source} button_latching={self.button_latching} '
-            f'hz={hz:.0f} cmd_hold={self.cmd_hold:.2f}s')
+            f'hz={hz:.0f} cmd_hold={self.cmd_hold:.2f}s '
+            f'gimbal={self.gimbal_backend} button={self.button_backend}')
         if self.odom_source == 'openloop':
             self.get_logger().warn(
                 '里程计是**开环积分**（官方 I2C API 无编码器/里程计读取接口），'
@@ -407,6 +536,30 @@ class RaspbotDriver(Node):
         if self.led_backend == 'vendor_topic':
             self.pub_led = self.create_publisher(
                 Float32, str(p('vendor_led_topic').value), 10)
+        if self.gimbal_backend == 'servo_topic':
+            try:
+                from yahboomcar_msgs.msg import ServoControl
+                self._servo_msg_type = ServoControl
+                self.pub_servo = self.create_publisher(
+                    ServoControl, self.servo_topic, 10)
+                self.get_logger().info(
+                    f'云台锁定 -> {self.servo_topic}（官方 s1/s2 = '
+                    f'{self._gimbal_angles}），周期重发以防 driver_node 晚起')
+            except Exception as e:
+                self.pub_servo = None
+                self.get_logger().error(
+                    f'yahboomcar_msgs/ServoControl 不可用（{e}）—— 云台锁定不下发；'
+                    '确认官方 bringup 与宿主在同一 ROS 域')
+        if self.gimbal_backend == 'i2c' and self.bot is None:
+            self.get_logger().warn(
+                'gimbal_backend=i2c 需要 Raspbot_Lib，但当前后端没加载它 —— '
+                '云台锁定不下发（改用 vendor_i2c 或 servo_topic）')
+            self.gimbal_backend = 'none'
+        if self.button_backend == 'i2c' and self.bot is None:
+            self.get_logger().warn(
+                'button_backend=i2c 需要 Raspbot_Lib，但当前后端没加载它 —— '
+                '板载 KEY1 轮询不启用，仍依赖 /raspbot/button 话题')
+            self.button_backend = 'topic'
 
     # ---------- 回调 ----------
 
@@ -496,7 +649,48 @@ class RaspbotDriver(Node):
         if now - self.last_diag >= self.diag_period:
             self._publish_diag(now, vx, vy, wz)
             self.last_diag = now
+        self._service_gimbal_and_button(now)
         self.last_tick = now
+
+    def _service_gimbal_and_button(self, now):
+        """低频维护云台锁定与板载 KEY1；10Hz 控制拍里不抢 I2C。"""
+        if self.gimbal_backend != 'none' and \
+                now - self.last_gimbal >= self.gimbal_period:
+            self.last_gimbal = now
+            self._send_gimbal_lock()
+        if self.button_backend == 'i2c' and self.bot is not None and \
+                now - self.last_button_poll >= 1.0 / self.button_poll_hz:
+            self.last_button_poll = now
+            pressed = read_key1(self.bot, self.key1_address)
+            # None = 读失败，绝不当成「松开」；只在状态变化时走闭锁策略。
+            if pressed is not None and pressed != self.button_pressed:
+                self._on_button(Bool(data=pressed))
+
+    def _send_gimbal_lock(self):
+        """周期重发：官方 driver_node 可能比本节点晚起，一次性 pub 会丢。"""
+        if self._gimbal_angles is None:
+            return
+        s1, s2 = self._gimbal_angles
+        if self.gimbal_backend == 'i2c':
+            if self.bot is None:
+                return
+            try:
+                self.bot.Ctrl_Servo(1, s1)
+                self.bot.Ctrl_Servo(2, s2)
+            except Exception as e:
+                self.get_logger().error(f'云台 I2C 锁定失败：{e}',
+                                        throttle_duration_sec=10.0)
+            return
+        if self.gimbal_backend == 'servo_topic':
+            if self.pub_servo is None or self._servo_msg_type is None:
+                return
+            try:
+                m = self._servo_msg_type()
+                m.servo_s1, m.servo_s2 = s1, s2
+                self.pub_servo.publish(m)
+            except Exception as e:
+                self.get_logger().error(f'/servo 下发失败：{e}',
+                                        throttle_duration_sec=10.0)
 
     def _drv_send(self, vx, vy, wz):
         self.last_cmd = (vx, vy, wz)
@@ -504,7 +698,9 @@ class RaspbotDriver(Node):
             return
         if self.backend == 'vendor_topic':
             m = Twist()
-            m.linear.x, m.linear.y, m.angular.z = vx, vy, wz
+            m.linear.x, m.linear.y, m.angular.z = vendor_twist_to_normalized(
+                vx, vy, wz, self.vendor_linear_gain, self.vendor_angular_gain,
+                self.vendor_linear_limit, self.vendor_angular_limit)
             self.pub_vendor.publish(m)
             self.frames_sent += 1
             return
@@ -622,9 +818,11 @@ class RaspbotDriver(Node):
             subs = self.pub_vendor.get_subscription_count()
             if subs == 0:
                 self.get_logger().warn(
-                    'vendor_topic 目标话题没有任何订阅者：官方 RASPBOT V2 出厂驱动 '
-                    '是 Python I2C API，不是 ROS 底盘节点，车不会动。'
-                    '请改用 driver_backend=vendor_i2c 并填好 motor_id_map',
+                    'vendor_topic 目标话题没有订阅者：官方 ROS2 底盘节点 '
+                    '/driver_node 运行在出厂 Docker 内，需先执行 '
+                    'ros2 launch yahboomcar_bringup bringup.launch.py，'
+                    '并确认容器与宿主 ROS_DOMAIN_ID / 网络互通；否则车不会动。'
+                    '也可改用 driver_backend=vendor_i2c 并填好 motor_id_map',
                     throttle_duration_sec=10.0)
         data = {
             'at_wall': round(now, 3),
@@ -634,6 +832,10 @@ class RaspbotDriver(Node):
             'block_reason': self.block_reason,
             'motor_id_map': list(self.motor_id_map) if self.motor_id_map else None,
             'vendor_subscribers': subs,
+            'vendor_cmd_gains': [self.vendor_linear_gain,
+                                 self.vendor_angular_gain],
+            'gimbal_backend': self.gimbal_backend,
+            'button_backend': self.button_backend,
             'odom_source': self.odom_source,
             'battery_source': self.battery_source,
             'button_latching': self.button_latching,

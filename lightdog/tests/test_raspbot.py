@@ -23,8 +23,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from harness import (PKG, Log, Msg, Pub, bind, extract_const,  # noqa: E402
-                     extract_funcs, extract_methods, source_of)
+from harness import (PKG, Log, Msg, Pub, Twist, bind,  # noqa: E402
+                     extract_const, extract_funcs, extract_methods,
+                     source_of)
 
 try:
     import yaml
@@ -40,11 +41,23 @@ ARUCO = source_of('lightdog_aruco_dock.py')
 RB_FUNCS = extract_funcs(RB, [
     'clamp_speed', 'mecanum_wheel_speeds', 'normalize_wheel_speeds',
     'integrate_openloop', 'cmd_to_send', 'parse_motor_id_map',
-    'wheel_speeds_to_pwm'], ns={'math': math})
+    'wheel_speeds_to_pwm', 'vendor_twist_to_normalized',
+    'servo_lock_angles', 'read_key1'], ns={
+        'math': math,
+        'VENDOR_LINEAR_LIMIT': extract_const(RB, 'VENDOR_LINEAR_LIMIT'),
+        'VENDOR_ANGULAR_LIMIT': extract_const(RB, 'VENDOR_ANGULAR_LIMIT'),
+        'SERVO_S1_RANGE': extract_const(RB, 'SERVO_S1_RANGE'),
+        'SERVO_S2_RANGE': extract_const(RB, 'SERVO_S2_RANGE'),
+        'KEY1_ADDRESS': extract_const(RB, 'KEY1_ADDRESS')})
 
 ARUCO_FUNCS = extract_funcs(
     ARUCO, ['resolve_dictionary_names'],
     ns={'AUTO_DICTS': extract_const(ARUCO, 'AUTO_DICTS')})
+
+# vendor_twist_to_normalized 在源码里调用同文件的 clamp_speed；harness 把每个
+# 函数抽到独立 globals，这里显式补上依赖（不在测试里复制实现）。
+RB_FUNCS['vendor_twist_to_normalized'].__globals__['clamp_speed'] = \
+    RB_FUNCS['clamp_speed']
 
 
 def _load(name):
@@ -332,7 +345,8 @@ class TestRealConfigIsActuallySwitched(unittest.TestCase):
     def test_raspbot_driver_defaults_are_safe(self):
         p = _load('raspbot_params.yaml')['/lightdog_raspbot_driver']['ros__parameters']
         self.assertEqual(p['driver_backend'], 'vendor_i2c',
-                         '本车驱动板是 I2C，不是 ROS /cmd_vel 底盘节点')
+                         '默认走官方 Raspbot_Lib I2C；官方另有 Docker 内的 '
+                         '/driver_node，切 vendor_topic 前要先确认 ROS 域互通')
         self.assertEqual(p['motor_id_map'], '',
                          '电机编号/轮序未实测时必须是空串，节点才会强制不动')
         self.assertEqual(p['led_backend'], 'i2c')
@@ -380,7 +394,8 @@ class TestSafetyInvariants(unittest.TestCase):
 
     def test_vendor_topic_warns_when_nobody_subscribes(self):
         self.assertIn('get_subscription_count()', self.src)
-        self.assertIn('不是 ROS 底盘节点', self.src)
+        self.assertIn('ros2 launch yahboomcar_bringup', self.src)
+        self.assertIn('/driver_node', self.src)
 
     def test_i2c_failure_reasserts_zero_speed(self):
         self.assertIn('I2C 电机下发失败，立刻补发全零', self.src)
@@ -403,6 +418,224 @@ class TestSafetyInvariants(unittest.TestCase):
 
     def test_shutdown_sends_zero_speed(self):
         self.assertIn('self._drv_send(0.0, 0.0, 0.0)', self.src)
+
+
+class TestOfficialROS2Chassis(unittest.TestCase):
+    """官方配套教程 PDF 的一手契约（docs/hardware_arrival.md §十）。"""
+
+    # 官方 04.Car motion control course/0.Mecanum wheel motion principle.pdf
+    # 第 5 页的符号表，列顺序是 L1 L2 R1 R2；URDF 教程第 2 页明确
+    # l1=左前、l2=左后、r1=右前、r2=右后。我们的返回顺序是 FL,FR,RL,RR。
+    OFFICIAL_TABLE = (
+        ('前进',            (1.0, 0.0, 0.0),  '++++'),
+        ('后退',            (-1.0, 0.0, 0.0), '----'),
+        ('左平移',          (0.0, 1.0, 0.0),  '-++-'),
+        ('右平移',          (0.0, -1.0, 0.0), '+--+'),
+        ('左前',            (1.0, 1.0, 0.0),  '0++0'),
+        ('左后',            (-1.0, 1.0, 0.0), '-00-'),
+        ('右前',            (1.0, -1.0, 0.0), '+00+'),
+        ('右后',            (-1.0, -1.0, 0.0), '0--0'),
+        ('逆时针(左转)',     (0.0, 0.0, 1.0),  '--++'),
+        ('顺时针(右转)',     (0.0, 0.0, -1.0), '++--'),
+        ('停止',            (0.0, 0.0, 0.0),  '0000'),
+    )
+
+    @staticmethod
+    def _sign(v, eps=1e-9):
+        return '0' if abs(v) < eps else ('+' if v > 0 else '-')
+
+    def test_inverse_matches_official_mecanum_sign_table(self):
+        f = RB_FUNCS['mecanum_wheel_speeds']
+        for label, (vx, vy, wz), expect in self.OFFICIAL_TABLE:
+            fl, fr, rl, rr = f(vx, vy, wz, 0.0586, 0.0829)
+            # L1 L2 R1 R2 = FL RL FR RR
+            got = ''.join(self._sign(v) for v in (fl, rl, fr, rr))
+            self.assertEqual(got, expect,
+                             f'官方运动「{label}」符号不符：得到 {got}，应为 {expect}')
+
+    def test_official_wheel_order_is_documented_not_guessed(self):
+        src = self._driver_src()
+        self.assertIn('WHEEL_NAMES', src)
+        self.assertIn('l1/l2/r1/r2', src,
+                      '官方 URDF 教程的 joint -> 轮位映射必须写进源码注释')
+
+    def _driver_src(self):
+        with open(RB, encoding='utf-8') as f:
+            return f.read()
+
+    def test_vendor_cmd_is_normalized_and_bounded(self):
+        f = RB_FUNCS['vendor_twist_to_normalized']
+        self.assertEqual(f(0.25, -0.10, 0.5, 1.0, 1.0), (0.25, -0.10, 0.5))
+        # 官方值域：linear [-1,1]，angular [-3,3]，越界必须钳住
+        self.assertEqual(f(9.0, -9.0, 9.0, 1.0, 1.0), (1.0, -1.0, 3.0))
+        self.assertEqual(f(0.5, 0.5, 1.0, 4.0, 2.0), (1.0, 1.0, 2.0))
+        # NaN 与非法 gain 一律安全归零，绝不把 NaN 发给 /driver_node
+        self.assertEqual(f(float('nan'), 0.1, 0.1, 1.0, 1.0), (0.0, 0.1, 0.1))
+        for g in (0.0, -1.0, float('nan')):
+            self.assertEqual(f(0.2, 0.2, 0.2, g, 1.0), (0.0, 0.0, 0.0))
+        self.assertEqual(f(0.2, 0.2, 0.2, 1.0, 1.0, 0.0, 3.0),
+                         (0.0, 0.0, 0.0))
+
+    def test_servo_lock_rejects_out_of_official_range(self):
+        f = RB_FUNCS['servo_lock_angles']
+        self.assertEqual(f(90, 25), (90, 25))
+        self.assertEqual(f(0, 110), (0, 110))
+        self.assertEqual(f(180, 0), (180, 0))
+        for bad in ((181, 25), (-1, 25), (90, 111), (90, -1),
+                    (float('nan'), 25), (90, float('nan')),
+                    ('x', 25), (90, None)):
+            self.assertIsNone(f(*bad), f'越界/非法角度必须拒绝：{bad}')
+
+    def test_key1_read_maps_to_bool_or_none(self):
+        f = RB_FUNCS['read_key1']
+
+        class Bot:
+            def __init__(self, value):
+                self.value = value
+                self.calls = []
+
+            def read_data_array(self, addr, n):
+                self.calls.append((addr, n))
+                if isinstance(self.value, Exception):
+                    raise self.value
+                return self.value
+
+        for raw, want in (([1], True), ([0], False), (1, True), (0, False),
+                          (b'\x01', True), (b'\x00', False)):
+            self.assertIs(f(Bot(raw)), want, f'read_data_array 返回 {raw!r}')
+        for raw in (None, [], RuntimeError('i2c'), object(), 'x'):
+            self.assertIsNone(f(Bot(raw)), f'读失败必须返回 None：{raw!r}')
+        self.assertIsNone(f(None))
+        b = Bot([0])
+        f(b, 0x0d)
+        self.assertEqual(b.calls, [(0x0d, 1)], '必须按官方 0x0d / 1 字节读')
+
+    def test_official_apis_and_topics_are_pinned(self):
+        with open(RB, encoding='utf-8') as f:
+            src = f.read()
+        for token in ('Ctrl_Muto', 'Ctrl_Servo', 'read_data_array',
+                      'KEY1_ADDRESS = 0x0d', 'yahboomcar_msgs.msg',
+                      '/servo', 'vendor_twist_to_normalized',
+                      'ros2 launch yahboomcar_bringup'):
+            self.assertIn(token, src, f'官方接口 {token} 不能丢')
+
+    def test_raspbot_config_exposes_official_chassis_params(self):
+        p = _load('raspbot_params.yaml')['/lightdog_raspbot_driver']['ros__parameters']
+        self.assertEqual(p['vendor_cmd_topic'], '/cmd_vel')
+        self.assertEqual(p['vendor_linear_limit'], 1.0)
+        self.assertEqual(p['vendor_angular_limit'], 3.0)
+        self.assertGreater(p['vendor_linear_gain'], 0.0)
+        self.assertGreater(p['vendor_angular_gain'], 0.0)
+        self.assertEqual(p['gimbal_backend'], 'none',
+                         '示例角度不是标定位，默认不能擅自下发云台指令')
+        self.assertEqual(p['servo_topic'], '/servo')
+        self.assertEqual(p['key1_address'], 13)   # 官方 0x0d
+        self.assertEqual(p['button_backend'], 'topic')
+        self.assertGreater(p['button_poll_hz'], 0.0)
+
+    # ---- 行为判据：只测纯函数时，把「下发路径」改回旧逻辑不会被发现 ----
+
+    def _driver_methods(self, names):
+        return extract_methods(RB, 'RaspbotDriver', names, ns={
+            'Twist': Twist, 'Bool': Msg,
+            'clamp_speed': RB_FUNCS['clamp_speed'],
+            'mecanum_wheel_speeds': RB_FUNCS['mecanum_wheel_speeds'],
+            'normalize_wheel_speeds': RB_FUNCS['normalize_wheel_speeds'],
+            'wheel_speeds_to_pwm': RB_FUNCS['wheel_speeds_to_pwm'],
+            'vendor_twist_to_normalized':
+                RB_FUNCS['vendor_twist_to_normalized'],
+            'read_key1': RB_FUNCS['read_key1']})
+
+    def test_vendor_topic_send_uses_normalized_cmd(self):
+        pub = Pub()
+        obj = types.SimpleNamespace(
+            backend='vendor_topic', pub_vendor=pub, frames_sent=0,
+            vendor_linear_gain=4.0, vendor_angular_gain=2.0,
+            vendor_linear_limit=1.0, vendor_angular_limit=3.0)
+        bind(obj, self._driver_methods(['_drv_send']))
+        obj._drv_send(0.25, -0.5, 2.0)
+        self.assertEqual(obj.frames_sent, 1)
+        m = pub.last
+        # 官方值域 linear [-1,1] / angular [-3,3]，gain 生效且越界钳住
+        self.assertEqual((m.linear.x, m.linear.y, m.angular.z),
+                         (1.0, -1.0, 3.0))
+        self.assertEqual(obj.last_cmd, (0.25, -0.5, 2.0),
+                         'diag 的 last_cmd 必须仍是车体 m/s，别被归一化值污染')
+
+    def test_button_poll_ignores_unknown_and_only_fires_on_change(self):
+        methods = self._driver_methods(['_service_gimbal_and_button'])
+        calls = []
+
+        class Bot:
+            def __init__(self, value):
+                self.value = value
+
+            def read_data_array(self, addr, n):
+                if isinstance(self.value, Exception):
+                    raise self.value
+                return self.value
+
+        def make(value, pressed=False):
+            obj = types.SimpleNamespace(
+                gimbal_backend='none', last_gimbal=0.0, gimbal_period=1.0,
+                button_backend='i2c', bot=Bot(value), last_button_poll=0.0,
+                button_poll_hz=2.0, key1_address=13, button_pressed=pressed,
+                get_logger=lambda: Log(),
+                _on_button=lambda m: calls.append(bool(m.data)))
+            bind(obj, methods)
+            return obj
+
+        make([1])._service_gimbal_and_button(10.0)
+        self.assertEqual(calls, [True], '按下必须置位软件闭锁')
+        calls.clear()
+        make([0], pressed=True)._service_gimbal_and_button(10.0)
+        self.assertEqual(calls, [False],
+                         '松开要交给 _on_button 的闭锁策略，不在轮询里直接解除')
+        calls.clear()
+        for bad in (RuntimeError('i2c'), [], object()):
+            make(bad)._service_gimbal_and_button(10.0)
+        self.assertEqual(calls, [],
+                         '读失败 = 不知道，绝不能当成松开去动急停闭锁')
+
+    def test_gimbal_lock_publishes_periodically_and_respects_limits(self):
+        methods = self._driver_methods(['_service_gimbal_and_button',
+                                       '_send_gimbal_lock'])
+
+        class ServoMsg:
+            def __init__(self):
+                self.servo_s1 = self.servo_s2 = None
+
+        class Bot:
+            def __init__(self):
+                self.calls = []
+
+            def Ctrl_Servo(self, mid, angle):
+                self.calls.append((mid, angle))
+
+        pub, bot = Pub(), Bot()
+        obj = types.SimpleNamespace(
+            gimbal_backend='servo_topic', last_gimbal=0.0, gimbal_period=1.0,
+            button_backend='topic', bot=bot, last_button_poll=0.0,
+            button_poll_hz=2.0, button_pressed=False, get_logger=lambda: Log(),
+            _gimbal_angles=(90, 25), _servo_msg_type=ServoMsg,
+            pub_servo=pub, key1_address=13)
+        bind(obj, methods)
+        obj._service_gimbal_and_button(10.0)
+        self.assertEqual(len(pub.sent), 1)
+        self.assertEqual((pub.last.servo_s1, pub.last.servo_s2), (90, 25))
+        obj._service_gimbal_and_button(10.5)   # 周期未满，不刷屏
+        self.assertEqual(len(pub.sent), 1)
+        obj._service_gimbal_and_button(11.0)   # 满一拍，重发防 driver_node 晚起
+        self.assertEqual(len(pub.sent), 2)
+
+        obj.gimbal_backend = 'i2c'
+        obj._send_gimbal_lock()
+        self.assertEqual(bot.calls, [(1, 90), (2, 25)],
+                         '官方 Ctrl_Servo(1/2, angle)')
+        before = len(pub.sent)
+        obj._gimbal_angles = None
+        obj._send_gimbal_lock()
+        self.assertEqual(len(pub.sent), before, '角度非法时一次都不发')
 
 
 if __name__ == '__main__':

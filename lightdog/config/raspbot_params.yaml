@@ -1,9 +1,9 @@
 # RASPBOT V2 实车驱动参数 —— 车上**有板载 MCU，但走 I2C 的 Raspbot_Lib**，
 # 不是我们自写的 STM32 CRC16 串口协议；这个节点取代 lightdog_mcu_bridge。
 #
-# 依据 docs/hardware_arrival.md（24 张商品截图）+ 亚博官方产品页 / 官方教程
-# `yahboom.net/study/RASPBOT-V2/12197` 填的，只写资料能确定的值；资料没给的
-# （电机编号与轮序、几何精值）一律显式标注「待确认」，不编造。
+# 依据 docs/hardware_arrival.md（24 张商品截图）+ 亚博官方产品页 + 官方教程
+# PDF（GitHub `YahboomTechnology/Raspbot-V2`，见文档 §十）填的，只写资料能
+# 确定的值；资料没给的（M1..M4 -> 轮子位置、几何精值）显式标注「待确认」。
 # 启动后看 /raspbot/diag 就能知道当前生效的后端与降级原因。
 #
 # 安全默认值：driver_backend=vendor_i2c 调官方 Ctrl_Muto，但 **motor_id_map
@@ -23,12 +23,23 @@
     driver_backend: vendor_i2c
     i2c_module: Raspbot_Lib             # 官方出厂镜像自带，路径 ~/py_install
     i2c_class: Raspbot
-    # TODO 上机四轮单动实测后填，按 FL,FR,RL,RR 顺序写四个编号，如 '0,2,1,3'。
-    # 官方 RASPBOT-V2/12197 示例注释是 0-3（L1,L2,R1,R2），Pi5-Board/12077
-    # 却写 1-4（M1..M4）；两者矛盾且都没给轮序图。空串 = 强制不动（安全）。
+    # TODO 上机四轮单动实测后填，按 FL,FR,RL,RR 顺序写四个编号，如 '1,3,2,4'。
+    # 官方 03.Car basic course/5.Motor control.pdf 明确 1-4（1:M1 … 4:M4），
+    # 驱动板丝印也是 M1~M4；但**没有**给出「编号 -> 轮子位置」的对应图，
+    # URDF 教程只给了 l1/l2/r1/r2 = 左前/左后/右前/右后 的 joint 名。
+    # 空串 = 强制 self_test，一个 I2C 字节都不发（安全）。
     motor_id_map: ''
     motor_pwm_scale: 255.0              # Ctrl_Muto 接受 -255..255 开环 PWM
-    vendor_cmd_topic: '/cmd_vel'        # 只有在自己起了 ROS 底盘节点时才有意义
+    # 官方 ROS2 底盘节点 /driver_node 订阅 /cmd_vel（在出厂 Docker 内，
+    # ros2 launch yahboomcar_bringup bringup.launch.py），不是我们猜的商家节点。
+    vendor_cmd_topic: '/cmd_vel'
+    # 教程 1.Robot information release.pdf 的 3.2 节注释：
+    #   linear.x/y 有效值 [-1,1]、angular.z [-3,3] —— **归一化量，不是 m/s**。
+    # gain 需实车标定；默认 1.0 数值上保持恒等，但绝不把量纲差异藏起来。
+    vendor_linear_gain: 1.0
+    vendor_angular_gain: 1.0
+    vendor_linear_limit: 1.0
+    vendor_angular_limit: 3.0
     motor_topic: '/raspbot/wheel_speeds'
     port: '/dev/ttyUSB0'                # direct_serial 用；本车走 I2C，不用串口
     baud: 115200
@@ -52,8 +63,27 @@
     led_topic: '/led/brightness'
     vendor_led_topic: '/raspbot/led'
     led_backend: i2c                    # 官方 API Ctrl_WQ2812_brightness_ALL(R,G,B)
+
+    # ---- 云台（官方 /servo 或 Ctrl_Servo，教程 1 的 3.4 节 / 03 的 4 节）----
+    # none（默认）：不碰云台，靠人工锁死 + P3 的 gimbal_locked 前置校验。
+    # servo_topic：周期发 yahboomcar_msgs/ServoControl 到 /servo 锁定外参。
+    # i2c        ：周期调 Ctrl_Servo(1/2, angle)，仅 vendor_i2c 后端可用。
+    # s1 [0,180]、s2 [0,110] 是官方机械限位；90/25 是官方示例，**不是标定位**，
+    # 上机标定相机外参后改成当时的实际角度。
+    gimbal_backend: none
+    servo_topic: '/servo'
+    servo_s1: 90.0
+    servo_s2: 25.0
+    gimbal_period: 1.0
+
     estop_topic: '/safety/estop'
-    button_topic: '/raspbot/button'     # 待确认：车上点动按键怎么接进 ROS
+    # 官方 03.Car basic course/2.Key reading.pdf：read_data_array(0x0d,1)
+    # -> 0 未按下 / 1 按下。topic = 等别人发 /raspbot/button（出厂没人发）；
+    # i2c = 直接轮询板载 KEY1（需 vendor_i2c 后端已加载 Raspbot_Lib）。
+    button_topic: '/raspbot/button'
+    button_backend: topic
+    button_poll_hz: 2.0
+    key1_address: 13                    # 0x0d
     button_latching: true               # 软件补闭锁：松手不自动恢复
     estop_auto_release: false
     odom_topic: '/odom'

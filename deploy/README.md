@@ -12,8 +12,13 @@
 > `config/real_*.yaml`，驱动单元是 `raspbot`（Pi 直驱、四麦轮），原 `mcu`（STM32）
 > 停用。上机前务必：① 换掉 `real_p4_params.yaml` / `real_p5_params.yaml` 里的
 > `CHANGE_ME_BEFORE_DEPLOY` 占位；② 显式 `--ros-distro humble`（或按
-> `docs/hardware_arrival.md` §四 选定 Docker/Jazzy 路线）；③ 确认商家驱动订阅的
-> `/cmd_vel` 话题名。安全等级变化见该文档 §8.3 —— 软件急停不等于物理急停。
+> `docs/hardware_arrival.md` §四 选定 Docker/Jazzy 路线）；③ **先关掉出厂开机自启
+> 「大程序」**（`sh /home/pi/project_demo/raspbot/killprocess.sh`），否则它会占用
+> I2C / 串口 / 6001 端口；④ 官方 ROS2 底盘节点 `/driver_node` 在出厂 Docker 内，
+> 若走 `vendor_topic` 须先 `ros2 launch yahboomcar_bringup bringup.launch.py`
+> 并确认宿主能看到 `/cmd_vel` 订阅者（`/cmd_vel` 话题名已由官方 PDF 确证，
+> 但其值是归一化量 [-1,1]/[-3,3]，不是 m/s）。详见该文档 §十。
+> 安全等级变化见 §8.3 —— 软件急停不等于物理急停。
 
 ---
 
