@@ -52,8 +52,13 @@ tf2 少一个失败模式；P2 已经验证这条路可靠。
   而不是拿错外参算一个「数值正常但方向不对」的假位姿。
 要做云台实时追踪，就得改成 tf2 查询动态外参，那是另一条路（尚未实现）。
 
-另外实车贴的是 **AprilTag**，不是 ArUco。`dictionary: auto` 会依次尝试
-ArUco 4x4 与 OpenCV contrib 自带的 4 种 AprilTag 字典，命中哪个记日志。
+另外实车贴的是 **AprilTag**，不是 ArUco。官方解锁教程《09、AprilTag标签码
+识别》明确「本次 apriltag 标签码使用的是 **TAG36H11** 格式，出厂已配套相关
+标签码，并贴在积木块上」，其源码 `Detector(families='tag36h11', ...)`，
+`detect(..., 0.025)` 里的 0.025 是官方设定的标签边长（米）。
+所以 `dictionary: auto` 把 36H11 放首位，其余 ArUco / AprilTag 字典留作兜底，
+命中哪个记日志。注意官方源码**没有传 camera_params**，也就是说出厂资料
+并不提供相机内参 —— `camera_info` 仍必须自己标定，不能照抄一个假内参。
 """
 
 import math
@@ -106,19 +111,20 @@ def make_tf(rotation, translation):
     return t
 
 
-#: 实车贴的是 AprilTag。OpenCV contrib 的 aruco 模块同时带这四种预定义字典，
-#: `auto` 依次试，不用先问商家到底是哪一族（文档里也没写）。
+#: 官方出厂标签确认为 **TAG36H11**（教程《09、AprilTag标签码识别》），放首位
+#: 能省掉前四次全图 detect；后面四族保留兜底，兼容用户自己打印的标签。
 #: 写成字面量（不是拼接表达式）是为了让离线回归能原样抽出这个常量。
-AUTO_DICTS = ('DICT_4X4_50',
+AUTO_DICTS = ('DICT_APRILTAG_36H11',
               'DICT_APRILTAG_16H5', 'DICT_APRILTAG_25H9',
-              'DICT_APRILTAG_36H10', 'DICT_APRILTAG_36H11')
+              'DICT_APRILTAG_36H10', 'DICT_4X4_50')
 
 
 def resolve_dictionary_names(raw):
     """把 dictionary 参数解析成「依次尝试」的字典名列表。
 
-    'auto' / 空 -> ArUco 4x4 + 4 种 AprilTag；也接受逗号分隔的显式列表。
-    纯函数，方便离线回归；cv2 里不存在的名字由调用方过滤并告警。
+    'auto' / 空 -> 官方 36H11 优先，再试其余 3 种 AprilTag + ArUco 4x4；
+    也接受逗号分隔的显式列表。纯函数，方便离线回归；cv2 里不存在的名字由
+    调用方过滤并告警。
     """
     text = str(raw if raw is not None else '').strip()
     if not text or text.lower() == 'auto':

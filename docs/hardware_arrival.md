@@ -420,8 +420,8 @@ marker 边长、桩位姿、存储容量；另加相机内参棋盘格标定、`
 | 6 | **灯条** | 「协议未确认，只记录不下发」 | `Ctrl_WQ2812_brightness_ALL(R,G,B)`、`Ctrl_WQ2812_ALL(state,color)` | `led_backend: i2c`，亮度可真正下发 |
 | 7 | **云台** | 靠人工锁死 + 静态外参 | `Ctrl_Servo(id, angle)` id 1/2、0–180°；**官方 PDF 确证** `/servo` 的 s1 [0,180] / s2 [0,110]（§10.3） | 已接：`gimbal_backend` 三种模式、限位拒绝、周期重发；默认 `none` 不擅自下发（§10.5 / §10.6） |
 | 8 | **蜂鸣器 / 超声波** | 图上有 | `Ctrl_BEEP_Switch(state)`、`Ctrl_Ulatist_Switch(state)` + `read_data_array(0x1b,1)<<8 | read_data_array(0x1a,1)`（单位 mm） | 后续可接近距离避障；**本轮未接**，项目 `collision_monitor` 仍是 `/scan` 契约 |
-| 9 | **电机编号与轮序** | 完全未知 | **编号已确证 1-4**：官方 `03/5.Motor control.pdf` 与扩展板丝印均为 M1~M4（§10.4）；0-3 是旧网页示例，非本 API。**仍缺「M1..M4 → 轮子位置」**，URDF 只给 joint 名 l1/l2/r1/r2 | **不做默认猜测**：新增 `motor_id_map`，空串时 `vendor_i2c` 强制降级 `self_test`，一个 I2C 字节都不发 |
-| 10 | **AprilTag** | 截图已确认「支持识别 AprilTag」 | 官方 / 经销商功能列表明确「**AprilTag 标签码识别 / 跟踪 / 追随**」、QR 码控制 | 验证 §C6 的 `dictionary: auto` 决策正确；**具体 AprilTag 家族仍未给**，仍靠 auto 多字典试 |
+| 9 | **电机编号与轮序** | 完全未知 | ~~编号已确证 1-4~~ **⚠️ 已由 §11.2 / §11.3 更正**：底层 I2C 寄存器是 **0-3**（协议表 L1/L2/R1/R2 + `Raspbot_Lib.py` 源码），1-4 只是扩展板丝印；轮位由 URDF 教程 + 接口分布图 + 麦轮符号表闭环推出候选 `0,2,1,3` | **不做默认猜测**：`motor_id_map` 空串时 `vendor_i2c` 强制降级 `self_test`，一个 I2C 字节都不发；候选值仍须上机四轮单动验证 |
+| 10 | **AprilTag** | 截图已确认「支持识别 AprilTag」 | 官方 / 经销商功能列表明确「**AprilTag 标签码识别 / 跟踪 / 追随**」、QR 码控制；**§11.6 补：出厂标签是 TAG36H11**，`tag_size=0.025` | 验证 §C6 的 `dictionary: auto` 决策正确；`AUTO_DICTS` 已把 36H11 提到首位，其余字典留兜底 |
 | 11 | 系统 / 供电 / 电池 | Pi OS + Humble、5.1V/5A、7.4V 2000mAh 约 2h | 官方一致：Raspberry Pi OS + ROS2 Humble、Type-C PD **5V/5A**、**7.4V 2S 2000mAh 约 2.1 小时** | §四 路线判断不变；`vcgencmd get_throttled` 仍要验 |
 | 12 | 无 LiDAR / IMU / 深度相机 | 推断「没有」 | 官方产品页与规格表**均未列**这三项 | Nav2 costmap 仍缺 `/scan`；P5 保持 `depth_mode: 'off'` / `fall-det: no` |
 | 13 | 语音链路 | 离线词条 + 通义千问 | 官方：实时接入通义千问 + 内置三模型（语言 / 语音 / 视觉）+ RAG + 远场拾音 / 回声消除 / 降噪 | 输出仍在**商家 Python 程序内部**，未桥接到 `/voice/command`（未变） |
@@ -467,7 +467,7 @@ python3 - <<'PY'
 from Raspbot_Lib import Raspbot
 import time
 bot = Raspbot()
-for mid in (1, 2, 3, 4):          # 官方确证 1-4
+for mid in (0, 1, 2, 3):          # ⚠️ §11.2 更正：底层是 0-3，不是丝印 1-4
     print('motor', mid)
     bot.Ctrl_Muto(mid, 80); time.sleep(1.0); bot.Ctrl_Muto(mid, 0)
 PY
@@ -479,12 +479,12 @@ PY
 
 ### 9.6 仍未确认（别当成已修）
 
-- 「编号 → 轮子位置」映射 —— **上机前唯一阻塞项**（编号体系 1-4 已由 §10.4 确证）。
-- I2C 地址 `0x2B` 是否是你这台 revision（官方教程只给 `get_i2c_device(address, i2c_bus)`，具体地址来自第三方库）。
-- 官方 ROS2 底盘节点是否在这张 TF 卡镜像里、Docker ↔ 宿主 DDS 是否互通；`/cmd_vel` 归一化量 → m/s 的 gain。
-- AprilTag 具体家族、目标 id、marker 黑框边长（决定 `marker_length`）。
-- 相机话题名、`camera_info` 内参、云台标定角度、`camera_offset` / `base_link_height`。
-- 按键寄存器与读法**已确证**（`0x0d` / `read_data_array`）；剩下的是上机把 `button_backend` 从 `topic` 切到 `i2c`。
+- ~~「编号 → 轮子位置」映射 / 编号体系 1-4~~ **§11.2 / §11.3 已更正**：底层 0-3、候选 `0,2,1,3`；剩下的是**上机四轮单动验证**，仍是唯一会让车乱跑的阻塞项。
+- ~~I2C 地址 `0x2B` 是否是你这台 revision~~ **§11.2 已由官方源码确证**：`PI5Car_I2CADDR = 0x2B`、`SMBus(1)`；上机仍要 `i2cdetect -y 1` 看实际枚举。
+- 官方 ROS2 底盘节点是否在这张 TF 卡镜像里、Docker ↔ 宿主 DDS 是否互通（§11.6 补了官方 `docker_ros2.sh` 参数）；`/cmd_vel` 归一化量 → m/s 的 gain。
+- ~~AprilTag 具体家族~~ **§11.6 已确认为 TAG36H11**；仍缺目标 id、实际打印边长（官方源码 `tag_size=0.025`）。
+- 相机话题名（§11.6 给出官方候选 `/image_raw`）、**`camera_info` 内参（官方明确没提供，必须自己标定）**、云台标定角度、`camera_offset` / `base_link_height`。
+- ~~把 `button_backend` 从 `topic` 切到 `i2c`~~ **§11.5 已完成**：默认已是 `i2c`，且按钮句柄独立于底盘后端加载。
 - 超声波能否接到 `collision_monitor`（现契约是 `/scan`）；无 LiDAR 时全局导航仍不可用。
 - 语音模块 → `/voice/command` 桥接；Humble 下 OpenCV aruco API 与 launch 裸 `LaunchConfiguration` 类型推断。
 - ONNX 模型导出、相机内参 / 几何六项实测、`auth_token` / `sip_ami_secret` 占位串替换。
@@ -540,7 +540,7 @@ PY
 |---|---|---|---|
 | 3 | 「出厂是 Python/Jupyter 库，**没有** ROS 底盘节点订阅 `/cmd_vel`」 | **有**：`ros2 launch yahboomcar_bringup bringup.launch.py` 启动 `/driver_node`（executable `Mcnamu_driver`），订阅 `/cmd_vel`；跑在**出厂 Docker 容器**内（`./docker_ros2.sh`） | 旧结论是「从 Jupyter 库 API 清单外推」过头了。§9.3 第 3 行已改；`vendor_topic` 从「死路」升级为**官方一等链路**，但必须先确认容器与宿主 `ROS_DOMAIN_ID` / 网络互通 |
 | 7 | 云台「软件主动锁角，本轮未接」 | `/servo`（`yahboomcar_msgs/ServoControl`，`servo_s1` 0..180 / `servo_s2` 0..110）+ `Ctrl_Servo(1/2, angle)` | 已落地 `gimbal_backend` 三种模式，默认 `none` |
-| 9 | 「官方两处教程编号矛盾 0-3 / 1-4」 | 电机控制 PDF 与扩展板丝印一致：`motor_id=[1,4]`（1:M1 … 4:M4），`Ctrl_Car` 同样 `[1,4]` | 编号体系**已确证 1-4**；0-3 是旧网页示例，不是这套 API。**仍缺的是「M1..M4 → 轮子位置」**，故 `motor_id_map` 空串强制 `self_test` 的守卫不变 |
+| 9 | 「官方两处教程编号矛盾 0-3 / 1-4」 | 电机控制 PDF 与扩展板丝印一致：`motor_id=[1,4]`（1:M1 … 4:M4），`Ctrl_Car` 同样 `[1,4]` | ~~编号体系已确证 1-4；轮位仍缺~~ **⚠️ 此行结论已被 §11.2 / §11.3 推翻**：拿到协议表 xlsx 与 `Raspbot_Lib.py` 源码后确认底层是 0-3，1-4 是丝印；轮位已闭环推出候选 `0,2,1,3`。**只有「`motor_id_map` 空串强制 `self_test`」这条守卫不变** |
 
 **没有推翻的**：官方 ROS2 底盘节点**不发布** `/odom`、不发布电量、不发布 `/scan`
 （只发 `/ultrasonic`、`/line_sensor`），所以 §9.3 第 5、8、12 条（开环 odom /
@@ -576,12 +576,15 @@ ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1, ...}}"
 
 ### 10.4 电机编号、轮序与麦轮符号表
 
-- **编号**：`Ctrl_Muto(motor_id, motor_speed)`，`motor_id=[1,4]`，1:M1 / 2:M2 /
-  3:M3 / 4:M4；`motor_speed=-255..255`（正=正转）；`Ctrl_Car` 用 dir 0/1 +
-  0..255。扩展板丝印 M2/M1（上排）、M4/M3（下排）见 PDF 第 1 页图。
-- **仍缺**：所有官方资料**都没给「M1..M4 → 左前/右前/左后/右后」的接线对应**。
-  URDF 教程只给 joint 名：`l1=左前`、`l2=左后`、`r1=右前`、`r2=右后`。
-  → `motor_id_map` 保持空串 = 强制 `self_test`；上机把车架起来四轮单动实测。
+- **编号（⚠️ 本节这两条已被 §11.2 / §11.3 更正，保留作历史）**：PDF 写
+  `Ctrl_Muto(motor_id, motor_speed)`，`motor_id=[1,4]`，1:M1 / 2:M2 / 3:M3 /
+  4:M4；`motor_speed=-255..255`（正=正转）；`Ctrl_Car` 用 dir 0/1 + 0..255。
+  实际上这是**丝印编号**；固件寄存器吃的是 0-3（协议表 + 驱动库源码）。
+- **轮位（⚠️ 当时判为「仍缺」，现已闭环推导）**：URDF 教程给 joint 名
+  `l1=左前`、`l2=左后`、`r1=右前`、`r2=右后`，接口分布图给
+  M1/M2/M3/M4=左上/左下/右上/右下，配合 §10.4 下方的麦轮符号表可推出
+  候选 `0,2,1,3`。→ `motor_id_map` **仍保持空串** = 强制 `self_test`，
+  上机把车架起来四轮单动实测确认后才启用。
 - **麦轮布局**：`ABBA` 型、俯视滚子呈 **X 型**；教程注明「TT 电机不能做 PID
   调速」，再次印证无编码器闭环。
 - **官方 10 种运动 + 停止共 11 行符号表**（列序 `L1 L2 R1 R2`）与
@@ -601,7 +604,7 @@ ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1, ...}}"
 
 | 项 | 一手事实 | 落地 |
 |---|---|---|
-| 板载按键 | `read_data_array(0x0d,1)` → 0 未按 / 1 按下，KEY1 为板载 | `button_backend: i2c` 可 2Hz 轮询；读失败返回 `None`「不知道」，**绝不**当成松开去动急停闭锁；默认仍 `topic` |
+| 板载按键 | `read_data_array(0x0d,1)` → 0 未按 / 1 按下，KEY1 为板载 | `button_backend: i2c` 2Hz 轮询；读失败返回 `None`「不知道」，**绝不**当成松开去动急停闭锁；~~默认仍 `topic`~~ **§11.5 已改为默认 `i2c`**（`topic` 下出厂无人发 `/raspbot/button`，硬件按钮是死的） |
 | 云台 | `/servo` 或 `Ctrl_Servo(1/2, angle)`；官方示例 90/25 | `gimbal_backend: none/i2c/servo_topic`，周期重发防 `driver_node` 晚起；默认 `none`（90/25 是示例，不是标定位） |
 | 语音 | `mySpeech.speech_read()` 返回**语义编号 num**（非文本），`void_write(num)` 播放回应，固定词条表、`speed 0..255` | 仍**未**桥接到 `/voice/command`：缺「编号 → 词条」协议表，不猜 |
 | **开机自启「大程序」** | 出厂镜像开机自启 `raspbot.pyc`（端口 6001），官方原文「will occupy the device and cause unpredictable errors」，开发前必须关闭 | 见 §10.7 第 0 步；这一步没做，I2C / 串口被占，我们的节点根本连不上 |
@@ -612,7 +615,7 @@ ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1, ...}}"
 | 文件 | 改动 |
 |---|---|
 | `lightdog/lightdog_raspbot_driver.py` | 新增纯函数 `vendor_twist_to_normalized`（官方归一化量纲 + 钳位 / NaN 安全）、`servo_lock_angles`（s1/s2 限位拒绝）、`read_key1`（0x0d，失败返回 None）；`vendor_topic` 下发走归一化；新增 `gimbal_backend` / `servo_topic` / `servo_s1/s2` / `gimbal_period`、`button_backend` / `button_poll_hz` / `key1_address`；`_service_gimbal_and_button()` 低频维护（不抢 10Hz 控制拍的 I2C）；diag 增后端与 gain；更正文件头、编号说明、无订阅者告警 |
-| `lightdog/config/raspbot_params.yaml` | 补上述参数并逐条注明官方 PDF 来源；`motor_id_map` 注释更正为「编号 1-4 确证、轮位仍缺」 |
+| `lightdog/config/raspbot_params.yaml` | 补上述参数并逐条注明官方 PDF 来源；`motor_id_map` 注释当时写「编号 1-4 确证、轮位仍缺」——**该结论已由 §十一 更正**（底层是 0-3，轮位已闭环推导） |
 | `lightdog/tests/test_raspbot.py` | 新增 `TestOfficialROS2Chassis` **10 项**：官方 11 行符号表、归一化值域 / NaN、云台限位、KEY1 读取、官方 API/话题静态钉住、真机配置，外加 **3 项方法级行为判据**（`_drv_send` 归一化下发、按键轮询忽略「读失败」、云台周期重发）；更正旧断言「不是 ROS 底盘节点」 |
 | 本文档 | §9.3 第 3/7/9 行、§9.4、§9.5、§9.6 更正，新增本章 |
 | `deploy/README.md` | 上机前置：先关开机自启大程序；`/cmd_vel` 话题名已由官方确证 |
@@ -622,8 +625,8 @@ ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1, ...}}"
 ```bash
 # 0) 关掉出厂开机自启「大程序」（不关会占 I2C / 串口 / 6001 端口）
 sh /home/pi/project_demo/raspbot/killprocess.sh
-# 永久关闭（下次开机也不起）：
-rm -rf /home/pi/project_demo/raspbot/start_raspbot.desktop
+# 永久关闭（下次开机也不起）—— 官方《00.开发前的准备》给的是 autostart 路径：
+sudo rm -rf /home/pi/.config/autostart/start_raspbot.desktop
 
 # 1) I2C 与官方库
 sudo i2cdetect -y 1
@@ -637,26 +640,30 @@ ros2 topic info /cmd_vel
 #    容器与宿主 ROS_DOMAIN_ID / 网络不通时，vendor_topic 会 diag 告警且车不动
 
 # 3) 四轮单动实测编号（车架起来、轮子离地）
+# ⚠️ 本行已按 §十一 更正：底层寄存器吃 0-3（协议表 L1/L2/R1/R2），
+#    上一版照抄教程 PDF 的 1-4（那是扩展板丝印）是错的。
 python3 - <<'PY'
 from Raspbot_Lib import Raspbot
 import time
 bot = Raspbot()
-for mid in (1, 2, 3, 4):        # 官方确证 1-4
+for mid in (0, 1, 2, 3):        # 官方协议表 + Raspbot_Lib 源码：0-3
     print('motor', mid)
     bot.Ctrl_Muto(mid, 80); time.sleep(1.0); bot.Ctrl_Muto(mid, 0)
 PY
 ```
 
 把第 3 步结果按 `FL,FR,RL,RR` 写进 `config/raspbot_params.yaml` 的
-`motor_id_map`。填错 = 车横着走；**空串 = 故意不动**。
+`motor_id_map`。四份官方资料闭环推出的**候选值是 `0,2,1,3`**（§十一），
+但只有亲眼看到四个轮子按预期转，才算验证通过。填错 = 车横着走；
+**空串 = 故意不动**。
 
 ### 10.8 仍未确认（别当成已修）
 
-- **M1..M4 → 轮子位置**（上机唯一阻塞项，仍是 `motor_id_map` 空串）。
-- 官方 ROS2 底盘节点是否在**你这张出厂 TF 卡**的镜像里（该课程 2026-06-24 才进仓库）；容器 ↔ 宿主 DDS 互通方式。
+- **M1..M4 → 轮子位置**：§十一 已由四份官方资料闭环推出候选 `0,2,1,3`；仍缺**上机四轮单动验证**，所以 `motor_id_map` 保持空串（刻意不动）。
+- 官方 ROS2 底盘节点是否在**你这张出厂 TF 卡**的镜像里（该课程 2026-06-24 才进仓库）；容器 ↔ 宿主 DDS 互通方式（§十一 补到了官方 `docker_ros2.sh` 的确切参数）。
 - `/cmd_vel` 归一化量 → 实际 m/s 的 gain（默认 1.0 只是数值恒等，未标定）。
-- 相机话题名 / 内参 / 云台标定角 / `camera_offset` / `base_link_height`；URDF 全文在 Docker 内未取到，轮距轮径仍用尺寸图估算值。
-- AprilTag 家族 / 目标 id / 黑框边长；语音「编号 → 词条」协议表。
+- 相机话题名（§十一 给出官方候选 `/image_raw`）/ **内参（官方明确没提供，必须自己标定）** / 云台标定角 / `camera_offset` / `base_link_height`；轮距轮径仍用尺寸图估算值。
+- AprilTag 家族**已确认为 TAG36H11**（§十一）；仍缺目标 id / 实际打印边长（官方源码 `tag_size=0.025`）与语音「编号 → 词条」协议表。
 - 无 LiDAR 的 Nav2 全局导航、Humble 下 aruco / launch 兼容性、两个 `CHANGE_ME_BEFORE_DEPLOY`、ONNX 模型导出。
 
 ### 10.9 验证证据
@@ -667,3 +674,137 @@ PY
 | `python -m pyflakes lightdog deploy sim` / `bash -n` × 4 / `nodes.conf` 9 列 | RC=0 / `SHELL_OK` / `COLS_OK` |
 | 固件 C 自检（本轮未改 C） | `-Werror -Wpedantic` 零警告，协议向量 **94 项**、应用层 **268 项**全过 |
 | 回退验证 | **10/10 CAUGHT**（麦轮符号表、归一化下发、非法 gain/NaN、云台限位、KEY1 映射、读失败不解锁、周期重发、非法角度不下发、配置默认值、官方 bringup 链路），全部 `restored=True`，恢复后 `TestOfficialROS2Chassis` rc=0 |
+
+---
+
+## 十一、用提取码解锁官方课程后的核对（2026-11-12 补）
+
+> **结论先行**：上一章把「电机编号 1-4 确证、轮位未知」当成定论，是**错的**。
+> 底层 I2C 寄存器吃的是 **0-3**（= L1/L2/R1/R2），教程 PDF 的 1-4 只是
+> 扩展板丝印 M1..M4；轮位映射已由四份官方资料闭环推出候选 **`0,2,1,3`**。
+> 另外发现官方驱动库吞掉 I2C 异常、舵机/RGB 限位形同虚设，以及
+> **`button_backend: topic` 会让板载 KEY1 硬件急停按钮完全失效** —— 三处
+> 都已在本轮修掉。仍然没有上机，所以 `motor_id_map` 继续留空、节点继续
+> 强制 `self_test`，一个字节都不发。
+
+### 11.1 这次真正取到了什么（来源分级）
+
+页面 `https://www.yahboom.com/study/RASPBOT-V2` 是 Vue SSR 外壳，课程目录和
+正文都不在 HTML 里。前端 chunk 里定位到接口后，用用户提供的提取码 **AKGP** 解锁：
+
+| 步骤 | 结果 |
+|---|---|
+| `GET https://api.yahboom.com/api/check-password?cname=RASPBOT-V2&pwd=AKGP` | `{"code":200,"msg":"success","data":{"productId":663,"token":"..."}}` |
+| 同样的请求把 pwd 换成 `ZZZZ`（对照） | `{"code":401,"msg":"密码错误","data":null}` —— 证明不是无条件放行，提取码真的有效 |
+| `GET /api/build?id=<id>&cid=663&token=<token>` | 解锁 **23 篇**课程正文（网页上原本只有锁图标），转成纯文本逐条比对 |
+| `GET /data/product-content/RASPBOT-V2.json` | 73 KB 完整目录：19 个模块 / 全部课程 id / 下载专区链接 |
+| `GET https://admin.yahboom.com/public/download/Raspbot_V2/树莓派5麦轮小车协议.xlsx` | **13,683 B 官方 I2C 协议表**（下载专区的相对路径要拼 `admin.yahboom.com`，前端 JS 里写明） |
+| `GET .../public/download/Raspbot_V2/py_install.zip` | **39,957 B 官方驱动库**，内含 `Raspbot_Lib/Raspbot_Lib.py`（15,372 B）与 v0.0.2 的 setup.py |
+
+本轮结论**优先采信 xlsx 协议表与驱动库源码**（可执行的一手资料），教程 PDF
+作为佐证；三者冲突时以源码/协议表为准。
+
+### 11.2 更正：底层电机编号是 0-3，不是 1-4
+
+| 来源 | 原文 | 判定 |
+|---|---|---|
+| 《树莓派5麦轮小车协议.xlsx》 | 「电机速度的范围 0-255，方向 0:前进 1:后退；**电机序号 0、1、2、3 L1\\L2\\R1\\R2**」；示例「控制 L1 前进 200：`buf[0]=0x00 buf[1]=0x00 buf[2]=0xC8`」 | **底层寄存器权威** |
+| `Raspbot_Lib.py` 源码 | `PI5Car_I2CADDR = 0x2B`；`Ctrl_Muto` 把 `motor_id` **原样**放进 `data=[motor_id, dir, abs(speed)]` 写 `0x01`；源码注释 `Ctrl_Car(0,..)=L1` … `Ctrl_Car(3,..)=R2` | 与协议表一致 |
+| 教程 PDF《05.电机控制》 | `motor_id=[1,4]`（1:M1 … 4:M4） | **指的是扩展板丝印**，不是寄存器取值；照抄会漏掉 0 号电机、把 4 发给不存在的电机 |
+| 《03.扩展板接口分布》 | ①M1=左上角 / ②M2=左下角 / ④M3=右上角 / ⑤M4=右下角 | 丝印 ↔ 物理位置 |
+
+其余寄存器一并确认：`0x01` 电机、`0x02` 舵机、`0x03/0x04` RGB 固定色、
+`0x08/0x09` RGB 亮度、`0x05` 红外探头开关、`0x06` 蜂鸣器、`0x07` 超声波开关、
+`0x0A` 四路巡线、`0x0C` 红外码值、`0x0D` KEY1（0 未按 / 1 按下）、
+`0x1A/0x1B` 超声波低/高位（单位 mm）。**全表没有任何编码器、里程计、
+IMU、电压读取寄存器** —— §三 C3「`/odom` 只能开环」的结论不变。
+
+### 11.3 轮序闭环推导 → 候选 `motor_id_map: '0,2,1,3'`
+
+四份官方资料互相印证，且与 `mecanum_wheel_speeds()` 的逆解逐行吻合：
+
+1. 协议表 / 驱动库源码：`0/1/2/3 = L1/L2/R1/R2`。
+2. 官方 URDF 教程：「`l1_Joint`：控制左前轮、`l2_Joint`：左后轮、
+   `r1_Joint`：右前轮、`r2_Joint`：右后轮」。
+3. 《麦克纳姆轮运动原理》：「小车实际麦轮分布是 **ABBA 型**，俯视图呈 X 型」，
+   给出 11 行 `L1 L2 R1 R2` 符号表（前进 `++++`、左平移 `-++-`、
+   逆时针自转 `--++` …）。
+4. 扩展板接口图：M1/M2/M3/M4 = 左上/左下/右上/右下。
+
+按 `WHEEL_NAMES=(FL,FR,RL,RR)` 推出：**FL=0(L1)、FR=2(R1)、RL=1(L2)、
+RR=3(R2)** → `0,2,1,3`。新增回归
+`test_official_motor_id_map_reorders_inverse_to_symbol_table` 会用这个映射把
+逆解结果摆回 L1..R2 顺序，逐行对 11 行官方符号表；映射写错立刻对不上。
+
+> ⚠️ **这是资料推导，不是实测。** 上机把车架起来、轮子离地，按 `0,1,2,3`
+> 逐个单动确认后，才把它写进 `config/raspbot_params.yaml`。默认仍保持
+> 空串强制 `self_test`。
+
+### 11.4 官方驱动库源码里两个必须知道的坑
+
+| 坑 | 源码实证 | 我们的应对 |
+|---|---|---|
+| **吞 I2C 异常** | `write_array` / `read_data_array` / 各 `Ctrl_*` 都是裸 `except: print('... I2C error')`，不抛异常 | `_send_i2c` 的 `try/except` **抓不到总线掉线**，`frames_sent` 会一直涨而车不动。新增：① 启动时用 KEY1 寄存器做一次读探针（官方库异常时返回 `None`），失败即降级 `self_test`；② `button_backend=i2c` 的周期读当运行时链路心跳，连续 3 次失败补发零速并降级；③ diag 增 `i2c_link_ok` / `i2c_read_failures` / `frames_sent_means`，把「调用过 ≠ 硬件收到」写进遥测 |
+| **限位形同虚设** | `Ctrl_Servo` 与 `Ctrl_WQ2812_brightness_ALL` 都是**先构造 `data=[id, angle]` / `[R,G,B]`，之后才 clamp**，写出去仍是未钳位原值 | 本节点自己的 `servo_lock_angles()`（s1 [0,180] / s2 [0,110]）和 `_send_led()` 的 clamp 一行都不能删。官方出厂 AprilTag 追踪源码也在下发前自行 clamp 到 180/110，默认位 `s1=90 / s2=25` |
+
+### 11.5 板载 KEY1 急停按钮之前是「死的」
+
+官方《01、机器人信息发布》列出 `/driver_node` 的订阅/发布：订阅 `/buzzer`、
+`/cmd_vel`、`/rgblight`、`/servo`；**只发布 `/ultrasonic` 和 `/line_sensor`**。
+出厂镜像里**没有任何节点会发布 `/raspbot/button`**。而上一版配置是
+`button_backend: topic` —— 等于把实体急停按钮废掉。
+
+本轮把默认改为 `button_backend: i2c`（直接轮询 `0x0d`），并且**让按钮的
+Raspbot_Lib 句柄独立于底盘后端加载**：即使 `motor_id_map` 空串导致底盘
+降级 `self_test`，急停按钮仍然活着。安全功能不该被底盘配置拖累。
+
+### 11.6 官方相机 / AprilTag / Docker 的确切参数
+
+| 项 | 官方值 | 出处 | 是否已填进配置 |
+|---|---|---|---|
+| 相机类型 | USB 单目，`cv2.VideoCapture(0)` / `/dev/video0`，示例 640×480 | 《01.摄像头驱动教程》《09.使用USB摄像头》 | 普通相机路线不变；MIPI 才需要 `/boot/firmware/config.txt` 的 `dtoverlay` |
+| 图像话题 | **`/image_raw`**（`sensor_msgs/Image`） | 《10、AprilTag标签码追踪》源码 `create_subscription(Image, '/image_raw', ...)` | 仅写进 5 份 `real_*.yaml` 头部注释作为**候选**，仍要上机 `ros2 topic list` 实测；没直接改参数值 |
+| 相机内参 | **官方没有提供**：`Detector.detect(..., 0.025)` 只传了 `tag_size`，`estimate_tag_pose=False` 且 `camera_params=None` | 同上 + 《09、AprilTag标签码识别》源码 | **不能编造**。`camera_info` 必须自己标定后发布，填假内参会让 P2 单目测距 / P3 solvePnP 静默算错 |
+| AprilTag 字典 | **TAG36H11**（「出厂已配套相关标签码，并贴在积木块上」），`families='tag36h11'` | 《09、AprilTag标签码识别》《10、…追踪》 | `AUTO_DICTS` 把 `DICT_APRILTAG_36H11` 提到首位，其余 4 族保留兜底 |
+| 标签边长 | 源码 `tag_size=0.025`（2.5 cm） | 同上 | 只写进 P3 注释作为候选；`marker_length` 仍是仿真换算值 `0.084` + TODO 实测（dock 上贴的是不是官方积木标签、打印有没有缩放，都得卡尺量） |
+| 云台 | `/servo` = `yahboomcar_msgs/msg/ServoControl`，字段 `servo_s1`/`servo_s2`；s1 [0,180]、s2 [0,110]；默认 90/25 | 《01、机器人信息发布》3.4 节、《10、…追踪》源码 | 已有，未改 |
+| ROS 版本 / 容器 | **ROS 2 Humble / Ubuntu 22.04**；镜像 `yahboomtechnology/ros-humble:0.0.6`；`docker_ros2.sh` 用 `--net=host`，映射 `/dev/i2c-1`、`/dev/i2c-0`、`/dev/video0`、`/dev/video1`、`/dev/gpiomem` | 《2、ROS2安装Humble》《05、进入小车的docker容器》 | 文档补录；容器内 AprilTag 源码 `from Raspbot_Lib import Raspbot` 也证明**容器里装了官方驱动库**，`vendor_i2c` / `vendor_topic` 两条路在容器内都可用 |
+| 开机自启「大程序」 | 临时关 `sh /home/pi/project_demo/raspbot/killprocess.sh`；永久关 `sudo rm -rf /home/pi/.config/autostart/start_raspbot.desktop`；手动起 `python3 /home/pi/project_demo/raspbot/raspbot.pyc` | 《00.开发前的准备》 | §10.7 已写，**永久关闭命令本轮修正为带 `.config/autostart` 的官方路径** |
+| 出厂网络 | 热点 `Raspbot` / `12345678`，热点 IP `192.168.1.11`，APP 端口 6000 / 视频 6001 | 《02.入手试玩教程》 | 文档补录，上机连车用 |
+| 语音 | 唤醒词「你好，小亚」/「Hi,Yahboom」；固定词条「小车停止/前进/后退/左转/右转/左旋/右旋」 | 《1.语音控制小车运动》 | **「编号 → 词条」协议表在教程截图里，正文没有**，仍是未知，不猜 |
+
+另外《06.注意事项（学前先看）》有一条物理风险：TT 电机白色输出轴是塑料件，
+拿取要托底盘、不能提车轮 —— 写在这里提醒上机四轮单动时别掰断。
+
+### 11.7 本轮代码 / 配置 / 测试改动
+
+| 文件 | 改动 |
+|---|---|
+| `lightdog/lightdog_raspbot_driver.py` | ① 更正文件头、`parse_motor_id_map` 注释和降级日志里「1-4 确证、轮位未给」的错误陈述；② 新增 `OFFICIAL_MOTOR_ID_MAP=(0,2,1,3)` 常量并注明是推导值非实测值；③ `vendor_i2c` 启动加 KEY1 读探针，失败即降级；④ `button_backend` 默认 `i2c`，`button_bot` 独立加载 Raspbot_Lib；⑤ 周期读失败计数 → `_degrade_i2c_link()` 补零速并降级；⑥ diag 增 `official_motor_id_map` / `i2c_link_ok` / `i2c_read_failures` / `frames_sent_means`；⑦ 补官方库两个坑的注释 |
+| `lightdog/config/raspbot_params.yaml` | `button_backend: topic → i2c`、新增 `i2c_max_read_failures: 3`；`motor_id_map` 注释改成四来源证据 + 候选 `0,2,1,3` + 别用 `1,2,3,4`；云台注释补「官方库限位失效」 |
+| `lightdog/lightdog_aruco_dock.py` | `AUTO_DICTS` 把官方 TAG36H11 提到首位；文件头/函数注释写明官方字典、`tag_size=0.025`、以及**出厂资料不含相机内参** |
+| `lightdog/config/real_p{2,3,4,5}_params.yaml`、`real_system_params.yaml` | 头部统一补官方相机事实（USB `/dev/video0`、640×480、`/image_raw` 候选、TAG36H11、无内参）；P3 的 `image_topic` / `marker_length` / `dictionary` 注释落到具体官方值，参数值仍留 TODO |
+| `lightdog/tests/test_raspbot.py` | 新增 7 项：官方映射常量、映射 × 11 行符号表端到端、36H11 优先、按钮 I2C 独立加载不变量、官方库吞异常探针不变量、连续读失败降级不变量、连续读失败行为判据；同步更新桩字段与 `button_backend` / `i2c_max_read_failures` 断言 |
+| 本文档 | §10.6 / §10.7 / §10.8 更正，新增本章 |
+
+### 11.8 仍未确认（别当成已修）
+
+- **四轮单动实测**：候选 `0,2,1,3` 未经真机验证，`motor_id_map` 仍是空串，
+  节点仍强制 `self_test`。这是唯一会让车「朝错方向冲出去」的项。
+- 相机驱动在你这张 TF 卡上实际发布的话题名；`camera_info` 内参标定；
+  云台锁定角、`camera_offset`、`base_link_height`、轮子几何精值。
+- dock 上 AprilTag 的目标 id 与实际打印边长（官方源码 0.025 仅供参考）。
+- `/cmd_vel` 归一化量 → m/s 的 gain；容器 ↔ 宿主 DDS 互通实测。
+- 语音「编号 → 词条」协议表（在教程图片里，正文没给）、ONNX 模型导出、
+  两个 `CHANGE_ME_BEFORE_DEPLOY`、Humble 下 `cv2.aruco` / launch 参数类型兼容性。
+
+### 11.9 验证证据
+
+| 检查 | 结果 |
+|---|---|
+| `PATH=/c/MinGW/bin:$PATH python lightdog/tests/run.py` | **437 项：通过 431 / 失败 0 / 跳过 6**（比 §10.9 的 430 项 +7；6 个 skip 全是 Windows 无 `/proc` 的 `TestLiveSampling`） |
+| `python lightdog/tests/test_raspbot.py -v` | 52 项全过 |
+| `python -m py_compile` × 3 / `python -m pyflakes lightdog deploy sim` | `PY_COMPILE_OK` / RC=0 |
+| 13 份 `config/*.yaml` 解析 / `bash -n` 全部 shell / `nodes.conf` 16 行 9 列 | `YAML_OK 13` / `BASH_N_OK` / `COLS_OK` |
+| 官方资料本身 | `AKGP` → `code:200`，错误码对照 `ZZZZ` → `code:401`；xlsx 13,683 B、zip 39,957 B 均为有效二进制（PK 头），23 篇正文 `code:200` |
+| 回退验证（本轮新增 4 条，防「静态断言假绿」） | **4/4 CAUGHT**：① 把 36H11 从 `AUTO_DICTS` 首位挪走、② `button_backend` 退回 `topic`、③ 删掉启动 I2C 探针、④ 连续失败判据 `>=` 改成 `>`，每次 `test_raspbot` 都 rc=1；全部 `RESTORED=True`，恢复后 rc=0 且全套 437 项通过 |

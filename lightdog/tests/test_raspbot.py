@@ -181,7 +181,7 @@ class TestOpenloopOdomAndSafety(unittest.TestCase):
 
 
 class TestOfficialI2CBackend(unittest.TestCase):
-    """官方 Raspbot_Lib 是 I2C + 开环 PWM；编号/轮序没给，不许猜。"""
+    """官方 Raspbot_Lib 是 I2C + 开环 PWM；底层编号 0-3，轮序可推导但仍须实测。"""
 
     def test_motor_id_map_requires_four_distinct_integers(self):
         f = RB_FUNCS['parse_motor_id_map']
@@ -224,6 +224,20 @@ class TestOfficialI2CBackend(unittest.TestCase):
         self.assertIn("'vendor_i2c'", src)
         self.assertIn("parse_motor_id_map(p('motor_id_map').value)", src)
 
+    def test_official_motor_id_map_is_pinned_and_still_disabled_by_default(self):
+        # 协议表 0/1/2/3=L1/L2/R1/R2 + URDF 教程 l1/l2/r1/r2=左前/左后/右前/右后
+        # + 扩展板接口图 M1..M4=左上/左下/右上/右下 + 麦轮符号表 -> '0,2,1,3'。
+        self.assertEqual(tuple(extract_const(RB, 'OFFICIAL_MOTOR_ID_MAP')),
+                         (0, 2, 1, 3))
+        p = _load('raspbot_params.yaml')['/lightdog_raspbot_driver']['ros__parameters']
+        self.assertEqual(p['motor_id_map'], '',
+                         '推导值可以写进注释，但没上机四轮单动验证前不许启用')
+        with open(RB, encoding='utf-8') as fh:
+            src = fh.read()
+        self.assertIn('教程 PDF', src)
+        self.assertIn('固件真正吃的是 0-3', src,
+                      '官方教程 PDF 的 1-4 是丝印，源码里必须写明这个矛盾')
+
 
 class TestAprilTagDictionaries(unittest.TestCase):
 
@@ -233,6 +247,15 @@ class TestAprilTagDictionaries(unittest.TestCase):
                   'DICT_APRILTAG_36H10', 'DICT_APRILTAG_36H11'):
             self.assertIn(n, names)
         self.assertIn('DICT_4X4_50', names)
+
+    def test_official_tag36h11_is_tried_first(self):
+        # 官方《09、AprilTag标签码识别》：出厂配套标签是 TAG36H11，源码
+        # Detector(families='tag36h11')。放首位能省掉前四次全图 detect，
+        # 其余字典仍保留兜底（用户可能自己打印别的族）。
+        names = ARUCO_FUNCS['resolve_dictionary_names']('auto')
+        self.assertEqual(names[0], 'DICT_APRILTAG_36H11')
+        self.assertEqual(len(names), 5)
+        self.assertEqual(len(set(names)), 5)
 
     def test_explicit_list_and_empty_fallback(self):
         f = ARUCO_FUNCS['resolve_dictionary_names']
@@ -354,6 +377,7 @@ class TestRealConfigIsActuallySwitched(unittest.TestCase):
         self.assertEqual(p['odom_source'], 'openloop')
         self.assertEqual(p['battery_source'], 'none')
         self.assertIs(p['button_latching'], True)
+        self.assertEqual(p['button_backend'], 'i2c')
         self.assertGreater(p['cmd_hold'], 0.0)
 
     def test_nodes_conf_runs_real_driver_not_stm32_bridge(self):
@@ -400,6 +424,26 @@ class TestSafetyInvariants(unittest.TestCase):
     def test_i2c_failure_reasserts_zero_speed(self):
         self.assertIn('I2C 电机下发失败，立刻补发全零', self.src)
         self.assertIn('self.bot.Ctrl_Muto(mid, 0)', self.src)
+
+    def test_official_lib_swallows_i2c_errors_so_probe_is_mandatory(self):
+        # 官方 Raspbot_Lib 的 write_array 是裸 except + print，_send_i2c 的
+        # try/except 抓不到总线掉线，frames_sent 会一直涨而车根本没动。
+        self.assertIn('probe = read_key1(self.bot, self.key1_address)', self.src)
+        self.assertIn('KEY1 读探针返回 None', self.src)
+        self.assertIn('frames_sent_means', self.src)
+        self.assertIn('吞掉 I2C 异常', self.src)
+
+    def test_button_i2c_survives_chassis_backend_degradation(self):
+        self.assertIn('self.button_bot = self.bot', self.src)
+        self.assertIn('底盘后端降级不影响急停按钮', self.src)
+        self.assertIn('出厂镜像无人发布它', self.src)
+
+    def test_consecutive_i2c_read_failures_degrade_and_zero(self):
+        self.assertIn('self.i2c_read_failures >= self.i2c_max_read_failures',
+                      self.src)
+        self.assertIn("self.block_reason = 'I2C 链路连续读失败'", self.src)
+        self.assertIn('官方库的限位等于没生效', self.src,
+                      '官方 Ctrl_Servo 先构造 data 再 clamp，我们侧的限位不能删')
 
     def test_unconfirmed_serial_protocol_forces_self_test(self):
         self.assertIn("if self.backend == 'direct_serial' and not self.protocol_confirmed:",
@@ -453,11 +497,29 @@ class TestOfficialROS2Chassis(unittest.TestCase):
             self.assertEqual(got, expect,
                              f'官方运动「{label}」符号不符：得到 {got}，应为 {expect}')
 
+    def test_official_motor_id_map_reorders_inverse_to_symbol_table(self):
+        """端到端：按 '0,2,1,3' 把逆解摆回 L1,L2,R1,R2，逐行对官方符号表。
+
+        这是「轮序推导」能不能真的拿去填 motor_id_map 的判据，而不只是注释
+        里写一句。若映射改成 0,1,2,3，左平移/自转这几行会立刻对不上。
+        """
+        m = tuple(extract_const(RB, 'OFFICIAL_MOTOR_ID_MAP'))
+        self.assertEqual(m, (0, 2, 1, 3))
+        f = RB_FUNCS['mecanum_wheel_speeds']
+        for label, (vx, vy, wz), expect in self.OFFICIAL_TABLE:
+            speeds = f(vx, vy, wz, 0.0586, 0.0829)   # FL,FR,RL,RR
+            by_id = {mid: s for mid, s in zip(m, speeds)}
+            got = ''.join(self._sign(by_id[i]) for i in range(4))
+            self.assertEqual(got, expect,
+                             f'按官方电机号 0..3 排回 L1..R2 后「{label}」不符：'
+                             f'得到 {got}，应为 {expect}')
+
     def test_official_wheel_order_is_documented_not_guessed(self):
         src = self._driver_src()
         self.assertIn('WHEEL_NAMES', src)
         self.assertIn('l1/l2/r1/r2', src,
                       '官方 URDF 教程的 joint -> 轮位映射必须写进源码注释')
+        self.assertIn('M1/M2/M3/M4=左上/左下/右上/右下', src)
 
     def _driver_src(self):
         with open(RB, encoding='utf-8') as f:
@@ -530,8 +592,11 @@ class TestOfficialROS2Chassis(unittest.TestCase):
                          '示例角度不是标定位，默认不能擅自下发云台指令')
         self.assertEqual(p['servo_topic'], '/servo')
         self.assertEqual(p['key1_address'], 13)   # 官方 0x0d
-        self.assertEqual(p['button_backend'], 'topic')
+        self.assertEqual(p['button_backend'], 'i2c',
+                         '官方 /driver_node 只发布 /ultrasonic 与 /line_sensor，'
+                         '没人发 /raspbot/button；用 topic 会把实体急停按钮废掉')
         self.assertGreater(p['button_poll_hz'], 0.0)
+        self.assertGreaterEqual(p['i2c_max_read_failures'], 1)
 
     # ---- 行为判据：只测纯函数时，把「下发路径」改回旧逻辑不会被发现 ----
 
@@ -575,12 +640,17 @@ class TestOfficialROS2Chassis(unittest.TestCase):
                     raise self.value
                 return self.value
 
+        degraded = []
+
         def make(value, pressed=False):
             obj = types.SimpleNamespace(
                 gimbal_backend='none', last_gimbal=0.0, gimbal_period=1.0,
-                button_backend='i2c', bot=Bot(value), last_button_poll=0.0,
-                button_poll_hz=2.0, key1_address=13, button_pressed=pressed,
-                get_logger=lambda: Log(),
+                button_backend='i2c', bot=Bot(value), button_bot=None,
+                last_button_poll=0.0, button_poll_hz=2.0, key1_address=13,
+                button_pressed=pressed, get_logger=lambda: Log(),
+                i2c_read_failures=0, i2c_link_ok=None,
+                i2c_max_read_failures=99,
+                _degrade_i2c_link=lambda: degraded.append(1),
                 _on_button=lambda m: calls.append(bool(m.data)))
             bind(obj, methods)
             return obj
@@ -596,6 +666,40 @@ class TestOfficialROS2Chassis(unittest.TestCase):
             make(bad)._service_gimbal_and_button(10.0)
         self.assertEqual(calls, [],
                          '读失败 = 不知道，绝不能当成松开去动急停闭锁')
+        self.assertEqual(degraded, [],
+                         '单次读失败不能立刻降级，必须连续 N 次')
+
+    def test_consecutive_i2c_read_failures_trigger_degrade(self):
+        """官方库吞写异常，KEY1 周期读是唯一的运行时链路心跳。"""
+        methods = self._driver_methods(['_service_gimbal_and_button'])
+        degraded = []
+
+        class Broken:
+            def read_data_array(self, addr, n):
+                return None
+
+        obj = types.SimpleNamespace(
+            gimbal_backend='none', last_gimbal=0.0, gimbal_period=1.0,
+            button_backend='i2c', bot=Broken(), button_bot=None,
+            last_button_poll=0.0, button_poll_hz=100.0, key1_address=13,
+            button_pressed=False, get_logger=lambda: Log(),
+            i2c_read_failures=0, i2c_link_ok=True, i2c_max_read_failures=3,
+            _degrade_i2c_link=lambda: degraded.append(1),
+            _on_button=lambda m: None)
+        bind(obj, methods)
+        for i in range(3):
+            obj._service_gimbal_and_button(10.0 + i)
+            self.assertIs(obj.i2c_link_ok, False)
+        self.assertEqual(obj.i2c_read_failures, 3)
+        self.assertEqual(degraded, [1], '连续 3 次读失败必须触发降级')
+
+        # 链路恢复后计数清零、链路状态回 True，且不再重复降级
+        obj.bot = types.SimpleNamespace(read_data_array=lambda a, n: [0])
+        obj._degrade_i2c_link = lambda: degraded.append(2)
+        obj._service_gimbal_and_button(20.0)
+        self.assertEqual(obj.i2c_read_failures, 0)
+        self.assertIs(obj.i2c_link_ok, True)
+        self.assertEqual(degraded, [1])
 
     def test_gimbal_lock_publishes_periodically_and_respects_limits(self):
         methods = self._driver_methods(['_service_gimbal_and_button',
@@ -615,8 +719,10 @@ class TestOfficialROS2Chassis(unittest.TestCase):
         pub, bot = Pub(), Bot()
         obj = types.SimpleNamespace(
             gimbal_backend='servo_topic', last_gimbal=0.0, gimbal_period=1.0,
-            button_backend='topic', bot=bot, last_button_poll=0.0,
-            button_poll_hz=2.0, button_pressed=False, get_logger=lambda: Log(),
+            button_backend='topic', bot=bot, button_bot=None,
+            last_button_poll=0.0, button_poll_hz=2.0, button_pressed=False,
+            get_logger=lambda: Log(), i2c_read_failures=0, i2c_link_ok=None,
+            i2c_max_read_failures=3,
             _gimbal_angles=(90, 25), _servo_msg_type=ServoMsg,
             pub_servo=pub, key1_address=13)
         bind(obj, methods)

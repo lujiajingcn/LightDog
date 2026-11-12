@@ -11,6 +11,17 @@
 #   **不要当成实车值** —— 照抄会出现「不报错但一直不对」。
 # 【必须现场填写】auth_token、sip_ami_secret、SSL 证书路径。
 #
+# 【官方解锁教程补确认，见 docs/hardware_arrival.md §十一】
+#   · 相机是 USB 单目：`cv2.VideoCapture(0)` / `/dev/video0`，示例 640x480
+#     （《01.摄像头驱动教程》《09.使用USB摄像头》）；MIPI 相机才需要
+#     `/boot/firmware/config.txt` 的 dtoverlay，本车走 USB 路线。
+#   · 官方 ROS2 节点订阅的是 `/image_raw`（《10、AprilTag标签码追踪》源码），
+#     **不是** `/camera/color/image_raw`：上机先 `ros2 topic list` 再 remap，
+#     别照抄仿真话题名。
+#   · 官方 AprilTag 用 TAG36H11、源码 tag_size=0.025m；但 `detect()` 没传
+#     camera_params —— **出厂资料不含相机内参**，必须自己标定后再发
+#     `/camera_info`；填假内参会让单目测距/PnP 静默算错。
+#
 # 注意：下方**原样保留**了仿真配置里的说明文字，个别注释还写着
 # 「use_sim_time: true」等仿真语境；那只是历史说明，实际生效的是参数值 false。
 #
@@ -24,17 +35,24 @@
   ros__parameters:
     use_sim_time: false
 
-    image_topic: '/camera/color/image_raw' # TODO remap to the vendor driver topic
-    info_topic: '/camera/color/camera_info' # TODO publish calibrated camera_info
+    # 官方《10、AprilTag标签码追踪》源码订阅 `/image_raw`（sensor_msgs/Image，
+    # 640x480）；出厂相机驱动究竟发布哪个话题仍要 `ros2 topic list` 实测，
+    # 别直接照抄仿真的 /camera/color/image_raw。
+    image_topic: '/camera/color/image_raw' # TODO remap：官方候选 /image_raw
+    info_topic: '/camera/color/camera_info' # TODO 自行标定后发布；官方资料无内参
 
     # ArUco 本体。marker_length 是**黑框边长**，不是白板边长：
     # lightdog/models/dock/model.sdf 里白板 0.14m 装 10 个 cell
     # （6 cell marker + 每边 2 cell 静默区），黑框 = 0.14 * 6/10 = 0.084。
     # 填错会让解出来的距离按比例整体缩放（0.084 填成 0.10 会让距离多算 19%），
     # 表现是回充时提前停下或者一直往桩里顶。
-    marker_length: 0.084                  # TODO measure: AprilTag black-square side
+    # 官方出厂标签是 TAG36H11，识别/追踪源码 `detect(..., 0.025)` 的
+    # tag_size=0.025m（2.5cm）。但 dock 上贴的是不是这块积木标签、打印有没有
+    # 缩放，都必须卡尺实测；0.084 是仿真 6cell ArUco 白板换算值，不能当官方
+    # 标签边长用。填错会让距离按比例整体缩放。
+    marker_length: 0.084                  # TODO 实测：官方标签候选 0.025
     marker_id: 0
-    dictionary: auto                   # vendor uses AprilTag; auto tries 5 dicts
+    dictionary: auto                   # 官方确认 TAG36H11；auto 已把它放首位
     # 仿真相机固定安装；实车 RASPBOT V2 是二自由度云台，见 real_p3_params.yaml。
     # false 时节点显式停止发布 /detected_dock_pose，而不是用错外参算假位姿。
     gimbal_locked: true                   # TODO lock the 2-DOF gimbal before docking

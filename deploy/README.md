@@ -18,6 +18,11 @@
 > 若走 `vendor_topic` 须先 `ros2 launch yahboomcar_bringup bringup.launch.py`
 > 并确认宿主能看到 `/cmd_vel` 订阅者（`/cmd_vel` 话题名已由官方 PDF 确证，
 > 但其值是归一化量 [-1,1]/[-3,3]，不是 m/s）。详见该文档 §十。
+> ⑤ **用官方提取码解锁后的一手资料核对见 §十一**：底层电机编号是 0-3（不是
+> 教程 PDF 的丝印 1-4）、轮序候选 `0,2,1,3` 仍须四轮单动实测；`button_backend`
+> 已默认 `i2c` 直接读板载 KEY1；出厂 AprilTag 是 TAG36H11，但**官方不提供相机
+> 内参**，必须自行标定后再发 `/camera_info`。永久关闭大程序的官方命令是
+> `sudo rm -rf /home/pi/.config/autostart/start_raspbot.desktop`。
 > 安全等级变化见 §8.3 —— 软件急停不等于物理急停。
 
 ---

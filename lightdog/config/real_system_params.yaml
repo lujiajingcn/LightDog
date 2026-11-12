@@ -11,6 +11,17 @@
 #   **不要当成实车值** —— 照抄会出现「不报错但一直不对」。
 # 【必须现场填写】auth_token、sip_ami_secret、SSL 证书路径。
 #
+# 【官方解锁教程补确认，见 docs/hardware_arrival.md §十一】
+#   · 相机是 USB 单目：`cv2.VideoCapture(0)` / `/dev/video0`，示例 640x480
+#     （《01.摄像头驱动教程》《09.使用USB摄像头》）；MIPI 相机才需要
+#     `/boot/firmware/config.txt` 的 dtoverlay，本车走 USB 路线。
+#   · 官方 ROS2 节点订阅的是 `/image_raw`（《10、AprilTag标签码追踪》源码），
+#     **不是** `/camera/color/image_raw`：上机先 `ros2 topic list` 再 remap，
+#     别照抄仿真话题名。
+#   · 官方 AprilTag 用 TAG36H11、源码 tag_size=0.025m；但 `detect()` 没传
+#     camera_params —— **出厂资料不含相机内参**，必须自己标定后再发
+#     `/camera_info`；填假内参会让单目测距/PnP 静默算错。
+#
 # 注意：下方**原样保留**了仿真配置里的说明文字，个别注释还写着
 # 「use_sim_time: true」等仿真语境；那只是历史说明，实际生效的是参数值 false。
 #

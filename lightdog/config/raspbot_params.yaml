@@ -2,13 +2,16 @@
 # 不是我们自写的 STM32 CRC16 串口协议；这个节点取代 lightdog_mcu_bridge。
 #
 # 依据 docs/hardware_arrival.md（24 张商品截图）+ 亚博官方产品页 + 官方教程
-# PDF（GitHub `YahboomTechnology/Raspbot-V2`，见文档 §十）填的，只写资料能
-# 确定的值；资料没给的（M1..M4 -> 轮子位置、几何精值）显式标注「待确认」。
+# PDF（GitHub `YahboomTechnology/Raspbot-V2`，§十）+ **用提取码解锁后下载的
+# 官方一手资料**：《树莓派5麦轮小车协议.xlsx》、py_install.zip 里的
+# Raspbot_Lib.py 源码、23 篇解锁教程正文（§十一）填的。只写资料能确定的值；
+# 资料没给的（相机内参、几何精值、AprilTag 实际打印边长）显式标注「待确认」。
 # 启动后看 /raspbot/diag 就能知道当前生效的后端与降级原因。
 #
 # 安全默认值：driver_backend=vendor_i2c 调官方 Ctrl_Muto，但 **motor_id_map
-# 未实测时节点强制降级 self_test，一个 I2C 字节都不发**。官方两处教程的电机
-# 编号互相矛盾（0-3 / 1-4），轮序也没给，猜错会让车乱跑。
+# 未实测时节点强制降级 self_test，一个 I2C 字节都不发**。官方资料内部有一处
+# 编号矛盾（教程 PDF 的丝印 1-4 vs 协议表/驱动库源码的底层 0-3），轮序虽已
+# 由四份资料闭环推出，仍必须上机四轮单动验证，猜错会让车乱跑。
 
 /lightdog_raspbot_driver:
   ros__parameters:
@@ -23,11 +26,18 @@
     driver_backend: vendor_i2c
     i2c_module: Raspbot_Lib             # 官方出厂镜像自带，路径 ~/py_install
     i2c_class: Raspbot
-    # TODO 上机四轮单动实测后填，按 FL,FR,RL,RR 顺序写四个编号，如 '1,3,2,4'。
-    # 官方 03.Car basic course/5.Motor control.pdf 明确 1-4（1:M1 … 4:M4），
-    # 驱动板丝印也是 M1~M4；但**没有**给出「编号 -> 轮子位置」的对应图，
-    # URDF 教程只给了 l1/l2/r1/r2 = 左前/左后/右前/右后 的 joint 名。
-    # 空串 = 强制 self_test，一个 I2C 字节都不发（安全）。
+    # TODO 上机四轮单动实测后填，按 FL,FR,RL,RR 顺序写四个编号。
+    # 官方一手资料闭环推导的**候选值**：'0,2,1,3'（代码里 OFFICIAL_MOTOR_ID_MAP）
+    #   · 《树莓派5麦轮小车协议.xlsx》寄存器 0x01：电机序号 0/1/2/3 = L1/L2/R1/R2，
+    #     示例 buf[0]=0x00 控制 L1 前进；固件吃的是 0-3，不是丝印 M1..M4。
+    #   · Raspbot_Lib.py 源码注释：Ctrl_Car(0,..)=L1 ... Ctrl_Car(3,..)=R2。
+    #   · 官方 URDF 教程：l1_Joint=左前 / l2_Joint=左后 / r1_Joint=右前 /
+    #     r2_Joint=右后；扩展板接口图：M1/M2/M3/M4=左上/左下/右上/右下。
+    #   · 《麦克纳姆轮运动原理》11 行符号表逐行与逆解吻合（见 test_raspbot）。
+    #   => FL=0(L1)、FR=2(R1)、RL=1(L2)、RR=3(R2)。
+    # 教程 PDF《05.电机控制》写的 motor_id=[1,4] 是**扩展板丝印**，照抄会漏掉
+    # 0 号电机、把 4 发给不存在的电机。别用 1,2,3,4。
+    # 空串 = 强制 self_test，一个 I2C 字节都不发（安全）；验证步骤见 §十一。
     motor_id_map: ''
     motor_pwm_scale: 255.0              # Ctrl_Muto 接受 -255..255 开环 PWM
     # 官方 ROS2 底盘节点 /driver_node 订阅 /cmd_vel（在出厂 Docker 内，
@@ -68,8 +78,10 @@
     # none（默认）：不碰云台，靠人工锁死 + P3 的 gimbal_locked 前置校验。
     # servo_topic：周期发 yahboomcar_msgs/ServoControl 到 /servo 锁定外参。
     # i2c        ：周期调 Ctrl_Servo(1/2, angle)，仅 vendor_i2c 后端可用。
-    # s1 [0,180]、s2 [0,110] 是官方机械限位；90/25 是官方示例，**不是标定位**，
-    # 上机标定相机外参后改成当时的实际角度。
+    # s1 [0,180]、s2 [0,110] 是官方机械限位；90/25 是出厂 AprilTag 追踪源码的
+    # 默认位，**不是标定位**，上机标定相机外参后改成当时的实际角度。
+    # 注意：官方 Raspbot_Lib.Ctrl_Servo 的限位是**失效的**（先构造 data 再
+    # clamp，写出去仍是原值），所以本节点的 servo_lock_angles() 必须保留。
     gimbal_backend: none
     servo_topic: '/servo'
     servo_s1: 90.0
@@ -77,13 +89,18 @@
     gimbal_period: 1.0
 
     estop_topic: '/safety/estop'
-    # 官方 03.Car basic course/2.Key reading.pdf：read_data_array(0x0d,1)
-    # -> 0 未按下 / 1 按下。topic = 等别人发 /raspbot/button（出厂没人发）；
-    # i2c = 直接轮询板载 KEY1（需 vendor_i2c 后端已加载 Raspbot_Lib）。
+    # 官方《02.按键读取》：read_data_array(0x0d,1) -> 0 未按下 / 1 按下。
+    # 官方 /driver_node 只发布 /ultrasonic 与 /line_sensor，**出厂镜像没有任何
+    # 节点会发 /raspbot/button**；用 topic 后端等于把实体急停按钮废掉，所以
+    # 默认 i2c 直接轮询板载 KEY1。即使底盘后端因 motor_id_map 未实测降级
+    # self_test，节点也会独立加载 Raspbot_Lib 保住这个安全功能。
     button_topic: '/raspbot/button'
-    button_backend: topic
+    button_backend: i2c
     button_poll_hz: 2.0
     key1_address: 13                    # 0x0d
+    # 官方库吞 I2C 异常（裸 except + print），写失败不会抛给调用方；用 KEY1
+    # 周期读当链路心跳，连续失败 N 次就补零速并降级 self_test，不假装还在开车。
+    i2c_max_read_failures: 3
     button_latching: true               # 软件补闭锁：松手不自动恢复
     estop_auto_release: false
     odom_topic: '/odom'
