@@ -93,4 +93,6 @@ sudo python3 deploy/soak.py run --duration 7200 --out /tmp/soak.csv
 `lightdog_raspbot_driver.py`（Pi 直驱 + 四麦轮全向）替代 STM32 串口路径，
 `config/real_*.yaml` 供真机部署，回归详见该文档 §八；**用官方提取码解锁课程、
 协议表 xlsx 与驱动库源码后的核对与更正见 §十一**（底层电机编号 0-3、轮序候选
-`0,2,1,3`、TAG36H11、板载 KEY1 默认走 I2C）。仿真链路保持不变。
+`0,2,1,3`、TAG36H11、板载 KEY1 默认走 I2C）；**《01.说明书》13 页图片版
+（发货清单、接线图、驱动板接口、出厂凭据、电源规范）的核对见 §十二**。
+仿真链路保持不变。

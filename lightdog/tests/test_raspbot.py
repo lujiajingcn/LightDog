@@ -744,5 +744,92 @@ class TestOfficialROS2Chassis(unittest.TestCase):
         self.assertEqual(len(pub.sent), before, '角度非法时一次都不发')
 
 
+class TestOfficialManual(unittest.TestCase):
+    """《01.说明书》13 页图片版（docs/hardware_arrival.md §十二）的事实钉子。
+
+    这一页没有正文文字、全在图里，最容易看完就忘：出厂凭据、电源上限、
+    三套互不等价的电机编号、以及「热点 IP 官方自己都写不一致」。
+    重点是防止有人看完图就把候选轮序填进配置、或挑一个 IP 写死。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(REPO, 'docs', 'hardware_arrival.md'),
+                  encoding='utf-8') as f:
+            cls.doc = f.read()
+        with open(RB, encoding='utf-8') as f:      # RB 是路径，源码要自己读
+            cls.driver_src = f.read()
+        cls.cfg = _load(
+            'raspbot_params.yaml')['/lightdog_raspbot_driver']['ros__parameters']
+        cls.config_names = ['raspbot_params.yaml'] + [
+            n for n in os.listdir(CONFIG)
+            if n.startswith('real_') and n.endswith('.yaml')]
+
+    def test_manual_source_is_pinned(self):
+        self.assertIn('10950', self.doc)
+        self.assertIn('13 张', self.doc)
+        self.assertIn('AKGP', self.doc)
+        self.assertIn('无文字节点', self.doc,
+                      '必须写明这页只有图片，否则下一个人会以为纯文本抓取就够了')
+
+    def test_hotspot_ip_conflict_is_documented_and_never_hardcoded(self):
+        # 说明书 p7 = 192.168.1.1，教程正文 = 192.168.1.11，官方自相矛盾。
+        # 唯一正确做法是上机 `hostname -I` 实测，谁都不许挑一个写进配置。
+        self.assertIn('192.168.1.1', self.doc)
+        self.assertIn('192.168.1.11', self.doc)
+        self.assertIn('hostname -I', self.doc)
+        self.assertIn('冲突', self.doc)
+        for name in self.config_names:
+            with open(os.path.join(CONFIG, name), encoding='utf-8') as f:
+                text = f.read()
+            self.assertNotIn('192.168.1.1', text,
+                             f'{name}: 冲突 IP 不许写死（含 .11 前缀）')
+
+    def test_three_motor_numbering_schemes_are_not_conflated(self):
+        for marker in ('TT电机①', 'M1..M4', '线束编号', '寄存器 0x01',
+                       'L1', 'R2', '左右镜像'):
+            self.assertIn(marker, self.doc, f'{marker} 必须写进 §十二')
+        self.assertIn('motor_id_map', self.doc)
+
+    def test_motor_id_map_still_empty_after_reading_manual(self):
+        # 行为级：说明书没给「线束号/丝印号 -> 底层 id」的对应，仍强制 self_test。
+        self.assertEqual(self.cfg['motor_id_map'], '')
+        self.assertIsNone(RB_FUNCS['parse_motor_id_map'](self.cfg['motor_id_map']))
+        self.assertIn('OFFICIAL_MOTOR_ID_MAP', self.driver_src)
+        self.assertIn('候选', self.doc)
+
+    def test_power_and_wiring_hard_limits_pinned(self):
+        for marker in ('8.4V', '8.5V', '3Pin', '烧坏主板', '驱动板引脚丝印',
+                       '7.0V', '0℃', '蜂鸣器'):
+            self.assertIn(marker, self.doc)
+        # 蜂鸣器报警是布尔量，不是电压遥测；不许拿它改成 0 或假电压源。
+        self.assertEqual(self.cfg['battery_source'], 'none')
+        self.assertIn('不是电压遥测', self.doc)
+
+    def test_servo_s1_s2_semantics_pinned(self):
+        # 说明书 p4：下舵机 -> S1(pan, 0..180)，上舵机 -> S2(tilt, 0..110)。
+        self.assertIn('下舵机接 S1', self.driver_src)
+        self.assertIn('上舵机接 S2', self.driver_src)
+        self.assertEqual(self.cfg['servo_s1'], 90.0)
+        self.assertEqual(self.cfg['servo_s2'], 25.0)
+        f = RB_FUNCS['servo_lock_angles']
+        self.assertEqual(f(90, 25), (90, 25))
+        self.assertIsNone(f(181, 25), 'S1 上限 180')
+        self.assertIsNone(f(90, 111), 'S2 上限 110，比 S1 小')
+
+    def test_factory_credentials_and_ports_recorded(self):
+        for marker in ('Raspbot', '12345678', 'yahboom', '6000', '6001',
+                       '鸣笛三声', 'YahboomRobot'):
+            self.assertIn(marker, self.doc)
+
+    def test_manual_round_changed_no_runtime_parameter(self):
+        # 本轮是纯文档/注释改动：关键运行时参数一个都不许被顺手改掉。
+        self.assertEqual(self.cfg['driver_backend'], 'vendor_i2c')
+        self.assertEqual(self.cfg['button_backend'], 'i2c')
+        self.assertEqual(self.cfg['odom_source'], 'openloop')
+        self.assertEqual(self.cfg['gimbal_backend'], 'none')
+        self.assertEqual(self.cfg['key1_address'], 13)
+
+
 if __name__ == '__main__':
     unittest.main()

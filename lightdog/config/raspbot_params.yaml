@@ -4,8 +4,9 @@
 # 依据 docs/hardware_arrival.md（24 张商品截图）+ 亚博官方产品页 + 官方教程
 # PDF（GitHub `YahboomTechnology/Raspbot-V2`，§十）+ **用提取码解锁后下载的
 # 官方一手资料**：《树莓派5麦轮小车协议.xlsx》、py_install.zip 里的
-# Raspbot_Lib.py 源码、23 篇解锁教程正文（§十一）填的。只写资料能确定的值；
-# 资料没给的（相机内参、几何精值、AprilTag 实际打印边长）显式标注「待确认」。
+# Raspbot_Lib.py 源码、23 篇解锁教程正文（§十一）+《01.说明书》13 页图片版
+# （§十二）填的。只写资料能确定的值；资料没给的（相机内参、几何精值、
+# AprilTag 实际打印边长、线束号 TT①~④ 到底层 id 的映射）显式标注「待确认」。
 # 启动后看 /raspbot/diag 就能知道当前生效的后端与降级原因。
 #
 # 安全默认值：driver_backend=vendor_i2c 调官方 Ctrl_Muto，但 **motor_id_map
@@ -78,6 +79,8 @@
     # none（默认）：不碰云台，靠人工锁死 + P3 的 gimbal_locked 前置校验。
     # servo_topic：周期发 yahboomcar_msgs/ServoControl 到 /servo 锁定外参。
     # i2c        ：周期调 Ctrl_Servo(1/2, angle)，仅 vendor_i2c 后端可用。
+    # 《01.说明书》p4 接线图红字：下舵机 -> S1 引脚、上舵机 -> S2 引脚，线序必须
+    # 与接线图一致 => S1 = 水平回转 pan(0..180)，S2 = 俯仰 tilt(0..110)。
     # s1 [0,180]、s2 [0,110] 是官方机械限位；90/25 是出厂 AprilTag 追踪源码的
     # 默认位，**不是标定位**，上机标定相机外参后改成当时的实际角度。
     # 注意：官方 Raspbot_Lib.Ctrl_Servo 的限位是**失效的**（先构造 data 再
@@ -89,7 +92,9 @@
     gimbal_period: 1.0
 
     estop_topic: '/safety/estop'
-    # 官方《02.按键读取》：read_data_array(0x0d,1) -> 0 未按下 / 1 按下。
+    # 说明书 p12 / 《03.扩展板接口分布》：驱动板正面丝印「按键 KEY1」（用户功能键，
+    # 可编程），旁边是 RESET（板载 MCU 复位）；《02.按键读取》给读法
+    # read_data_array(0x0d,1) -> 0 未按下 / 1 按下。
     # 官方 /driver_node 只发布 /ultrasonic 与 /line_sensor，**出厂镜像没有任何
     # 节点会发 /raspbot/button**；用 topic 后端等于把实体急停按钮废掉，所以
     # 默认 i2c 直接轮询板载 KEY1。即使底盘后端因 motor_id_map 未实测降级
@@ -109,7 +114,9 @@
     odom_frame_id: odom
     base_frame_id: base_link
     battery_topic: '/battery_state'
-    battery_source: none                # 官方 API 无电压遥测 -> 发 NaN，绝不填 0
+    # 说明书 p12 只有「低电 -> 板载有源蜂鸣器报警」，那是布尔提示，不是电压读数；
+    # 官方 I2C API 也没有电压遥测 -> 仍发 NaN，绝不拿蜂鸣器/报警状态冒充 0。
+    battery_source: none
     vendor_battery_topic: '/raspbot/battery_ratio'
     fault_topic: '/mcu/fault'
     diag_topic: '/raspbot/diag'
